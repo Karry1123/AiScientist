@@ -14,6 +14,7 @@ can be trusted".
 from __future__ import annotations
 
 import csv
+import datetime as _dt
 import json
 import os
 import re
@@ -24,6 +25,7 @@ from pathlib import Path
 from typing import Any
 
 from .._lib.cellranger import describe_cellranger_layout
+from .._lib.result_dataset import CELLQC_POINTER as RESULT_POINTER
 from .._lib.scrna import _dirs, _import_scanpy, _p, _rel, _schema
 from ..sdk import HarnessTool
 
@@ -351,6 +353,79 @@ def _plain_strings(adata: Any) -> None:
         adata.raw = raw
 
 
+# The bundle is copied from HPC3 to the gateway after every step, file by file: a table bigger than
+# this (the per-cell obs of a very large library) stays with the complete directory only.
+_BUNDLE_FILE_MAX = 64 * 1024 * 1024
+
+
+def _link_or_copy(src: Path, dst: Path) -> None:
+    """A second name for ``src`` where the filesystem allows it (no bytes copied), else a copy."""
+    try:
+        os.link(os.path.realpath(src), dst)          # the file itself, not a link CellQC published
+    except OSError:
+        shutil.copy2(src, dst)
+
+
+def _publish_result(result_dir: Path, workspace: Path, art: Path,
+                    included: list[str]) -> "tuple[list[str], dict[str, Any]]":
+    """Hand on CellQC's ``result/`` directory, complete and under its own name.
+
+    It used to be a hand-picked seven of its files, in ``artifacts/cellqc/`` (which the bundle
+    then filed under ``extra/`` as a stray): the per-library ``.h5ad``, the ``_obs`` / ``_var``
+    tables and the slide deck's source were left behind in ``work/`` (RCHENLAB/AiScientist
+    issue 3). Now:
+
+    - ``artifacts/result/`` gets every file except the matrices (and any table over
+      ``_BUNDLE_FILE_MAX``), so the bundle and the files browser show CellQC's directory as CellQC
+      wrote it;
+    - ``<run>/result/cellqc/`` gets every file, matrices included. It is outside ``artifacts/``
+      for the reason the processed dataset is: on HPC3 everything under artifacts is copied to
+      the gateway after each step, and a matrix has no business there. The console downloads this
+      directory as one zip, and "save to my data" moves it to the user's folder as a dataset.
+
+    Returns the bundle paths written, and the pointer the console reads to offer both (also
+    written to ``data/cellqc_result.json``, beside ``result_dataset.json``).
+    """
+    files = sorted(p for p in result_dir.iterdir() if p.is_file() and not p.name.startswith("."))
+    bundle_dir = art / "result"
+    full_dir = workspace / "result" / "cellqc"
+    for d in (bundle_dir, full_dir):
+        shutil.rmtree(d, ignore_errors=True)       # a re-run replaces the earlier run's files
+        d.mkdir(parents=True, exist_ok=True)
+    copied: list[str] = []
+    listing: list[dict[str, Any]] = []
+    for src in files:
+        size = src.stat().st_size
+        _link_or_copy(src, full_dir / src.name)
+        listing.append({"name": src.name, "size": size})
+        if src.suffix != ".h5ad" and size <= _BUNDLE_FILE_MAX:
+            shutil.copy2(src, bundle_dir / src.name)
+            copied.append(_rel(art, bundle_dir / src.name))
+    matrices = [f["name"] for f in listing if f["name"].endswith(".h5ad")]
+    in_bundle = {Path(c).name for c in copied}
+    pointer = {
+        "path": str(full_dir), "files": listing,
+        "size_bytes": sum(f["size"] for f in listing),
+        "libraries": included, "matrices": matrices,
+        "in_bundle": "result/",
+        "not_in_bundle": [f["name"] for f in listing if f["name"] not in in_bundle],
+        "created_at": _dt.datetime.now(_dt.timezone.utc).isoformat(timespec="seconds"),
+        "saved_to": None,
+    }
+    (art / "data").mkdir(parents=True, exist_ok=True)
+    (art / "data" / RESULT_POINTER).write_text(json.dumps(pointer, indent=2), encoding="utf-8")
+    return copied, pointer
+
+
+def _counts_layer_note(ambient: str) -> str:
+    """One sentence on what ``layers['counts']`` holds, for the checkpoint, the result and the report."""
+    if str(ambient).lower() in ("none", "", "false", "off"):
+        return ("integer UMI counts of the cells that passed CellQC, with no ambient-RNA correction "
+                "(ambient_method=none)")
+    return (f"ambient-corrected integer UMI counts from CellQC ({ambient}), not the Cell Ranger "
+            "matrix: ambient RNA has already been subtracted from every cell")
+
+
 def _merge_and_preprocess(sc: Any, h5ads: list[Path], n_top_genes: int, figs: Path) -> Any:
     """CellQC's per-library results as ONE object, in the checkpoint shape the later tools read:
     counts in ``layers['counts']``, log-normalised ``.X`` and ``.raw``, highly-variable genes."""
@@ -504,21 +579,16 @@ def run_cellqc(args: dict[str, Any], ctx: Any) -> dict[str, Any]:
     adata = _merge_and_preprocess(sc, h5ads, int(_p(_TOOL, "n_top_genes", args)), figs)
     adata.uns["cellqc"] = {"species": species, "chemistry": chemistry, "decider": decider,
                            "ambient_method": ambient, "libraries": included}
+    # What the counts layer IS. CellQC writes the AMBIENT-CORRECTED matrix, so these are not Cell
+    # Ranger's counts: checked on run f3b8268c4fd4 (SoupX), every cell's total was lower and the
+    # layer summed to 97.4% of the filtered matrix, yet its manuscript called the layer "pre-SoupX".
+    counts_layer = _counts_layer_note(ambient)
+    adata.uns["counts_layer"] = counts_layer
     _plain_strings(adata)                   # HVG / plotting may have added text columns
     adata.write(work / "adata_qc.h5ad")
 
-    # CellQC's own outputs, where the report bundle and the files browser find them.
-    cq_art = art / "cellqc"
-    cq_art.mkdir(parents=True, exist_ok=True)
-    copied: list[str] = []
-    for name in ("report.html", "report_slides.pdf", "metrics.csv", "qc_status.csv", "manifest.tsv"):
-        src = result_dir / name
-        if src.is_file():
-            shutil.copy2(src, cq_art / name)
-            copied.append(_rel(art, cq_art / name))
-    for src in sorted(result_dir.glob("*_doublet_*.txt")):
-        shutil.copy2(src, cq_art / src.name)
-        copied.append(_rel(art, cq_art / src.name))
+    # CellQC's own result/ directory, complete: see _publish_result for what goes where.
+    copied, cellqc_result = _publish_result(result_dir, work.parent, art, included)
     if (result_dir / "metrics.csv").is_file():
         shutil.copy2(result_dir / "metrics.csv", tables / "cellqc_metrics.csv")
     figures = [_rel(art, p) for p in sorted(figs.glob("*cellqc_after_qc*.png"))]
@@ -554,11 +624,19 @@ def run_cellqc(args: dict[str, Any], ctx: Any) -> dict[str, Any]:
         "warnings": warnings,
         "obs_sample_key": "sampleid",
         "layers": ["counts"],
+        "counts_layer": counts_layer,
         "raw_slot": "log1p_normalized",
         "checkpoint": "adata_qc.h5ad",
         "figures": figures,
         "tables": ["tables/cellqc_metrics.csv"] if (tables / "cellqc_metrics.csv").is_file() else [],
         "cellqc_outputs": copied,
+        "cellqc_result": {"n_files": len(cellqc_result["files"]),
+                          "size_bytes": cellqc_result["size_bytes"],
+                          "matrices": cellqc_result["matrices"],
+                          "note": ("CellQC's complete result/ directory is kept with the run (the "
+                                   "per-library .h5ad included): downloadable as one zip, and "
+                                   "saveable to the user's data as a dataset. The bundle's result/ "
+                                   "holds every file except the matrices.")},
         "read_from": f"the bound folder ({Path(root).name}/)",
         "raw_data_to_llm": False,
     }

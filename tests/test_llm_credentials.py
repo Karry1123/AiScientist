@@ -147,6 +147,14 @@ def test_lab_model_round_trips(lc):
     assert lc.update("alice", pub["id"], lab_model="")["lab_model"] is None
 
 
+def test_a_changed_lab_model_drops_the_stored_verification(lc):
+    """The key was proven against the old PI/Critic model, not the new one."""
+    pub = _make(lc, lab_model="deepseek-reasoner")
+    assert lc.mark_verified("alice", pub["id"], model="deepseek-chat")["verified_at"] is not None
+    assert lc.update("alice", pub["id"], lab_model="deepseek-reasoner")["verified_at"] is not None  # unchanged
+    assert lc.update("alice", pub["id"], lab_model="other-model")["verified_at"] is None
+
+
 # --- optional encryption -----------------------------------------------------
 
 

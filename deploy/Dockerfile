@@ -3,7 +3,7 @@
 # This is the FULL image: it bundles the analysis stack because the app's CodeAct sandbox runs
 # generated analysis code in-process on the same host (scanpy/gseapy/matplotlib), and the report
 # renderer shells out to pandoc + xelatex + graphviz. So the image is GB-scale (texlive + scanpy
-# are the bulk). If you later move tool execution to HPC3 (RemoteCodeSandbox + Singularity), the
+# are the bulk). If you later move tool execution to HPC3 (RemoteCodeSandbox + Apptainer), the
 # gateway image can drop the analysis stack and shrink dramatically.
 #
 # Build + push (run from repo root):

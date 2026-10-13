@@ -64,7 +64,10 @@ def test_ttl_reads_from_env(monkeypatch):
 # --- /api/lab/continue guard when checkpoints have expired --------------------
 
 @pytest.fixture(autouse=True)
-def _clean_conns():
+def _clean_conns(monkeypatch):
+    # The single-user console (accounts off): who may call these routes with accounts on is
+    # pinned in tests/test_connection_ownership.py.
+    monkeypatch.setattr(gw_app, "_AUTH_ENABLED", False)
     yield
     gw_app.CONNECTIONS.clear()
 

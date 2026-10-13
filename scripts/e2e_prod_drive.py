@@ -8,9 +8,9 @@ the real service, with a real HPC3 session, a real GPU job and real data, and th
 own process files. Run it after any change to planning, routing, offload or reporting.
 
 Usage (from the eyeserver's point of view the key path is SERVER-side — the gateway loads it):
-    .venv/bin/python scripts/e2e_prod_drive.py \
-        --base "$AISCIENTIST_BASE" --user "$AISCIENTIST_USER" \
-        --key /data/BioAgent/app/ssh_creds/<owner>/<id>.key \
+    AISCIENTIST_PASSWORD=<password> .venv/bin/python scripts/e2e_prod_drive.py \
+        --base "$AISCIENTIST_BASE" --user "$AISCIENTIST_USER" [--account <AiScientist login>] \
+        --key /data/aiscientist/state/ssh_creds/<owner>/<id>.key \
         --dataset /dfs3b/ruic20_lab/software/AiScientist/uploads/<user>/Ddx41_DEG.h5ad \
         [--question "..."] [--plan-only] [--exercise-plan-mode]
 
@@ -22,11 +22,18 @@ Phases: connect -> ready | ask (plan mode) -> plan card | [question reply -> pla
 change reply -> one-step patch; Stop while pending -> immediate cancel] | approve -> run to
 completion | verify: composition offloaded (hpc_slurm), DE step ran run_de, report sections.
 Prints PASS/FAIL/WARN lines and exits non-zero on any FAIL. Needs `pip install websocket-client`.
+
+With accounts on, the gateway serves a connection only to the account that opened it, so the drive
+logs in first (the account defaults to --user; the password comes from AISCIENTIST_PASSWORD, never
+the command line) and sends the session cookie on every request and on the WebSocket. --key must
+then be one of that account's own saved keys.
 """
 from __future__ import annotations
 
 import argparse
+import http.cookiejar
 import json
+import os
 import re
 import sys
 import threading
@@ -49,6 +56,8 @@ class Drive:
         self.lock = threading.Lock()
         self.fails = 0
         self.record = None
+        self.jar = http.cookiejar.CookieJar()
+        self.http = urllib.request.build_opener(urllib.request.HTTPCookieProcessor(self.jar))
         if record:
             from pathlib import Path
             self.record = Path(record)
@@ -67,14 +76,28 @@ class Drive:
         req = urllib.request.Request(self.base + path, data=json.dumps(body).encode(),
                                      headers={"Content-Type": "application/json"}, method="POST")
         try:
-            with urllib.request.urlopen(req, timeout=120) as r:
+            with self.http.open(req, timeout=120) as r:
                 return r.status, json.loads(r.read() or b"{}")
         except urllib.error.HTTPError as e:
             return e.code, json.loads(e.read() or b"{}")
 
     def get(self, path: str) -> dict:
-        with urllib.request.urlopen(self.base + path, timeout=60) as r:
+        with self.http.open(self.base + path, timeout=60) as r:
             return json.loads(r.read())
+
+    def login(self, username: str, password: str) -> tuple[int, dict]:
+        """Sign in to the gateway; the session cookie lands in ``self.jar`` for every later call."""
+        req = urllib.request.Request(self.base + "/api/auth/login",
+                                     data=json.dumps({"username": username, "password": password}).encode(),
+                                     headers={"Content-Type": "application/json"}, method="POST")
+        try:
+            with self.http.open(req, timeout=60) as r:
+                return r.status, json.loads(r.read() or b"{}")
+        except urllib.error.HTTPError as e:
+            return e.code, json.loads(e.read() or b"{}")
+
+    def _cookie_header(self) -> str:
+        return "; ".join(f"{c.name}={c.value}" for c in self.jar)
 
     def listen(self, cid: str) -> None:
         def on_msg(_w, m):
@@ -86,7 +109,8 @@ class Drive:
                 self.events.append((time.time(), ev))
                 self._log("events", {"event": ev})
         threading.Thread(target=lambda: websocket.WebSocketApp(
-            f"{self.ws_base}/ws/{cid}", on_message=on_msg).run_forever(ping_interval=20),
+            f"{self.ws_base}/ws/{cid}", on_message=on_msg,
+            cookie=self._cookie_header() or None).run_forever(ping_interval=20),
             daemon=True).start()
 
     def wait(self, pred, timeout: float, since: int = 0):
@@ -108,10 +132,31 @@ class Drive:
         self._log("checks", {"result": tag.strip(), "message": msg})
 
 
+# A failure fork's FIRST option is often "try the same thing harder": on run 7f2955e8e (2026-10-08) it
+# was "search /dfs3b again for MSigDB M5/M6", which repeated three failed attempts. Prefer the option
+# that uses what exists, then skipping, then the first.
+_DECISION_PREFERENCE = (
+    r"actually present|present locally|installed|available locally|libraries that are|"
+    r"already (?:present|installed)",
+    r"\bskip\b",
+    r"proceed",
+)
+
+
+def pick_decision(options: "list[str]") -> str:
+    for rx in _DECISION_PREFERENCE:
+        for option in options:
+            if re.search(rx, option, re.IGNORECASE):
+                return option
+    return options[0] if options else ""
+
+
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--base", required=True)
-    ap.add_argument("--user", required=True)
+    ap.add_argument("--user", required=True, help="HPC3 UCInetID")
+    ap.add_argument("--account", default=None,
+                    help="AiScientist login (default: --user); password from AISCIENTIST_PASSWORD")
     ap.add_argument("--key", required=True, help="SERVER-side path to the SSH key")
     ap.add_argument("--dataset", default=None, help="dfs3b path (uploads/, never Temp/)")
     ap.add_argument("--server-path", default=None,
@@ -140,10 +185,18 @@ def main() -> int:
     if not (a.dataset or a.server_path or a.continue_run):
         ap.error("give --dataset or --server-path")
     d = Drive(a.base, record=a.record)
+    password = os.environ.get("AISCIENTIST_PASSWORD", "")
+    if password:
+        st, r = d.login(a.account or a.user, password)
+        print("login ->", st, (r.get("user") or {}).get("username") or r.get("detail"))
+        if st != 200:
+            return 1
 
     st, r = d.post("/api/connect", {"ucinetid": a.user, "auth_method": "ssh_key",
                                     "key_path": a.key, "campus_network_confirmed": True})
     print("connect ->", st, r.get("connection_id"), r.get("error"))
+    if st == 401 and not password:
+        print("accounts are on: set AISCIENTIST_PASSWORD (and --account if it is not --user)")
     if st != 200:
         return 1
     cid = r["connection_id"]
@@ -238,7 +291,7 @@ def main() -> int:
     t1 = time.time()
     # A manual-mode run can pause mid-way on a decision point (e.g. "use the existing labels or
     # re-cluster?"). Nobody answers in a headless drive, so each one used to cost its full 600 s
-    # timeout (2026-09-30, run f107bcf7b660). Answer with the first option and say so.
+    # timeout (2026-09-30, run f107bcf7b660). Answer with pick_decision and say so.
     since = n0
     while True:
         left = a.run_timeout - (time.time() - t1)
@@ -247,7 +300,7 @@ def main() -> int:
         if not done or done[1].get("type") != "decision_prompt":
             break
         options = list(done[1].get("options") or [])
-        pick = options[0] if options else ""
+        pick = pick_decision(options)
         print(f"decision: {str(done[1].get('goal', ''))[:100]!r} -> {pick!r}", flush=True)
         plan(a.conv, "approve", pick)
         since = j + 1

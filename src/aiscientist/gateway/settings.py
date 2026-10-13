@@ -40,7 +40,7 @@ class HPCSettings:
     # kill. Our staging (`put_file`/`get_file`) moves GB-scale VCFs and h5ad matrices, so it gets its
     # OWN connection here instead of riding the login-node session that `exec` uses.
     # MEASURED 2026-08-06: this host runs a RESTRICTED shell (`ssh … echo hi` -> "Command 'echo' not
-    # allowed"), so ONLY the SFTP subsystem works — sbatch/squeue/module/singularity and the vLLM
+    # allowed"), so ONLY the SFTP subsystem works — sbatch/squeue/module/apptainer and the vLLM
     # tunnel must stay on `host`. It mounts the SAME $HOME and /dfs3b, so paths and authorized_keys
     # are identical and no extra setup is needed.
     # Set AISCIENTIST_HPC_TRANSFER_HOST="" to disable the split and stage over the login node again.
@@ -134,13 +134,13 @@ class HPCSettings:
     temp_ttl_days: int = 3
 
     # --- LLM serving backend ------------------------------------------------
-    # "vllm" (Singularity container, OpenAI-compatible /v1) — the default and only
+    # "vllm" (Apptainer container, OpenAI-compatible /v1) — the default and only
     # supported serving backend. "sglang" is reserved for a future engine swap that
     # reuses the SAME /v1 client (vllm_client) and only changes the serve command.
     # Everything downstream (Biomni, providers) is backend-agnostic (all OpenAI /v1).
     llm_backend: str = "vllm"
 
-    # vLLM (runs inside a Singularity container on the GPU node; serves /v1).
+    # vLLM (runs inside an Apptainer container on the GPU node; serves /v1).
     # Qwen3.8-27B (dense, hybrid attention, vision) as W4A16 INT4 (compressed-tensors, 16GB). It
     # needs a newer vLLM than the June vllm.sif, hence vllm-0.28.0.sif; the format is auto-detected,
     # so vllm_quantization is "". MEASURED 2026-09-25 on HPC3 (one card, 262144 ctx, same bench):
@@ -181,11 +181,16 @@ class HPCSettings:
     # a new job may use. Set per model from the cluster model list.
     vllm_gpu_cards: str = ""
 
-    # Container runtime for the GPU serve job + code sandbox. RCIC HPC3 provides
-    # SINGULARITY (module `singularity/<ver>`), NOT Apptainer — they share a CLI, but
-    # the binary/module on HPC3 is `singularity`. See rcic.uci.edu user-installed software.
-    container_bin: str = "singularity"
-    container_module: str = "singularity/3.11.3"
+    # Container runtime for every HPC3 container (vLLM serve, scGPT, VL review, run_code, the
+    # analysis/variant/phenotype/report/literature jobs, the package cache, image provisioning).
+    # Apptainer since 2026-10-09: HPC3 has both modules, and apptainer/1.4.5 runs every staged
+    # image and every command built here unchanged (measured on CPU and GPU nodes). It is installed
+    # WITHOUT setuid, so containers run in a user namespace with SIFs mounted by squashfuse_ll; its
+    # `--fakeroot` builds a .def on HPC3 itself, which Singularity never could (no /etc/subuid entry).
+    # Rollback, no code change: AISCIENTIST_CONTAINER_BIN=singularity +
+    # AISCIENTIST_CONTAINER_MODULE=singularity/3.11.3 in the .env.
+    container_bin: str = "apptainer"
+    container_module: str = "apptainer/1.4.5"
 
     # --- scGPT per-cell annotation (GPU batch job, NOT a persistent server) -----
     # scGPT is a gene/expression transformer (not an LLM); we run its one-shot
@@ -229,8 +234,10 @@ class HPCSettings:
     vlreview_max_iters: int = 3             # render -> review -> re-render passes before giving up
 
     # --- CodeAct (run_code) as a CPU Slurm batch job (opt-in) -------------------
-    # By default run_code executes in the LOCAL CodeSandbox on the eyeserver (uncapped subprocess).
-    # Set AISCIENTIST_RUN_CODE_ON_HPC=1 to instead submit each snippet as a Singularity-contained CPU
+    # By default run_code executes in the LOCAL CodeSandbox on the gateway host (uncapped
+    # subprocess), which only a console WITHOUT accounts may do: with accounts on, run_code never
+    # runs on the gateway host (app._host_code_allowed), so it is unavailable until this is set.
+    # Set AISCIENTIST_RUN_CODE_ON_HPC=1 to instead submit each snippet as an Apptainer-contained CPU
     # batch job on HPC3, where `#SBATCH --mem` is a REAL, cgroup-enforced memory cap (the durable
     # fix for the OOM/-9 kills). Needs the dataset + run dirs on shared DFS and an analysis image.
     run_code_on_hpc: bool = False
@@ -264,16 +271,16 @@ class HPCSettings:
 
     # --- Uploads land on HPC3 dfs3b, not the eyeserver (opt-in) -----------------
     # Off: uploaded datasets are written to the eyeserver's per-user workspace. Set
-    # AISCIENTIST_UPLOADS_ON_HPC=1 to stream each upload straight to the user's HPC3 area
-    # (<lab_storage>/<user>/uploads) over the SSH session, so raw data never lives on the
-    # eyeserver. Needs a connected session (the SSH executor, which /api/connect brings up
-    # together with the GPU). Tools that still run locally stage the file back on demand;
-    # once analysis moves to HPC3 they read dfs3b in place with no round-trip.
+    # AISCIENTIST_UPLOADS_ON_HPC=1 to copy each upload to the user's HPC3 area
+    # (<shared_root>/uploads/<user>) through the transfer host, so raw data does not stay on the
+    # eyeserver. The copy runs in the background after the upload request answers (see
+    # gateway/staging.py); the local file is deleted once the copy is verified. Needs a connected
+    # session. Tools that still run locally stage the file back on demand.
     uploads_on_hpc: bool = False
 
     # --- scanpy analysis line runs as HPC3 CPU Slurm jobs (opt-in) --------------
     # Off: run_scanpy_qc/clustering/de/enrichment + the dataset preflight execute IN-PROCESS on
-    # the eyeserver. Set AISCIENTIST_ANALYSIS_ON_HPC=1 to submit each as a Singularity-contained CPU
+    # the eyeserver. Set AISCIENTIST_ANALYSIS_ON_HPC=1 to submit each as an Apptainer-contained CPU
     # batch job on HPC3 (SlurmAnalysisExecutor), reading the dataset on dfs3b in place — the real
     # memory cap is Slurm --mem, and the gateway host stays a thin I/O layer. Reuses analysis_image
     # + cpu_partition/cpu_account/run_code_mem_gb/run_code_cpus. Falls back in-process on failure.
@@ -282,8 +289,10 @@ class HPCSettings:
     # --- report render (pandoc/xelatex) runs as an HPC3 CPU Slurm job (opt-in) --
     # Off: build_pdf_report shells out to pandoc/xelatex on the eyeserver (a multi-GB texlive install
     # + minutes of CPU per report). Set AISCIENTIST_REPORT_ON_HPC=1 to render each report as a
-    # Singularity-contained CPU batch job on HPC3 (SlurmReportRenderer) using a deps-only
-    # pandoc/texlive image — no texlive on the eyeserver. Falls back to local pandoc on failure.
+    # Apptainer-contained CPU batch job on HPC3 (SlurmReportRenderer) using a deps-only
+    # pandoc/texlive image — no texlive on the eyeserver. On failure it falls back to local pandoc;
+    # with accounts on that fallback writes the DOCX only (TeX never runs on the gateway host for
+    # an account, so this flag is then what makes a PDF possible at all).
     report_on_hpc: bool = False
     report_image: str = f"{SHARED_ROOT}/containers/report.sif"
 
@@ -292,7 +301,7 @@ class HPCSettings:
     # VCF but it reads the whole file into memory, caps at 500 variants, and is rate-limited, so it
     # can't scale to a WGS-size VCF. Set AISCIENTIST_VARIANT_ON_HPC=1 to run the OFFLINE line
     # (bcftools PASS-filter -> `vep --offline --cache --fork` over a local cache -> stream-parse) as a
-    # Singularity-contained CPU batch job on HPC3, reading the VCF on dfs3b in place. No network is
+    # Apptainer-contained CPU batch job on HPC3, reading the VCF on dfs3b in place. No network is
     # needed at run time (the cache is bind-mounted) — the analysis container now allows network
     # on-demand (AISCIENTIST_SANDBOX_NETWORK, default on) but the offline line doesn't use it. Reuses
     # SlurmAnalysisExecutor + cpu_partition/cpu_account/run_code_mem_gb. Falls

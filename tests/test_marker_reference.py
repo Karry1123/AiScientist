@@ -123,3 +123,93 @@ def test_a_label_whose_markers_are_not_enriched_is_withdrawn(tmp_path):
     assert out["canonical_check_failed"] == ["0", "1"]
     row = _table(tmp_path)["0"]
     assert row["withdrawn_label"] == "A" and "XGENE" in row["evidence"]
+
+
+def test_a_cluster_with_glul_but_not_rlbp1_is_not_called_muller_glia(tmp_path):
+    # Run f3b8268c4fd4: 27 cells called Muller glia on Glul alone (+2.81) with Rlbp1 +0.28 in 44% of
+    # them, while their own top genes (Best2, Ptgds, Trpm3) were no retinal glia's. GLUL is shared
+    # with astrocytes and ocular epithelia; RLBP1 is the marker Muller glia cannot be called without.
+    spec = {**_HUMAN, "4": {"GLUL": 3.0, "APOE": 2.0, "BEST2": 3.0, "PTGDS": 2.5}}
+    out = _run(tmp_path, _object(spec), {"reference": "retina"})
+    assert out["labels"]["0"] == "Muller glia"            # RLBP1 + GLUL: still Muller glia
+    assert out["labels"]["4"] == "Unassigned"
+    assert "4" in out["canonical_check_failed"]
+    row = _table(tmp_path)["4"]
+    assert row["withdrawn_label"] == "Muller glia" and row["unassigned_reason"] == "withdrawn"
+    assert "RLBP1" in row["evidence"] and "shared" in row["evidence"]
+    # ...and it is described by what it does express.
+    assert {"BEST2", "PTGDS"} <= set(out["unassigned_detail"]["4"]["top_markers"])
+    assert out["reference"]["defining"]["Muller glia"] == ["RLBP1"]
+
+
+def test_an_unassigned_cluster_says_which_lineages_it_mixes(tmp_path):
+    # Microglia markers mean 1.75 against bipolar 1.37: both present, neither 1.5x the other.
+    spec = {**_HUMAN, "4": {"VSX2": 1.5, "GRM6": 2.0, "TRPM1": 2.0, "C1QA": 2.0, "P2RY12": 1.5}}
+    out = _run(tmp_path, _object(spec), {"reference": "retina"})
+    detail = out["unassigned_detail"]["4"]
+    assert detail["reason"] == "mixed"
+    assert detail["evidence"].startswith("mixed: Microglia") and "Bipolar cell" in detail["evidence"]
+    assert _table(tmp_path)["1"]["top_markers"]           # every cluster carries its top markers
+
+
+def test_a_labelled_cluster_led_by_another_lineages_genes_is_named(tmp_path):
+    # Rod markers clear the checks, but the cluster's own top genes are ganglion-cell genes.
+    spec = {**_HUMAN, "4": {"RHO": 3.0, "NRL": 2.0, "GNAT1": 2.5},
+            "5": {"RHO": 2.0, "NRL": 1.5, "GNAT1": 1.8, "NEFL": 3.0, "NEFM": 2.5}}
+    out = _run(tmp_path, _object(spec), {"reference": "retina"})
+    assert out["labels"]["5"] == "Rod photoreceptor"
+    crossed = _table(tmp_path)["5"]["top_markers_of_other_lineages"]
+    assert any(c.startswith("NEFL (Retinal ganglion cell)") for c in crossed)
+    assert any("5 (Rod photoreceptor)" in w and "NEFL" in w for w in out["warnings"])
+    assert "top_markers_of_other_lineages" not in _table(tmp_path)["4"]
+
+
+def test_counts_in_place_of_log_expression_are_refused(tmp_path):
+    # Run 7f2955e8e: an object whose X and .raw held integer counts reached the annotation; with
+    # thresholds in log units, 52.9% of cells came out Unassigned.
+    a = _object(_HUMAN)
+    a.X = np.round(a.X * 100)
+    a.raw = a.copy()
+    out = _run(tmp_path, a, {"reference": "retina"})
+    assert out["status"] == "error" and "integer counts" in out["error"] and "log units" in out["error"]
+
+
+def test_run_de_refuses_counts_too(tmp_path):
+    from aiscientist.tools.run_de.tool import run_de
+    a = _object(_HUMAN)
+    a.X = np.round(a.X * 100)
+    a.raw = a.copy()
+    out = _run_tool(tmp_path, a, run_de, {"groupby": "leiden"})
+    assert out["status"] == "error" and "integer counts" in out["error"]
+    assert "log2 fold-changes" in out["error"]
+
+
+def _run_tool(tmp_path: Path, a: "ad.AnnData", fn, args: dict) -> dict:
+    work = tmp_path / "work"
+    work.mkdir(parents=True, exist_ok=True)
+    a.write_h5ad(work / "adata_clustered.h5ad")
+    return fn(args, HarnessContext(decisions={}, workspace=tmp_path))
+
+
+def test_reference_none_does_not_let_a_panel_rename_retina_lineages(tmp_path):
+    # Run 4de7ab04a239: reference "none" + a panel written from DE tables with names and genes
+    # crossed ("Cone photoreceptor" = rod genes) — 8,132 rods came out cones.
+    spec = {**_HUMAN, "4": {"RHO": 4.0, "NRL": 2.0, "GNAT1": 3.0},
+            "5": {"ARR3": 4.0, "PDE6H": 3.0, "GNAT2": 2.5}}
+    crossed = {"Cone photoreceptor": ["RHO", "NRL", "GNAT1"], "Rod photoreceptor": ["ARR3", "PDE6H"],
+               "Muller glia": ["RLBP1", "GLUL"], "Microglia": ["C1QA"]}
+    out = _run(tmp_path, _object(spec), {"reference": "none", "panel": crossed,
+                                         "discriminators": crossed})
+    assert out["labels"]["4"] == "Rod photoreceptor" and out["labels"]["5"] == "Cone photoreceptor"
+    assert out["reference"]["name"] == "retina"
+    assert any("`reference: none` was overridden" in w for w in out["warnings"])
+    bad = out["reference"]["caller_panel_contradictions"]
+    assert "Rod photoreceptor" in bad["Cone photoreceptor"] and "Cone photoreceptor" in bad["Rod photoreceptor"]
+
+
+def test_reference_none_still_works_for_a_tissue_without_one(tmp_path):
+    spec = {"0": {"ALB": 3.0}, "1": {"KRT19": 3.0}}
+    out = _run(tmp_path, _object(spec), {"reference": "none", "panel": {"Hepatocyte": ["ALB"],
+                                                                         "Cholangiocyte": ["KRT19"]},
+                                         "dominance_ratio": 1.0})
+    assert out["reference"] == {} and out["labels"] == {"0": "Hepatocyte", "1": "Cholangiocyte"}

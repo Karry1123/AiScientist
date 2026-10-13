@@ -17,6 +17,9 @@ from aiscientist.gateway.tool_images import build_command, image_sif_name, lock_
 
 CELLQC = "bioconda:cellqc=0.3.6 r-doubletfinder python=3.12"
 
+# The directory the gateway gives this job line: <shared_root>/Temp/<user>/scratch/runcode.
+SCRATCH = "/dfs/lab/Temp/tester/scratch/runcode"
+
 
 def _skill(root: Path, name: str, front: str, body: str = "Run the pipeline.\n",
            files: "dict[str, str] | None" = None) -> Path:
@@ -213,7 +216,7 @@ def test_the_first_use_builds_the_image_from_shared_downloads():
 
 def test_without_a_containers_dir_it_says_so():
     hpc = _HPC()
-    out = SlurmCodeExecutor(remote=hpc, container_image="x.sif", work_dir="/w").run_in_image(
+    out = SlurmCodeExecutor(remote=hpc, container_image="x.sif", scratch_dir=SCRATCH, work_dir="/w").run_in_image(
         "ls", CELLQC, workdir="env/x")
     assert out["status"] == "not_enabled"
 

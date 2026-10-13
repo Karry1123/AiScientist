@@ -188,7 +188,7 @@ get_tags = get_models
 
 
 def ensure_installed(executor, settings: HPCSettings, emit) -> dict:
-    """vLLM runs from a prebuilt Singularity image — there is NO per-user binary to
+    """vLLM runs from a prebuilt Apptainer image — there is NO per-user binary to
     install (unlike Ollama). Just verify the ``.sif`` is present so a missing image
     is surfaced at provisioning, not mid-serve. Returns an info dict for the UI."""
     image = settings.vllm_image
@@ -198,7 +198,7 @@ def ensure_installed(executor, settings: HPCSettings, emit) -> dict:
         return {"installed": True, "engine": "vllm", "image": image, "version": None}
     raise GatewayError(
         f"vLLM container image not found at {image}. Pull it once on the cluster with: "
-        f"singularity pull {image} docker://vllm/vllm-openai:latest",
+        f"apptainer pull {image} docker://vllm/vllm-openai:latest",
         stage="vllm_image",
         detail={"image": image, "stderr": result.stderr},
     )
@@ -348,7 +348,7 @@ def chat_tools_stream(
     only where the trace is wanted.
     """
     url = f"{_endpoint(local_port, base_url)}/chat/completions"
-    payload: dict = {"model": model, "messages": messages, "stream": True}
+    payload: dict = {"model": model, "messages": _wire_messages(messages), "stream": True}
     if tools:
         payload["tools"] = tools
         payload["tool_choice"] = "auto"
@@ -565,6 +565,13 @@ def complete(
                        base_url=base_url, api_key=api_key, think=think)[0]
 
 
+def _wire_messages(messages: list[dict]) -> list[dict]:
+    """The history as an OpenAI-compatible server should see it: without ``provider_blocks``,
+    which only the Anthropic adapter reads (a strict server rejects unknown message fields)."""
+    return [{k: v for k, v in m.items() if k != "provider_blocks"} if isinstance(m, dict)
+            and "provider_blocks" in m else m for m in messages]
+
+
 def chat_tools(
     local_port: int,
     model: str,
@@ -603,7 +610,7 @@ def chat_tools(
     url = f"{_endpoint(local_port, base_url)}/chat/completions"
     payload: dict = {
         "model": model,
-        "messages": messages,
+        "messages": _wire_messages(messages),
         "tools": tools,
         "tool_choice": "auto",
         "stream": False,
@@ -667,7 +674,7 @@ def count_tokens(
 ) -> int | None:
     """EXACT prompt token count from vLLM's server-side ``/tokenize`` — the count is
     computed by the SAME tokenizer + chat template the server enforces ``--max-model-len``
-    with, INSIDE the Singularity container on the GPU node. The gateway only ships the
+    with, INSIDE the Apptainer container on the GPU node. The gateway only ships the
     messages over the tunnel and reads back an integer; no tokenizer/model files land on
     eye-server.
 
@@ -698,7 +705,7 @@ def count_tokens(
     # add_generation_prompt mirrors a real chat call; send tools when present so the
     # count includes the tool-schema injection. If this server build rejects `tools` on
     # /tokenize, retry without them (the caller adds the schema estimate separately).
-    base_payload = {"model": model, "messages": messages, "add_generation_prompt": True}
+    base_payload = {"model": model, "messages": _wire_messages(messages), "add_generation_prompt": True}
     if tools:
         got = _post({**base_payload, "tools": tools})
         if got is not None:

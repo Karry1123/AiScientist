@@ -39,6 +39,8 @@ def test_zero_context_corpus_answer_falls_back_to_europe_pmc():
     assert calls, "Europe PMC fallback did not run"
     assert any(e.get("type") == "literature_fallback" for e in events)
     assert res.status in ("ok", "incomplete")
+    # The Critic is told the switch was the platform's (run 7f2955e8e revised it as off-brief).
+    assert (res.final_answer or "").startswith("(Platform note: the indexed corpus")
 
 
 def test_cited_corpus_answer_does_not_fall_back():
@@ -54,3 +56,39 @@ def test_cited_corpus_answer_does_not_fall_back():
                          Specialist("s", "p"), "", [], lambda e: None)
     assert not calls
     assert res.status == "ok" and "Farrar" in (res.final_answer or "")
+
+
+def test_a_cannot_answer_with_one_tangential_context_still_falls_back():
+    # Run f3b8268c4fd4: one off-topic passage came back with "I cannot answer." and status ok; the
+    # step was treated as a corpus answer, so Europe PMC never ran and References shipped empty.
+    deep = _tool("deep_literature", {"status": "ok", "answer": "\n\nI cannot answer.",
+                                     "formatted_answer": "Question: q\n\n\n\nI cannot answer.",
+                                     "contexts": [{"citation": "Davidson AE et al. 2009"}]})
+    calls = []
+    lit = HarnessTool("literature_search", "keyword search", {"type": "object", "properties": {}},
+                      lambda a, c: calls.append(a) or {"status": "ok", "papers": []})
+    _lab([deep, lit])._scientist("q", "**Literature grounding** — use `deep_literature`.",
+                                 Specialist("s", "p"), "", [], lambda e: None)
+    assert calls, "Europe PMC fallback did not run"
+
+
+def test_the_corpus_is_asked_a_question_not_a_keyword_string():
+    asked = []
+    deep = HarnessTool("deep_literature", "corpus", {"type": "object", "properties": {}},
+                       lambda a, c: asked.append(a["question"]) or {
+                           "status": "ok", "answer": "Grounded.", "contexts": [{"citation": "X 2020"}]})
+    step = ("**Deep literature & external benchmark** — Ground the interpretation with `deep_literature`, "
+            "asking one focused scientific question: the established single-cell marker profile and "
+            "expected cell-type composition of the inferred tissue. The cited answer grounds the "
+            "discussion.")
+    # The model is unavailable here ("{}"), so the brief itself becomes the question.
+    _lab([deep])._scientist("analyse this dataset", step, Specialist("s", "p"), "", [], lambda e: None)
+    assert asked and "marker profile and expected cell-type composition" in asked[0]
+    assert "`" not in asked[0] and "**" not in asked[0] and "GO:" not in asked[0]
+
+    model_q = "What is the expected cell-type composition of adult mouse retina in single-cell studies?"
+    from aiscientist.agents.research_harness import ResearchHarness
+    lab = ResearchLab(HarnessContext(), LabConfig(max_rounds=1), complete_fn=lambda m: model_q,
+                      scientist=ResearchHarness(catalog=[deep], chat_fn=lambda m, t: {}))
+    lab._scientist("analyse this dataset", step, Specialist("s", "p"), "", [], lambda e: None)
+    assert asked[-1] == model_q

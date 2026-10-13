@@ -452,7 +452,7 @@ def run_quick_chat(
             result.stopped = True
             return result
         result.turns = turn + 1
-        turn_text, turn_thinking, calls = "", "", []
+        turn_text, turn_thinking, calls, provider_blocks = "", "", [], None
         for kind, chunk in stream_fn(messages, schemas):
             if cancelled():
                 result.stopped = True
@@ -467,6 +467,8 @@ def run_quick_chat(
                 emit({"type": "thinking", "token": chunk})
             elif kind == "tool_calls":
                 calls = list(chunk or [])
+            elif kind == "provider_blocks":
+                provider_blocks = chunk     # Claude's raw turn, replayed by its adapter next turn
 
         # Only the LAST turn's text is the answer the user keeps; earlier turns' prose is the
         # model narrating before a tool call ("PDE6B is a rod phosphodiesterase subunit — let me
@@ -475,6 +477,8 @@ def run_quick_chat(
         assistant_msg: dict[str, Any] = {"role": "assistant", "content": turn_text}
         if calls:
             assistant_msg["tool_calls"] = calls
+        if provider_blocks:
+            assistant_msg["provider_blocks"] = provider_blocks
         messages.append(assistant_msg)
 
         if not calls:

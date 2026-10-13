@@ -188,9 +188,10 @@ def test_a_crash_mid_run_then_resume_finishes_without_redoing_work():
 
 
 @pytest.fixture()
-def gw():
+def gw(monkeypatch):
     pytest.importorskip("fastapi")
     from aiscientist.gateway import app as gw_app
+    monkeypatch.setattr(gw_app, "_AUTH_ENABLED", False)   # accounts on: test_connection_ownership.py
     yield gw_app
     gw_app.CONNECTIONS.clear()
 

@@ -14,6 +14,13 @@ from aiscientist.gateway import app as gw_app  # noqa: E402
 from aiscientist.gateway import vllm_client  # noqa: E402
 
 
+@pytest.fixture(autouse=True)
+def _accounts_off(monkeypatch):
+    # The single-user console (accounts off): who may call these routes with accounts on is
+    # pinned in tests/test_connection_ownership.py.
+    monkeypatch.setattr(gw_app, "_AUTH_ENABLED", False)
+
+
 class _FakeConn:
     selected_model = "QuantTrio/Qwen3.6-35B-A3B-AWQ"
     tunnel_port = 37219
@@ -237,9 +244,10 @@ def test_upload_response_carries_a_content_peek(tmp_path):
         loop.close()
 
 
-def test_describe_endpoint_deterministic_without_a_served_model(tmp_path):
+def test_describe_endpoint_deterministic_without_a_served_model(tmp_path, monkeypatch):
     """The LLM description must run ONLY when a model is up. With no GPU (tunnel_port unset) the
     endpoint returns the deterministic peek + a note, and NEVER provisions anything."""
+    monkeypatch.setattr(gw_app, "_AUTH_ENABLED", False)   # who may call it: test_describe_access.py
     conn, loop = _mock_conn(tmp_path)
     assert conn.tunnel_port is None                           # a fresh session has no served model
     try:
@@ -260,7 +268,8 @@ def test_describe_endpoint_deterministic_without_a_served_model(tmp_path):
         loop.close()
 
 
-def test_describe_endpoint_requires_a_path(tmp_path):
+def test_describe_endpoint_requires_a_path(tmp_path, monkeypatch):
+    monkeypatch.setattr(gw_app, "_AUTH_ENABLED", False)
     conn, loop = _mock_conn(tmp_path)
     try:
         r = _client().post("/api/dataset/describe", json={"connection_id": conn.id})
@@ -271,7 +280,9 @@ def test_describe_endpoint_requires_a_path(tmp_path):
 
 
 def test_reserve_folder_avoids_collision(tmp_path):
-    """Reserving the same folder name twice yields distinct top-level dirs (data, data (1))."""
+    """Reserving the same folder name twice yields distinct top-level dirs (data, data_2). The second
+    name has to come through ``safe_relpath`` unchanged: the browser sends it back in every file's
+    path, and "data (1)" came back as "data1", a folder that had not been reserved."""
     import asyncio
 
     from aiscientist.gateway.settings import HPCSettings
@@ -285,7 +296,8 @@ def test_reserve_folder_avoids_collision(tmp_path):
         a = c.post("/api/upload/reserve-folder", json={"connection_id": conn.id, "name": "data"})
         b = c.post("/api/upload/reserve-folder", json={"connection_id": conn.id, "name": "data"})
         assert a.json()["folder"] == "data"
-        assert b.json()["folder"] == "data (1)"
+        assert b.json()["folder"] == "data_2"
+        assert gw_app.safe_relpath(b.json()["folder"]) == b.json()["folder"]
     finally:
         gw_app.CONNECTIONS.pop(conn.id, None)
         loop.close()
@@ -358,6 +370,45 @@ def test_files_list_includes_nested_and_serves_them(tmp_path, monkeypatch):
     # the nested file serves inline for preview
     served = client.get(files["DEG_Cone.csv"]["url"])
     assert served.status_code == 200 and served.content == b"gene,lfc\nCD3D,1.2\n"
+
+
+def test_a_file_is_served_from_disk_with_ranges_and_never_cached_stale(tmp_path, monkeypatch):
+    monkeypatch.setattr(gw_app, "CONSOLE_RUNS_DIR", tmp_path)
+    art = tmp_path / "tester" / "run0001" / "artifacts"
+    art.mkdir(parents=True)
+    (art / "big.csv").write_bytes(b"0123456789" * 1000)
+    served = _client().get("/api/file/tester/run0001/big.csv")
+    assert served.status_code == 200 and len(served.content) == 10000
+    assert served.headers["cache-control"] == "no-cache"           # a regenerated report is re-fetched
+    assert "content-disposition" not in served.headers            # inline, for the preview pane
+    part = _client().get("/api/file/tester/run0001/big.csv", headers={"Range": "bytes=10-19"})
+    assert part.status_code == 206 and part.content == b"0123456789"
+
+
+def test_the_bundle_is_built_on_disk_and_removed_after_the_download(tmp_path, monkeypatch):
+    import io
+    import os
+    import time
+    import zipfile
+
+    monkeypatch.setattr(gw_app, "CONSOLE_RUNS_DIR", tmp_path)
+    run = tmp_path / "tester" / "run0001"
+    art = run / "artifacts"
+    (art / "tables").mkdir(parents=True)
+    (art / "tables" / "a.csv").write_text("x\n1\n", encoding="utf-8")
+    (art / "report.md").write_text("# r\n", encoding="utf-8")
+    cut = run / ".bundle-cut.zip"                                  # left by a download that was cut
+    cut.write_bytes(b"half a zip")
+    os.utime(cut, (time.time() - 7200, time.time() - 7200))
+
+    r = _client().get("/api/bundle/tester/run0001")
+    assert r.status_code == 200 and r.headers["content-type"] == "application/zip"
+    assert 'filename="aiscientist_results_run0001.zip"' in r.headers["content-disposition"]
+    with zipfile.ZipFile(io.BytesIO(r.content)) as z:
+        assert sorted(z.namelist()) == ["report.md", "tables/a.csv"]
+        assert z.read("tables/a.csv") == b"x\n1\n"
+    assert list(run.glob(".bundle-*")) == []                       # this download's file, and the stale one
+    assert _client().get("/api/bundle/tester/nope").status_code == 404
 
 
 def test_files_unknown_run_is_empty_and_bad_path_404(tmp_path, monkeypatch):

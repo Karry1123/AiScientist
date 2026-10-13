@@ -21,7 +21,7 @@ change-set.** The rebuild column is the point — a size and a path are not a ha
 
 The root was `software/bioagent` until 2026-08-08 and was renamed to `software/AiScientist` to
 match the product name. **`software/bioagent` is now a symlink to it**, deliberately and
-permanently: prod's `/data/BioAgent/app/.env` and any out-of-repo script may still carry the old
+permanently: prod's `/data/aiscientist/app/.env` and any out-of-repo script may still carry the old
 absolute paths, and both spellings must keep resolving. Same zero-downtime pattern as the
 `BIOAGENT_*` / `AISCIENTIST_*` env aliases (CLAUDE.md). **Do not delete the symlink** until every
 `.env` on eyeserver has been checked. Verified after the rename: all 7 `.sif` files resolve through
@@ -34,9 +34,29 @@ which is why our root lives there.
 
 ## Containers — `<root>/containers/` (17 G)
 
-Built with `singularity build --remote` (Sylabs cloud): **HPC3 has no fakeroot** — the user has no
-mapping in `/etc/subuid` — so a `singularity build` from a definition file cannot work there. Each has
-a `deploy/<name>/build_and_stage.sh` in the repo.
+**Runtime: Apptainer (`module load apptainer/1.4.5`) since 2026-10-09.** The images below were built
+before that with `singularity build --remote` (Sylabs cloud), because Singularity on HPC3 had no
+fakeroot (no `/etc/subuid` mapping for us). Apptainer runs every one of them unchanged — measured on
+CPU and GPU nodes, no rebuild needed. It changes how a NEW image is built:
+
+- **`--remote` is gone** (`Error: --remote is no longer supported`). Build on a compute node with
+  `apptainer build --fakeroot` instead: HPC3's apptainer is installed without setuid and fakes root
+  in a root-mapped user namespace, which needs no `/etc/subuid` entry. Verified 2026-10-09 on the
+  repo's own defs: `lirical.def` 31 s, `vep.def` 71 s, `analysis.def` 85 s, `report.def` 36 s; the
+  rebuilt analysis.sif imports scanpy/gseapy/pysam/cyvcf2 and the rebuilt report.sif renders a PDF.
+  Each `deploy/<name>/build_and_stage.sh` prints the exact `sbatch` line.
+- **A `%post` that runs `apt-get` must first run**
+  `echo 'APT::Sandbox::User "root";' > /etc/apt/apt.conf.d/99-aiscientist-fakeroot`. With only root
+  mapped, apt cannot switch to its `_apt` user and dies with `setgroups … Operation not permitted`.
+  The three apt-based defs (analysis, vep, lirical) carry that line.
+- **Keep `APPTAINER_CACHEDIR` off `$HOME`** (point it at `$TMPDIR` on the node): the default
+  `~/.apptainer/cache` fills the home quota with base-image layers.
+- Images are mounted with `squashfuse_ll` (FUSE) rather than the kernel; startup measured the same
+  (analysis.sif ~6 s; vllm-0.28.0.sif imports vLLM in ~14 s). Inside a container the lab group shows
+  as `nogroup`, but host permission checks still use it (dfs3b binds, setgid inheritance unchanged).
+- **Rollback, no code change**: `AISCIENTIST_CONTAINER_BIN=singularity` +
+  `AISCIENTIST_CONTAINER_MODULE=singularity/3.11.3` in the gateway's `.env`, for as long as RCIC keeps
+  that module. An Apptainer-built image runs under singularity/3.11.3 as well.
 
 **Since 2026-10-02 a tool can also declare its image in its `TOOL.md`** (`image:`), and the platform
 provisions it on first use (`gateway/tool_images.py`): a `docker://` image is PULLED, a
@@ -62,7 +82,7 @@ image that shares R/Bioconductor packages does not download them again.
 | `vep.sif` | 241 M | 2026-07-07 | offline Ensembl VEP (+ OpenSpliceAI runs inside it) | `deploy/vep/build_and_stage.sh` |
 | `lirical.sif` | 135 M | 2026-07-14 | LIRICAL v2.4.1 phenotype→disease | `deploy/lirical/build_and_stage.sh` |
 | `cellqc-0.3.6_4509649d69.sif` | ~1.1 G | 2026-10-02 | `run_cellqc`'s image: CellQC 0.3.6, Python 3.12.14, R 4.5.3, Seurat/DoubletFinder/SoupX/scDblFinder (package list at `/opt/conda/aiscientist-packages.txt` inside) | automatic: built on first use from `run_cellqc/TOOL.md` `image:` |
-| `cellqc_0.3.6--pyhdfd78af_1.sif` | 1.1 G | 2026-10-02 | the published BioContainer, pulled to inspect it: **Python 3.14.7**, on which CellQC's nuclear_fraction fails — NOT used; safe to delete | `singularity pull docker://quay.io/biocontainers/cellqc:0.3.6--pyhdfd78af_1` |
+| `cellqc_0.3.6--pyhdfd78af_1.sif` | 1.1 G | 2026-10-02 | the published BioContainer, pulled to inspect it: **Python 3.14.7**, on which CellQC's nuclear_fraction fails — NOT used; safe to delete | `apptainer pull docker://quay.io/biocontainers/cellqc:0.3.6--pyhdfd78af_1` |
 
 **`paperqa.sif` is NOT in this directory** — it was built, but it lives in Ziyao's personal dir
 (see the warning below), so `deploy/paperqa/build_and_stage.sh` has never staged a copy here.
@@ -135,9 +155,13 @@ files is exactly what we do not do. Raise it with Ziyao; the destination if he a
 ## Per-user session state — `$HOME/.bioagent/` (2.4 M)
 
 `serve.sbatch` / `serve.gpu.sbatch` / `serve.free_gpu32.sbatch`, `vllm.<jobid>.port` + `vllm.port`
-(how the gateway finds a running vLLM), and stale `analysis/ jobs/ ollama/ report/ runcode/
-variant/` dirs left over from before scratch moved to dfs3b. Small; not swept. Note `$HOME` is a
-separate, much smaller quota than dfs3b.
+and `vllm.<jobid>.spec` (how the gateway finds and steers a running vLLM), with the serve job's log
+beside it at `$HOME/bioagent-vllm-<jobid>.log`. These are the only files the application still
+writes in the home directory. The `analysis/ jobs/ ollama/ report/ runcode/ variant/` dirs there are
+left over: job files went to `Temp/<ucinetid>/scratch/` in two steps (2026-08-08, and the analysis,
+report and worker lines on 2026-10-12) and can be deleted by hand, see
+`docs/hpc3_storage_layout.md`. Small; not swept. Note `$HOME` is a separate, much smaller quota
+than dfs3b.
 
 ## Legacy per-member dirs — `/dfs3b/ruic20_lab/<ucinetid>/`
 

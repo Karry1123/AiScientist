@@ -59,8 +59,11 @@ def _http_error(code: int, body: str = "{}") -> urllib.error.HTTPError:
 def test_presets_are_public_data_only():
     presets = lp.public_presets()
     keys = {p["key"] for p in presets}
-    assert {"openrouter", "custom"} <= keys
-    assert all(set(p) == {"key", "label", "base_url", "lists_models", "key_url", "note"} for p in presets)
+    assert {"openrouter", "anthropic", "custom"} <= keys
+    assert all(set(p) == {"key", "label", "base_url", "lists_models", "key_url", "note", "transport"}
+               for p in presets)
+    assert {p["key"]: p["transport"] for p in presets}["anthropic"] == "anthropic"
+    assert {p["transport"] for p in presets if p["key"] != "anthropic"} == {"openai"}
 
 
 def test_custom_preset_has_no_base_url():

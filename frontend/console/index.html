@@ -249,9 +249,10 @@
                 <!-- Axis B: WHICH ENGINE answers. Explicit and user-visible on purpose — a
                      classifier that silently sent a real study down the fast path would return a
                      fluent answer with no analysis behind it. Research stays the default. -->
-                <select id="routeSelect" class="workflow-select" title="Chat = a fast, streaming answer that starts typing immediately and can look things up (literature, HPO). No plan, no analysis, no report. Research = the full lab: the PI plans, tools run on HPC3, and you get a report + downloadable results.">
+                <select id="routeSelect" class="workflow-select" title="Chat = a fast, streaming answer that starts typing immediately and can look things up (literature, HPO). No plan, no analysis, no report. Research = the full lab: the PI plans, tools run on HPC3, and you get a report + downloadable results. Corpus scan = one HPC3 job reads EVERY paper of the indexed corpus and writes genes.csv + hits.csv (genes explicitly reported as haploinsufficient in retinal disease, with verbatim quotes). No plan, no report; about an hour. One pick is one scan: after Send the composer goes back to the engine this chat was using.">
                   <option value="research" selected>🔬 Research (full pipeline)</option>
                   <option value="chat">💬 Chat (fast answer)</option>
+                  <option value="corpus">📚 Corpus scan (haploinsufficient genes → CSV)</option>
                 </select>
                 <select id="modeSelect" class="workflow-select" title="How to run the research. Auto = the PI decides (a single scientist or a Virtual-Lab team). Single agent = one scientist. Virtual Lab = a team of expert agents that deliberate (Virtual-Lab style). The PI picks the analysis preset pipeline automatically — you don't.">
                   <option value="auto" selected>✨ Auto (PI decides)</option>
@@ -260,10 +261,11 @@
                 </select>
                 <label class="pipeline-toggle" title="The PI proposes a plan first; you refine it in chat (no manual editing) before any tool runs"><input id="planMode" type="checkbox" checked /> Plan first (PI proposes; refine in chat)</label>
                 <label class="pipeline-toggle" title="Bypass mode: run the whole research loop end-to-end with NO human gates — no plan review and no decision-point pauses (the agent decides at every fork). Stop and mid-run notes still work. Off = Manual (review gates on)."><input id="autonomousMode" type="checkbox" /> Bypass (run autonomously, no HITL)</label>
+                <label class="pipeline-toggle" title="When the run completes, save what it hands on to your data: the processed dataset (.h5ad) and, after CellQC, CellQC's whole result folder. They appear in Datasets, ready for the next analysis, with nothing to download or upload. Off = they are kept beside the run for a few days, and Runs → “Save to my data” saves them."><input id="saveResults" type="checkbox" /> Save results to my data</label>
                 <div id="datasetChips" class="dataset-chips" title="The data file(s) the next run will use — attach several (a VCF + a BED panel + a 2nd VCF); ★ marks the primary"></div>
                 <div id="caseNoteChips" class="dataset-chips" title="The patient's clinical description the next run will map to HPO terms"></div>
                 <input id="datasetInput" type="hidden" />
-                <input id="datasetFile" type="file" class="hidden" multiple accept=".h5ad,.h5,.loom,.csv,.tsv,.txt,.vcf,.vcf.gz,.bed,.bed.gz,.json" />
+                <input id="datasetFile" type="file" class="hidden" multiple accept=".h5ad,.h5,.loom,.csv,.tsv,.txt,.vcf,.vcf.gz,.bed,.bed.gz,.json,.zip,.tar,.tgz,.gz" />
                 <input id="datasetDir" type="file" class="hidden" webkitdirectory directory multiple />
                 <input id="caseNoteFile" type="file" class="hidden" accept=".txt,.md,.text" />
                 <div class="data-menu-wrap">
@@ -517,19 +519,24 @@
              is close to invisible — it needs you to already suspect that typing will suggest
              something. The list is fetched as soon as we have a key to fetch it with, so clicking
              the box usually just shows it; ↻ re-asks. -->
-        <label>Model <span class="hint-inline">required — click the box to search what this endpoint serves</span>
+        <!-- PI & Critic first: it is the model that plans, judges and writes, so it is the one a
+             user means by "which model". The Scientist's model is the optional second choice (it
+             makes the most calls, so a cheaper one there is where money is saved). Stored the
+             other way round — `model` is the Scientist's and required, `lab_model` the PI's and
+             optional — so app.js maps the two fields on load and on save (credRoles). -->
+        <label>Model for PI &amp; Critic <span class="hint-inline">required — plans, critiques and writes the report; click the box to search what this endpoint serves</span>
           <div class="model-row-controls combo">
-            <input id="apiKeyModel" type="text" placeholder="click to search, or type an id" autocomplete="off"
-                   role="combobox" aria-expanded="false" aria-autocomplete="list" aria-controls="apiKeyModelMenu" />
-            <div id="apiKeyModelMenu" class="combo-menu hidden" role="listbox"></div>
+            <input id="apiKeyLabModel" type="text" placeholder="click to search, or type an id" autocomplete="off"
+                   role="combobox" aria-expanded="false" aria-autocomplete="list" aria-controls="apiKeyLabModelMenu" />
+            <div id="apiKeyLabModelMenu" class="combo-menu hidden" role="listbox"></div>
             <button id="apiKeyFetchModels" type="button" class="icon-btn" title="Re-read the model list from this endpoint">↻</button>
           </div>
         </label>
-        <label>Model for PI &amp; Critic <span class="hint-inline">optional — a stronger model for planning and critique only</span>
+        <label>Model for the Scientist <span class="hint-inline">optional — runs the tool calls, the bulk of the requests; a cheaper model here saves the most</span>
           <div class="combo">
-            <input id="apiKeyLabModel" type="text" placeholder="leave blank to use the same model" autocomplete="off"
-                   role="combobox" aria-expanded="false" aria-autocomplete="list" aria-controls="apiKeyLabModelMenu" />
-            <div id="apiKeyLabModelMenu" class="combo-menu hidden" role="listbox"></div>
+            <input id="apiKeyModel" type="text" placeholder="leave blank to use the same model" autocomplete="off"
+                   role="combobox" aria-expanded="false" aria-autocomplete="list" aria-controls="apiKeyModelMenu" />
+            <div id="apiKeyModelMenu" class="combo-menu hidden" role="listbox"></div>
           </div>
         </label>
         <label>Label <span class="hint-inline">optional</span>
@@ -580,6 +587,7 @@
 
   <div id="toast" class="toast"></div>
   <script src="/static/cytoscape.min.js"></script>
+  <script src="/static/tus.min.js"></script>
   <script src="/static/app.js"></script>
 </body>
 </html>

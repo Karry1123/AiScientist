@@ -29,7 +29,7 @@ Design posture:
   prompt; external literature queries are sanitized (a bare filename and the question,
   never data).
 - **Heavy compute stays on HPC3.** GPU inference, `run_code`, scanpy analysis, report
-  rendering, scGPT, and VL review all run as Singularity-contained Slurm jobs on the
+  rendering, scGPT, and VL review all run as Apptainer-contained Slurm jobs on the
   cluster — never silently on the web server.
 - **Honest over impressive.** Tools report failures instead of faking success; a
   deterministic guard refuses to let the Critic "accept" a step whose tool run errored
@@ -45,7 +45,7 @@ Design posture:
    SSHes to `hpc3.rcic.uci.edu` with your UCInetID + interactive **Duo**. HPC3 credentials are never stored — only a bcrypt
    hash of the *app* password lives in the DB.
 2. **Serve the model.** A per-user Slurm GPU job serves `RedHatAI/Qwen3.8-27B-INT4`
-   via **vLLM** (Singularity, OpenAI-compatible `/v1`) on a dynamic port; the console
+   via **vLLM** (Apptainer, OpenAI-compatible `/v1`) on a dynamic port; the console
    SSH-tunnels to it. Jobs are per-user-isolated (`squeue --me`) and the model is warmed
    on connect so the first query isn't stuck on the cold load from shared DFS.
 3. **Upload a dataset.** Resumable chunked upload; the file streams straight to your
@@ -67,11 +67,11 @@ Browser ──HTTPS──▶ Envoy Gateway (<PUBLIC_HOSTNAME>)
                         │
                         ▼
         eyeserver: FastAPI + WebSocket console  ← accounts, chat history, uploads,
-        (systemd `bioagent.service`, Postgres)    orchestration, report assembly
+        (systemd `aiscientist.service`, Postgres)  orchestration, report assembly
                         │  SSH + Duo, per-session tunnel
                         ▼
         UCI HPC3 (Slurm): vLLM GPU serve (Qwen3.8-27B) · run_code · scanpy analysis ·
-        pandoc/XeLaTeX report render · scGPT · VL review — all Singularity-contained
+        pandoc/XeLaTeX report render · scGPT · VL review — all Apptainer-contained
 ```
 
 The web console (`src/aiscientist/gateway/`) is a deployable FastAPI + WebSocket app; the
@@ -122,7 +122,7 @@ Flags (gateway env, all default off): `AISCIENTIST_PLANNER=dag`,
 
 - **Single-cell analysis** (`tools/scrna_pack.py`) — real scanpy QC → clustering → DE →
   gseapy Enrichr enrichment, emitting deterministic scanpy/matplotlib figures and tables;
-  runs as a Singularity Slurm job on HPC3.
+  runs as an Apptainer Slurm job on HPC3.
 - **`run_code`** — a CodeAct sandbox that reads the run's dataset + checkpoints and writes
   new artifacts, with a real per-snippet memory cap (runs on HPC3).
 - **Literature** — `literature_search` (Europe PMC keyword retrieval) and
@@ -161,10 +161,10 @@ References: `https://rcic.uci.edu/account/login.html`,
 
 ## Deploy & run
 
-**Production (eyeserver).** The console runs as a host systemd unit (`bioagent.service`,
-user `aiscientist`, `/data/BioAgent/app`), bound to the node IP on `:8800`, fronted by
+**Production (eyeserver).** The console runs as a host systemd unit (`aiscientist.service`,
+user `aiscientist`, `/data/aiscientist/app`), bound to the node IP on `:8800`, fronted by
 the `aiscientist` Kubernetes Service → Envoy Gateway at `<PUBLIC_HOSTNAME>`.
-Config/secrets are read from `/data/BioAgent/app/.env` (see
+Config/secrets are read from `/data/aiscientist/app/.env` (see
 `configs/aiscientist.example.env` and [`deploy/`](deploy/)). Redeploy backend changes with
 `./deploy/redeploy.sh` (rsync + `systemctl restart` — drops live sessions; there is no
 zero-downtime backend path). Full deploy kit, TLS, and systemd notes:

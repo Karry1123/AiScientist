@@ -15,7 +15,7 @@ Turns a diagram written as text into a figure, with a deterministic renderer: Gr
 ## When the agent uses it
 
 - For conceptual figures in a report: the analysis workflow, a signalling pathway, a proposed mechanism.
-- The gateway also uses its DOT renderer for the report's workflow figure (`render_dot`, `workflow_schematic_dot` through `tools/api.py`).
+- The gateway also uses its DOT renderer for the report's workflow figure (`render_workflow_schematic` through `tools/api.py`): one box per plan step holding its number and title, a long plan folded into rows, and the layout chosen so the figure stays between 1:2 and 4:1.
 
 ## Inputs
 
@@ -30,6 +30,7 @@ Turns a diagram written as text into a figure, with a deterministic renderer: Gr
 ## Outputs
 
 - A figure under `artifacts/figures/` and its path.
+- For a PNG: its `width` and `height` in pixels, and a warning when one side is more than 8 times the other. Such a figure would print as a strip, and the report does not embed it (`reporting/figure_checks.py`).
 
 ## Where it runs
 
@@ -47,6 +48,7 @@ On the fast chat path: no (research runs only).
 
 - Not for data plots; those come from the analysis tools.
 - Graphviz must be installed on the gateway; D2 and Mermaid are optional.
+- The workflow figure shows each step's title only (its bold opening, else its first clause, cut to three short lines). The full text of a step is in the plan and in the Methods.
 
 ## Code and tests
 

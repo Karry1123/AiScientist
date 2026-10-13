@@ -98,6 +98,11 @@ def build_scientist_catalog(code_executor: Any = None, scgpt_runner: Any = None,
     offline VEP (the REST path stays the in-process fallback for small VCFs), ``phenotype_executor``
     LIRICAL, ``literature_executor`` PaperQA. A tool goes to the one its manifest names.
 
+    A manifest that says ``research: false`` is left out: that tool runs only from its own console
+    line (the corpus scan is an hour-long job the user starts, with a workspace of its own), so
+    the PI cannot plan it and the Scientist cannot call it. The line reaches it by name through
+    its executor, not through this catalog.
+
     ``scgpt_runner`` is the gateway-injected remote executor for the scGPT GPU batch job; the
     ``scgpt_annotate`` tool is always present (it self-reports not-enabled without one, so the System
     page can list it), like ``run_code`` without a sandbox.
@@ -113,7 +118,8 @@ def build_scientist_catalog(code_executor: Any = None, scgpt_runner: Any = None,
     executors = {"hpc:analysis": analysis_executor, "hpc:variant": variant_executor,
                  "hpc:phenotype": phenotype_executor, "hpc:literature": literature_executor}
     catalog: list[HarnessTool] = list(default_catalog())                  # finish + smoke QC/DE
-    catalog += tool_catalog.build_tools({"scgpt_runner": scgpt_runner}, route=_router(executors))
+    catalog += tool_catalog.build_tools({"scgpt_runner": scgpt_runner}, where=lambda m: m.research,
+                                        route=_router(executors))
     catalog.append(make_run_code_tool(code_executor))                      # CodeAct (needs the sandbox)
     # A skill's declared environment (SKILL.md ``image:``) — only when the executor can run images
     # on HPC3, so a local run's roster stays honest.

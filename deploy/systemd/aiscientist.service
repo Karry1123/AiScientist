@@ -1,0 +1,49 @@
+# systemd unit for the AiScientist console.
+#
+# Replaces hand-running ./start.sh: keeps the app alive (Restart=always), starts it on
+# boot, and gives one-command restarts for the frequent-update workflow:
+#     sudo systemctl restart aiscientist.service   # picks up new backend code (frontend is hot)
+#     sudo systemctl status  aiscientist.service
+#     journalctl -u aiscientist -f                 # live logs (incl. the code-fingerprint line)
+#
+# Bind address: on the eyeserver the Envoy Gateway terminates TLS on :443 and routes to the host's
+# internal node IP, so the unit binds that IP (--host 128.200.71.197), not 127.0.0.1. On a bare
+# host behind nginx (deploy/nginx/) bind 127.0.0.1 instead.
+# Because the app is a stateful singleton (per-session SSH tunnels to HPC3), a restart drops
+# live sessions; users simply reconnect. There is no zero-downtime path for backend changes.
+#
+# Install (run as a user with sudo on eyeserver):
+#     sudo cp deploy/systemd/aiscientist.service /etc/systemd/system/aiscientist.service
+#     # edit User= / paths / --host below if your service account or layout differ
+#     sudo systemctl daemon-reload
+#     sudo systemctl enable --now aiscientist.service
+# Until 2026-10 the unit was bioagent.service and the root /data/BioAgent; scripts/migrate_prod_root.sh
+# moved both (see deploy/README.md, "Moving the deployment root").
+#
+# Config/secrets are read from /data/aiscientist/app/.env by the app itself (load_project_env).
+# For the PUBLIC deploy that .env MUST set:  AISCIENTIST_SECRET_KEY=<strong-random>  and
+# AISCIENTIST_PUBLIC_HTTPS=1  (marks session cookies Secure). See deploy/README.md.
+
+[Unit]
+Description=AiScientist console (FastAPI/uvicorn)
+After=network-online.target postgresql.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+# Service account (nologin). See deploy/public-domain-tls.md.
+User=aiscientist
+Group=aiscientist
+WorkingDirectory=/data/aiscientist/app
+# The app loads /data/aiscientist/app/.env on startup; EnvironmentFile is belt-and-suspenders
+# for anything read at import time. Comment out if you rely solely on the app's .env loader.
+EnvironmentFile=-/data/aiscientist/app/.env
+ExecStart=/data/aiscientist/env/bin/python -m aiscientist.gateway --host 128.200.71.197 --port 8800
+Restart=always
+RestartSec=2
+# Give in-flight requests a moment to drain on restart.
+TimeoutStopSec=20
+KillSignal=SIGINT
+
+[Install]
+WantedBy=multi-user.target

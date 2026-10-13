@@ -5,8 +5,9 @@ were deleted once the report existed, and nothing copied them anywhere, so a run
 but no dataset the next analysis could start from (run f3b8268c4fd4: a 39 MB bundle of tables and
 figures for a 16,750-cell library, no .h5ad). This builds that dataset before the checkpoints go:
 
-- the BASE is the QC checkpoint: every gene that passed QC, ``X`` log-normalised, the raw integer
-  counts in ``layers["counts"]``. (A later checkpoint may hold only the highly variable genes in a
+- the BASE is the QC checkpoint: every gene that passed QC, ``X`` log-normalised, the integer
+  counts in ``layers["counts"]`` (AMBIENT-CORRECTED when run_cellqc made the checkpoint; the QC tool
+  says which in ``uns["counts_layer"]``, and the pointer repeats it). (A later checkpoint may hold only the highly variable genes in a
   scaled ``X``, which no next analysis can start from.)
 - every later checkpoint adds what it computed: ``obs`` columns (clusters, cell types, scores,
   doublet calls) and ``obsm`` embeddings (PCA, UMAP), aligned by cell barcode, newest first.
@@ -35,6 +36,8 @@ CHECKPOINTS = ("adata_annotated.h5ad", "adata_de.h5ad", "adata_integrated.h5ad",
                "adata_scored.h5ad", "adata_clustered.h5ad", "adata_qc.h5ad")
 BASE_CHECKPOINT = "adata_qc.h5ad"
 POINTER = "result_dataset.json"
+# CellQC's complete result/ directory, kept with the run by run_cellqc (which writes this pointer).
+CELLQC_POINTER = "cellqc_result.json"
 # Stems that say nothing about the data: name the result after the folder holding them instead.
 _GENERIC_STEMS = {"filtered_feature_bc_matrix", "raw_feature_bc_matrix", "matrix", "data",
                   "adata", "counts", "sample_filtered_feature_bc_matrix"}
@@ -43,6 +46,16 @@ _GENERIC_STEMS = {"filtered_feature_bc_matrix", "raw_feature_bc_matrix", "matrix
 def result_name(dataset_path: str, run_id: str, when: "_dt.datetime | None" = None) -> str:
     """``<input>.processed.<YYYYmmdd-HHMM>.<run_id>.h5ad`` — the data it came from, that it is
     processed, when, and by which run, readable in a plain directory listing."""
+    return _named(dataset_path, run_id, when, "processed") + ".h5ad"
+
+
+def cellqc_result_name(dataset_path: str, run_id: str, when: "_dt.datetime | None" = None) -> str:
+    """``<input>.cellqc.<YYYYmmdd-HHMM>.<run_id>`` — the folder CellQC's result directory becomes
+    when it is saved to the user's data."""
+    return _named(dataset_path, run_id, when, "cellqc")
+
+
+def _named(dataset_path: str, run_id: str, when: "_dt.datetime | None", what: str) -> str:
     p = Path(dataset_path or "dataset")
     stem = p.name
     for suffix in (".h5ad", ".h5", ".loom", ".gz", ".csv", ".tsv", ".txt"):
@@ -55,7 +68,7 @@ def result_name(dataset_path: str, run_id: str, when: "_dt.datetime | None" = No
     stem = re.sub(r"[^A-Za-z0-9._-]+", "_", stem).strip("._-") or "dataset"
     stamp = (when or _dt.datetime.now()).strftime("%Y%m%d-%H%M")
     run = re.sub(r"[^A-Za-z0-9]+", "", run_id or "")[:32] or "run"
-    return f"{stem[:80]}.processed.{stamp}.{run}.h5ad"
+    return f"{stem[:80]}.{what}.{stamp}.{run}"
 
 
 def _checkpoints(work: Path) -> "list[Path]":
@@ -194,7 +207,8 @@ def export(workspace: "str | Path", name: str, meta: "dict[str, Any] | None" = N
         "name": name, "path": str(out), "size_bytes": size,
         "n_cells": int(adata.n_obs), "n_genes": int(adata.n_vars),
         "X": "log-normalised expression, all genes that passed QC (sparse)",
-        "layers": sorted(adata.layers.keys()), "obs_columns": [str(c) for c in adata.obs.columns],
+        "layers": sorted(adata.layers.keys()),
+        "counts_layer": str(adata.uns.get("counts_layer") or "integer counts kept by the QC step"), "obs_columns": [str(c) for c in adata.obs.columns],
         "obsm": sorted(adata.obsm.keys()), "checkpoints": used, "notes": notes,
         "created_at": provenance["created_at"], "saved_to": None,
         "cells_table": "tables/cells.csv", **_plain(meta or {}),

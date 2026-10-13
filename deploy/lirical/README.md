@@ -10,8 +10,8 @@ The orchestration that *runs* the image is built + offline-tested (`src/aiscient
 + `phenotype_cli.py`, driven by `SlurmAnalysisExecutor` with an injected runner — no cluster, no
 LIRICAL, no network in CI: `tests/test_phenotype_dx.py`). This folder is the **image + data build kit**.
 
-> ⚠️ macOS cannot build `.sif`. Build on **HPC3** (a **login node** — the downloads need internet) or
-> any Linux host with `singularity`.
+> ⚠️ macOS cannot build `.sif`. Build on an **HPC3 compute node** (`standard` nodes have egress for the
+> downloads; RCIC bans builds and downloads on login nodes) or any Linux host with `apptainer`.
 
 ## Two scoring modes
 
@@ -38,13 +38,13 @@ Phenotype-only mode needs **no** Exomiser DB and is usable immediately.
 ## Build & stage
 
 ```bash
-# on an HPC3 LOGIN node, from a checkout of this repo:
-module load singularity            # HPC3 has apptainer/1.4.5, singularity/3.11.3
+# on HPC3, from a checkout of this repo (builds + downloads go to a COMPUTE node: RCIC bans them on
+# the login nodes, and `standard` compute nodes have egress):
 cd deploy/lirical
 
-# 1. build the image (deps-only: JRE 17 + LIRICAL v2 CLI baked in) — pick a route the script prints
-singularity build --fakeroot lirical.sif lirical.def       # if RCIC enables --fakeroot
-#   ...or `singularity build --remote lirical.sif lirical.def`
+# 1. build the image (deps-only: JRE 17 + LIRICAL v2 CLI baked in) — Apptainer --fakeroot, no /etc/subuid entry needed
+sbatch -p standard -A ruic20_lab -c 8 --mem=16G -t 04:00:00 -J build-lirical --wait \
+  --wrap 'module load apptainer/1.4.5 && APPTAINER_CACHEDIR=$TMPDIR/ac apptainer build --fakeroot lirical.sif lirical.def'
 
 # 2. stage the .sif + download the LIRICAL phenotype data (required); Exomiser DB is opt-in
 BUILT=1 ./build_and_stage.sh                       # phenotype-only (no Exomiser)

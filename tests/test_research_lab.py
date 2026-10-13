@@ -573,6 +573,201 @@ def test_pi_plan_guard_collapses_duplicate_literature_steps():
                       "DDX41 in the retina and attach DOI-backed citations."]
 
 
+# --- the literature guard follows what the user SAID about literature, not the words they used ---
+# Prod run 1e887ed2bf8e (2026-10-12). In plan review the user typed "only keep 1. cell QC quality
+# control ,discard all other step" and then "also discard the literature ,only first part.". The
+# PI's redraft dropped the literature step and said so; the guard put it back both times: first
+# because the protocol text says "reference" and "Literature", then because the note asking for
+# the removal contains the word "literature". The approved plan ran four literature searches.
+
+_QC_STEP = "**Cell QC** — Quality-control the delivery with `run_cellqc` and report what was removed."
+_CLUSTER_STEP = "**Clustering** — Cluster the cells with `run_clustering` and draw the UMAP."
+_LIT_STEP = ("**Mouse retina literature grounding** — Search the published literature with "
+             "`deep_literature` for mouse retina cell-type markers and attach DOI-backed citations.")
+# What the celltype_annotation protocol hands the PI in every run it matches: "reference" as
+# something to annotate against, and a literature stage.
+_PROTOCOL = ('5. Annotate with `run_marker_annotation`: for a curated reference pass '
+             '`reference: "retina"` and NO panel, or score against the reference panel.\n'
+             "6b. **Literature grounding** (`literature_search`): search on the cell types and "
+             "markers, and attach the references to the report.")
+_QC_REQUEST = "Run CellQC on the uploaded sample to generate quality control report."
+_LIT_REQUEST = "Annotate the mouse retina cell types and give me references for the markers."
+
+
+def _guard_lab(*drafts, **config):
+    """A lab that has the literature tools and whose PI answers each (re)draft with the next of
+    ``drafts`` (the last one repeats). A single-step patch is declined, as it is for any request
+    that removes a step; every other model call gets an empty reply."""
+    left = list(drafts)
+
+    def complete(messages):
+        system = messages[0]["content"]
+        if "revising ONE step" in system:
+            return '{"step": 0, "new_text": ""}'
+        if "Principal Investigator of a bioinformatics lab" in system:
+            return json.dumps({"agenda": left.pop(0) if len(left) > 1 else left[0]})
+        return "{}"
+
+    tools = [HarnessTool(name, f"{name} tool", {"type": "object", "properties": {}},
+                         lambda _args, _ctx: {"status": "ok"}, category="analysis")
+             for name in ("run_cellqc", "run_clustering", "deep_literature", "literature_search")]
+    return ResearchLab(_ctx(), LabConfig(**config), complete_fn=complete,
+                       scientist=ResearchHarness(catalog=tools))
+
+
+def _revise(lab, question, prior, *notes):
+    """The plan after the LAST of ``notes``, typed at ``prior``; the earlier notes are the log."""
+    kind, agenda = lab._pi_plan(question, lambda _event: None, feedback="\n".join(notes),
+                                prior_agenda=list(prior), latest_feedback=notes[-1])
+    assert kind == "agenda"
+    return agenda
+
+
+def test_a_review_note_that_removes_literature_does_not_put_it_back():
+    lab = _guard_lab([_QC_STEP, "SELF-SOURCED: The literature step was removed as requested."],
+                     preset_prompt=_PROTOCOL)
+    first = "only keep 1. cell QC quality control ,discard all other step"
+    second = "also discard the literature ,only first part."
+
+    assert _revise(lab, _QC_REQUEST, [_QC_STEP, _LIT_STEP], first) == [_QC_STEP]
+    assert _revise(lab, _QC_REQUEST, [_QC_STEP, _LIT_STEP], first, second) == [_QC_STEP]
+    # The plan and the PI's own note about it now say the same thing.
+    assert "literature step was removed" in lab._self_sourced
+
+
+def test_plan_review_shows_the_plan_the_note_asked_for():
+    """The same, through the review loop: the PI planned literature off the protocol, the user
+    took it out, and the next card is the one-step plan."""
+    lab = _guard_lab([_QC_STEP, _LIT_STEP], [_QC_STEP], preset_prompt=_PROTOCOL, mode="single")
+    shown: list[list[str]] = []
+    replies = [{"action": "revise", "feedback": "also discard the literature ,only first part."},
+               {"action": "cancel"}]
+
+    def review(kind, payload):
+        shown.append(list(payload))
+        return replies[len(shown) - 1]
+
+    events: list[dict] = []
+    lab.run(_QC_REQUEST, events.append, plan_review=review)
+
+    assert shown == [[_QC_STEP, _LIT_STEP], [_QC_STEP]]
+    # What went is in front of the reviewer, as with any step a redraft drops.
+    delta = [e for e in events if e.get("type") == "plan_redraft_delta"]
+    assert delta and delta[-1]["dropped"] == [_LIT_STEP]
+
+
+def test_a_request_for_literature_still_gets_the_step_the_pi_forgot():
+    from aiscientist.agents.research_lab import _is_literature_step
+
+    lab = _guard_lab([_QC_STEP, _CLUSTER_STEP])
+    kind, agenda = lab._pi_plan(_LIT_REQUEST, lambda _event: None)
+    assert kind == "agenda" and agenda[:2] == [_QC_STEP, _CLUSTER_STEP]
+    assert len(agenda) == 3 and _is_literature_step(agenda[2])
+    # A redraft that loses the step while changing something else gets back the step the user
+    # reviewed, word for word, not a newly written one.
+    assert _revise(lab, _LIT_REQUEST, [_QC_STEP, _CLUSTER_STEP, _LIT_STEP],
+                   "use resolution 0.8 for the clustering") == [_QC_STEP, _CLUSTER_STEP, _LIT_STEP]
+    # Asked for in review, on a plan that has none.
+    agenda = _revise(lab, _QC_REQUEST, [_QC_STEP, _CLUSTER_STEP],
+                     "add a literature step on the marker genes")
+    assert len(agenda) == 3 and _is_literature_step(agenda[2])
+
+
+@pytest.mark.parametrize("note", [
+    "drop the literature step",
+    "no references needed",
+    "the literature search is not needed",
+    "remove step 3",                                       # by its number: no literature word at all
+    "only keep step 1 and 2, discard all other steps",
+    "不要文献",
+    "去掉文献",
+    "文献步骤也去掉",
+    "把文献检索删掉",
+    "删掉第三步",
+    "只保留前两步",
+])
+def test_a_removal_in_review_wins_over_a_question_that_asked_for_literature(note):
+    lab = _guard_lab([_QC_STEP, _CLUSTER_STEP])
+    assert _revise(lab, _LIT_REQUEST, [_QC_STEP, _CLUSTER_STEP, _LIT_STEP], note) \
+        == [_QC_STEP, _CLUSTER_STEP]
+
+
+def test_a_removed_literature_step_stays_out_until_the_user_asks_for_it_again():
+    from aiscientist.agents.research_lab import _is_literature_step
+
+    lab = _guard_lab([_QC_STEP, _CLUSTER_STEP])
+    removal, other = "去掉文献", "use resolution 0.8 for the clustering"
+    # The next note is about something else, typed at a plan that no longer has the step.
+    assert _revise(lab, _LIT_REQUEST, [_QC_STEP, _CLUSTER_STEP], removal, other) \
+        == [_QC_STEP, _CLUSTER_STEP]
+    agenda = _revise(lab, _LIT_REQUEST, [_QC_STEP, _CLUSTER_STEP], removal, other,
+                     "add the literature step back")
+    assert len(agenda) == 3 and _is_literature_step(agenda[2])
+
+
+def test_a_protocol_naming_a_reference_panel_or_literature_forces_no_step():
+    lab = _guard_lab([_QC_STEP, _CLUSTER_STEP], preset_prompt=_PROTOCOL)
+    for question in (_QC_REQUEST,
+                     # ...and neither do the user's words, when the reference is what the
+                     # analysis is run against.
+                     "Annotate the clusters against the retina reference panel."):
+        assert lab._pi_plan(question, lambda _event: None) == ("agenda", [_QC_STEP, _CLUSTER_STEP])
+
+
+def test_what_a_sentence_says_about_literature():
+    from aiscientist.agents.research_lab import _literature_wish, _requests_literature
+
+    asks = ["Analyze DDX41 knockout mouse retina and include relevant literature context",
+            "Add citations for the top genes.",
+            "remove step 2 and add a literature step",
+            "discard the enrichment step and keep the literature step",
+            "skip clustering and search the literature for DDX41",
+            "make the literature step focus on rod photoreceptors",
+            "加上文献检索", "去掉富集保留文献", "分析这个数据并做文献检索"]
+    declines = ["also discard the literature ,only first part.",
+                "QC only, no clustering, no literature",
+                "don't add a literature step",
+                "I don't think we should add literature",
+                "no need to include references",
+                "we don't need the literature step",
+                "the literature step is not needed",
+                "discard the enrichment and literature steps",
+                "remove literature and add GSEA instead",
+                "不要文献", "去掉文献", "文献步骤也去掉", "把文献检索删掉", "文献不要了",
+                "不要保留文献", "去掉富集、文献", "不做聚类、注释、run_de、enrichment、GSEA 和文献检索"]
+    silent = [_QC_REQUEST, "only keep 1. cell QC quality control ,discard all other step",
+              "Align to the reference genome.", "Score the markers against the reference panel.",
+              "只保留第一步"]
+    for text in asks:
+        assert _literature_wish(text) is True and _requests_literature(text), text
+    for text in declines:
+        assert _literature_wish(text) is False and not _requests_literature(text), text
+    for text in silent:
+        assert _literature_wish(text) is None and not _requests_literature(text), text
+    # Read in order: the later sentence is the one that holds.
+    assert _literature_wish("Analyse it with literature context", "drop the literature step") is False
+    assert _literature_wish("No literature.", "add a literature step") is True
+    assert not _requests_literature(_PROTOCOL.splitlines()[0])       # "reference", "reference panel"
+
+
+def test_a_review_note_asking_for_literature_overrules_the_first_messages_limit():
+    """The scope is read from the first message only. A note typed at the plan is the newer
+    instruction, in both directions."""
+    from aiscientist.agents.research_lab import _is_literature_step
+    from aiscientist.agents.scope import read_scope
+
+    question = "Only run QC on this sample. No literature search."
+    lab = _guard_lab([_QC_STEP])
+    lab._scope = read_scope(question, {t.name: t.description for t in lab.scientist.catalog})
+    assert not lab._scope.allows_literature()
+    assert lab._pi_plan(question, lambda _event: None) == ("agenda", [_QC_STEP])
+
+    asked = "add a literature step on the marker genes"
+    agenda = _revise(lab, question, [_QC_STEP], asked)
+    assert len(agenda) == 2 and _is_literature_step(agenda[1])
+    assert _revise(lab, question, agenda, asked, "remove the literature step") == [_QC_STEP]
+
+
 def test_literature_context_step_is_deterministically_routed_to_literature_search():
     calls = []
 

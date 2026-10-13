@@ -16,6 +16,8 @@ from .._lib.scrna import (
     _DEFAULT_GENE_SETS,
     _dirs,
     _genesets_dir,
+    gene_sets_note,
+    installed_gene_sets,
     _missing,
     _p,
     _rel,
@@ -148,7 +150,7 @@ def run_enrichment(args: dict[str, Any], ctx: Any) -> dict[str, Any]:
     """Over-representation analysis (ORA) on the top DE genes per group — OFFLINE, against
     LOCAL ``.gmt`` gene-set files (``gseapy.enrich``), NOT the Enrichr web API.
 
-    The analysis runs in a network-OFF Slurm/Singularity container, so a web API (Enrichr)
+    The analysis runs in a network-OFF Slurm/Apptainer container, so a web API (Enrichr)
     can never reach out; and local GMTs are also more reproducible (pinned library versions,
     no rate limits). Download the libraries once with ``scripts/fetch_genesets.py`` into
     :func:`_genesets_dir`. Writes an enrichment table + bar plot per group; returns top terms.
@@ -203,8 +205,7 @@ def run_enrichment(args: dict[str, Any], ctx: Any) -> dict[str, Any]:
                 "error": (f"no USABLE local gene-set (.gmt) library found in {gdir} for {gene_sets}. "
                           + ("Present but degenerate: "
                              + "; ".join(degenerate_libs.values()) + " " if degenerate_libs else "")
-                          + "Offline enrichment needs local GMTs (the analysis container has no "
-                            "network) — run scripts/fetch_genesets.py to download them.")}
+                          + gene_sets_note(gene_sets))}
 
     # Prefer DE results computed this run — for ANY groupby (leiden, majorclass, cell_type, …),
     # so enrichment runs PER CLASS instead of collapsing to one pooled list. run_de writes
@@ -446,6 +447,11 @@ def run_enrichment(args: dict[str, Any], ctx: Any) -> dict[str, Any]:
     }
 
 
+def _installed_line() -> str:
+    have = installed_gene_sets()
+    return (f"Installed libraries: {', '.join(have)}; no other can be used." if have else "")
+
+
 def make_tool() -> HarnessTool:
     """The ``run_enrichment`` record for the Scientist's catalog (see ``TOOL.md``)."""
     return HarnessTool(
@@ -463,7 +469,8 @@ def make_tool() -> HarnessTool:
         "separately, so a down-regulated programme cannot be cancelled out by an up-regulated "
         "one; `split_direction: false` disables that. "
         "`gene_sets` are library names resolved to local .gmt files "
-        "(default GO_Biological_Process_2023 / Reactome_2022 / MSigDB_Hallmark_2020).",
+        "(default GO_Biological_Process_2023 / Reactome_2022 / MSigDB_Hallmark_2020). "
+        + _installed_line(),
         _schema("run_enrichment",
                 gene_sets={"type": "array", "items": {"type": "string"},
                            "description": "local gene-set libraries to test against"},

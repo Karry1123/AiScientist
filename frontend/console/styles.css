@@ -350,10 +350,14 @@ button.small { padding: 6px 12px; font-size: 12px; }
 .upload-card.error .upload-row > .msym { color: var(--red); }
 .upload-card.done .upload-row > .msym { color: var(--green); }
 .upload-card.cancelled .upload-row > .msym { color: var(--text-tertiary); }
-.upload-card [data-cancel], #uploadCancel { color: var(--red); }
+.upload-card [data-act="cancel"], .upload-card [data-act="discard"], #uploadCancel { color: var(--red); }
+.upload-card.pending .upload-row > .msym { color: var(--text-tertiary); }
+.upload-card.pending .meter-fill { opacity: 0.45; }
 #uploadCancel { align-self: flex-start; }
-.upload-name { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-weight: 500; }
-.upload-stat { font-size: 12px; color: var(--text-secondary); font-variant-numeric: tabular-nums; flex: none; }
+.upload-name { flex: 1 1 30%; min-width: 110px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-weight: 500; }
+.upload-stat { font-size: 12px; color: var(--text-secondary); font-variant-numeric: tabular-nums;
+  flex: 0 1 auto; min-width: 0; max-width: 64%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.upload-row > button { flex: none; }
 .upload-card.error .upload-stat { color: var(--red); }
 .upload-card .meter { margin-top: 9px; }
 .workflow-select {
@@ -1003,6 +1007,16 @@ button.full { width: 100%; margin-top: 6px; }
 .card-main .muted { font-size: 12px; }
 .run-dataset { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; margin-top: 6px; }
 .run-dataset .muted.small, .run-dataset .ok.small { font-size: 12px; overflow-wrap: anywhere; }
+/* A run card's downloads are links, which the button rules do not reach: without this they were the
+   browser's own underlined links, and wrapped mid-label beside a long row. */
+.run-card a.ghost { flex: none; display: inline-flex; align-items: center; gap: 4px; padding: 6px 12px;
+  font-size: 12px; font-weight: 500; color: var(--accent); text-decoration: none; white-space: nowrap;
+  border-radius: var(--radius-sm); }
+.run-card a.ghost:hover { background: rgba(0, 113, 227, 0.08); }
+.run-card a.ghost .msym { font-size: 16px; }
+.artifacts-block .result-handoff:empty { display: none; }
+.artifacts-block .result-handoff { margin-top: 8px; }
+.artifacts-block .result-handoff a.ghost { display: inline-flex; align-items: center; padding: 0; font-size: 12.5px; }
 
 /* run artifacts panel */
 .run-artifacts { margin-top: 20px; background: var(--surface); border: 1px solid var(--border); border-radius: var(--radius-sm); padding: 16px; }

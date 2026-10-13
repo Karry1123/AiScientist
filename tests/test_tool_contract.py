@@ -21,6 +21,7 @@ SRC = ROOT / "src" / "aiscientist"
 PLATFORM_RELIES_ON = {
     "annotate_variants": "gateway/app.py: VCF staging and the variant executor",
     "deep_literature": "gateway/app.py, agents/quick_chat.py, agents/research_lab.py: literature steps",
+    "extract_haploinsufficient_genes": "gateway/app.py: the corpus-scan line (route \"corpus\")",
     "inspect_dataset": "agents/research_lab.py: dataset triage steps",
     "literature_search": "gateway/app.py, agents/research_lab.py: literature steps and citations",
     "make_schematic": "agents/research_lab.py: figure steps",
@@ -32,6 +33,8 @@ PLATFORM_RELIES_ON = {
     "run_doublet_detection": "agents/research_lab.py: QC steps",
     "run_enrichment": "agents/research_lab.py: enrichment steps",
     "run_gsea_prerank": "agents/research_lab.py: enrichment steps",
+    "run_integration": "agents/scope.py: the plain word 'integration' in a user's limit",
+    "run_marker_annotation": "agents/scope.py: the plain word 'annotation' in a user's limit",
     "run_pseudobulk_de": "agents/research_lab.py: DE producers",
     "run_scanpy_qc": "gateway/app.py, agents/research_lab.py: QC steps",
     "scgpt_annotate": "gateway/app.py, gateway/scgpt_runner.py, agents/research_lab.py: scGPT steps",

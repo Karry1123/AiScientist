@@ -1,6 +1,6 @@
 """Per-agent isolated + evolving memory (Axis C) — see docs/agent_memory_design.md.
 
-Two tiers, both on the GATEWAY (eyeserver) disk — NOT in the ephemeral HPC3/Singularity containers:
+Two tiers, both on the GATEWAY (eyeserver) disk — NOT in the ephemeral HPC3/Apptainer containers:
   • long-term (disk): ``<root>/<agent_id>/episodes.jsonl`` (append-only) + ``lessons.md`` (distilled).
   • working (context): the caller injects a RETRIEVED slice into the model prompt each turn.
 

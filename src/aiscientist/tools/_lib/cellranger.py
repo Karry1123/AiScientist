@@ -14,6 +14,8 @@ parent's when the directory is the usual ``outs/``.
 from __future__ import annotations
 
 import csv
+import json
+from pathlib import Path
 import io
 from collections import Counter
 from pathlib import PurePosixPath
@@ -170,13 +172,19 @@ def _describe_open_10x(f: Any, h5py: Any, np: Any, max_entries: int) -> "dict[st
     }
     if data.shape[0] <= max_entries:
         gex = np.array([t == _GEX for t in types]) if types and set(types) != {_GEX} else None
-        facts["counts"] = _count_stats(g, n_barcodes, gex, np)
+        names_ds = feats.get("name") if layout == "v3" else g.get("gene_names")
+        names = [_text(x) for x in names_ds[:]] if names_ds is not None else []
+        facts["counts"] = _count_stats(g, n_barcodes, gex, np, names)
     return facts
 
 
-def _count_stats(g: Any, n_barcodes: int, gex: Any, np: Any) -> "dict[str, Any]":
-    """Per-barcode UMI and gene counts over a CSC matrix (``gex``: a feature mask, or None for all)."""
+def _count_stats(g: Any, n_barcodes: int, gex: Any, np: Any,
+                 names: "list[str] | None" = None) -> "dict[str, Any]":
+    """Per-barcode UMI and gene counts over a CSC matrix (``gex``: a feature mask, or None for all),
+    and the most abundant features by total UMIs (``top_genes``, when ``names`` are given)."""
     data, indptr = g["data"], g["indptr"][:].astype(np.int64)
+    n_features = len(names) if names else 0
+    feature_totals = np.zeros(n_features, dtype=np.float64) if n_features else None
     integer_dtype = data.dtype.kind in "iu"
     acc = np.int64 if integer_dtype else np.float64
     umis = np.zeros(n_barcodes, dtype=acc)
@@ -199,8 +207,15 @@ def _count_stats(g: Any, n_barcodes: int, gex: Any, np: Any) -> "dict[str, Any]"
                 genes[b0:b1] = kept[ends] - kept[starts]
             cum = np.concatenate([[0], np.cumsum(vals, dtype=acc)])
             umis[b0:b1] = cum[ends] - cum[starts]
+            if feature_totals is not None:
+                idx = g["indices"][lo:hi]
+                feature_totals += np.bincount(idx, weights=vals, minlength=n_features)[:n_features]
         b0 = b1
     total = umis.sum()
+    top: list[str] = []
+    if feature_totals is not None:
+        order = np.argsort(-feature_totals)[:50]
+        top = [names[i] for i in order if feature_totals[i] > 0]
     return {
         "integer": integer_dtype or fractional == 0,
         "non_negative": not negative,
@@ -208,6 +223,7 @@ def _count_stats(g: Any, n_barcodes: int, gex: Any, np: Any) -> "dict[str, Any]"
         "median_umis_per_barcode": float(np.median(umis)) if n_barcodes else 0.0,
         "median_genes_per_barcode": float(np.median(genes)) if n_barcodes else 0.0,
         "empty_barcodes": int(np.count_nonzero(umis == 0)),
+        "top_genes": top,
     }
 
 
@@ -304,6 +320,42 @@ def _species(libs: "list[dict[str, Any]]") -> str:
     return found.pop() if len(found) == 1 and "" not in found else ""
 
 
+# The curated marker references live with the annotation tool; read as data, never imported.
+_MARKER_REFERENCES = Path(__file__).resolve().parents[1] / "run_marker_annotation" / "references"
+
+
+def tissue_hint(top_genes: "list[str]") -> str:
+    """Which curated tissue the most abundant genes point to, as a planner-facing sentence ('' when
+    none does). A delivery carries no tissue label, so on 2026-10-08 the PI guessed: one rerun of
+    f3b8268c4fd4's analysis refused the retina reference as "a fabrication" and wrote its own panel
+    (rods came out cones), the next planned "a general mouse hematopoietic/immune panel" for a retina. Abundance is a hint, not a label;
+    three or more of a reference's marker genes among the 50 most abundant is enough to say which."""
+    best: "tuple[str, dict[str, str]] | None" = None
+    wanted = set(top_genes)
+    for path in sorted(_MARKER_REFERENCES.glob("*.json")):
+        try:
+            ref = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            continue
+        hits: dict[str, str] = {}
+        for types in (ref.get("species") or {}).values():
+            for lineage, spec in types.items():
+                for gene in list(spec.get("discriminators", [])) + list(spec.get("panel", [])):
+                    if gene in wanted:
+                        hits.setdefault(gene, lineage)
+        if len(hits) >= 3 and (best is None or len(hits) > len(best[1])):
+            best = (path.stem, hits)
+    if best is None:
+        return ""
+    name, hits = best
+    order = [g for g in top_genes if g in hits]
+    shown = ", ".join(f"{g} ({hits[g]})" for g in order[:6])
+    return (f"TISSUE HINT (from gene abundance — no tissue label came with the data): the 50 most "
+            f"abundant genes include {shown}, markers in the curated {name} reference, so the tissue "
+            f"is most likely {name}. Plan `run_marker_annotation` with `reference: \"{name}\"` unless "
+            "the marker genes say otherwise, and say in the report that the tissue was inferred. ")
+
+
 def _provenance(libs: "list[dict[str, Any]]") -> str:
     """The facts read from the libraries' filtered matrices and the ruling they support."""
     read = [lib for lib in libs if isinstance(lib.get("matrix"), dict)]
@@ -336,6 +388,8 @@ def _provenance(libs: "list[dict[str, Any]]") -> str:
     if species:
         text += (f"The reference genome makes the species {species.upper()}: plan {species} gene "
                  f"symbols and {species} marker panels. ")
+    text += tissue_hint([g for lib in read for g in ((lib["matrix"].get("counts") or {})
+                                                      .get("top_genes") or [])])
     return text + (
         "PROVENANCE IS SETTLED: these are Cell Ranger's own unnormalized integer UMI counts. Do NOT "
         "plan a `run_code` step to open, audit or re-verify the .h5 matrices (their layout, "

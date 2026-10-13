@@ -23,6 +23,12 @@ gateway = [
 langgraph = [
   "langgraph>=1.2",
 ]
+# Native Anthropic transport for users' own Claude keys (gateway/anthropic_client.py). Imported
+# lazily: without it a Claude key is refused at verification with "SDK not installed" and every
+# other provider works as before. 1.13 is the version the transport was built and tested against.
+anthropic = [
+  "anthropic>=1.13,<2",
+]
 # User accounts / login / admin (eye-server). SQLAlchemy 2.0 models + Alembic
 # migrations; bcrypt for password hashing; itsdangerous for signed session cookies;
 # psycopg (v3) is the PostgreSQL driver in prod. Local dev/CI uses SQLite (stdlib),

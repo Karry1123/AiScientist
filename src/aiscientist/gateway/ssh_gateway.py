@@ -1,14 +1,17 @@
 from __future__ import annotations
 
 import base64
+import os
 import select
 import shlex
 import socket
+import shutil
 import socketserver
+import subprocess
 import threading
 import time
 from pathlib import Path
-from typing import Callable
+from typing import Callable, Iterator
 
 import paramiko
 
@@ -95,6 +98,16 @@ class SSHExecutor:
         self._connect_timeout = connect_timeout
         self._transfer_client: paramiko.SSHClient | None = None
         self._transfer_pkey: paramiko.PKey | None = None  # set on key auth; reused for the DTN
+        # The same key as a FILE, for the OpenSSH fast path (see _native_sftp_argv). OpenSSH in batch
+        # mode cannot be handed a passphrase, so an encrypted key is loaded once into an ssh-agent
+        # that belongs to this session alone (see _agent_socket) and the passphrase is kept for that.
+        self._transfer_key_path: str | None = None
+        self._transfer_key_encrypted = False
+        self._transfer_key_passphrase: str | None = None
+        self._agent: subprocess.Popen | None = None
+        self._agent_dir: str | None = None
+        self._agent_failed = False
+        self._agent_lock = threading.Lock()
         self._transfer_disabled = False  # set after the one-time fallback warning
         # Serializes reconnects: several threads hit a dead transport at once, and only ONE of
         # them should redial. ``_reconnect_rounds`` counts finished attempts, so a thread that
@@ -155,6 +168,9 @@ class SSHExecutor:
             # passphrase.
             self._transfer_pkey = pkey
             self._reconnect_pkey = pkey
+            self._transfer_key_path = key_path
+            self._transfer_key_encrypted = bool(key_passphrase)
+            self._transfer_key_passphrase = key_passphrase or None
         else:
             self._interactive_auth(transport, password or "", duo_response, duo_callback)
 
@@ -256,6 +272,14 @@ class SSHExecutor:
             self._reconnect_pkey = self._load_key(key_path, passphrase)
         except GatewayError:
             return False
+        # The key is deployed in the user's HPC3 authorized_keys, and access-hpc3 shares that home,
+        # so it opens the transfer host too: a password session with a saved key stops staging
+        # over the login node (RCIC rule) instead of falling back to it.
+        if self._transfer_pkey is None:
+            self._transfer_pkey = self._reconnect_pkey
+            self._transfer_key_path = key_path
+            self._transfer_key_encrypted = bool(passphrase)
+            self._transfer_key_passphrase = passphrase or None
         return True
 
     def _live_transport(self) -> paramiko.Transport:
@@ -490,36 +514,38 @@ class SSHExecutor:
         """:meth:`put_file` for large files. Writes ``<remote>.part``, continuing from where an
         interrupted copy stopped, then renames it into place, so a dropped 30 GB BAM transfer
         resumes and a half-written file is never mistaken for the real one. ``progress(sent, total)``
-        is called per chunk; an exception it raises aborts the copy and leaves the ``.part``."""
-        import os
+        is called as bytes land; an exception it raises aborts the copy and leaves the ``.part``.
+
+        The bytes go through the OpenSSH client when it can authenticate on its own (see
+        :meth:`_native_sftp_argv`; ~4x paramiko's speed), else through paramiko. A ``.part`` older
+        than the source is a leftover of a different file and is restarted, never appended to."""
         import posixpath
 
         parent = posixpath.dirname(remote_path)
         if parent and make_parent:
             self.exec(f"mkdir -p {shlex.quote(parent)}")
         part = remote_path + ".part"
-        total = os.path.getsize(local_path)
+        local_stat = os.stat(local_path)
+        total = local_stat.st_size
         sftp = self._open_sftp()
         try:
-            try:
-                offset = int(sftp.stat(part).st_size or 0)
-            except OSError:
-                offset = 0
-            if offset > total:
-                offset = 0
-            with open(local_path, "rb") as src, sftp.open(part, "r+b" if offset else "wb") as dst:
-                dst.set_pipelined(True)
-                src.seek(offset)
-                dst.seek(offset)
-                sent = offset
-                while True:
-                    chunk = src.read(4 * 1024 * 1024)
-                    if not chunk:
-                        break
-                    dst.write(chunk)
-                    sent += len(chunk)
-                    if progress is not None:
-                        progress(sent, total)
+            offset = _resume_offset(sftp, part, total, local_stat.st_mtime)
+            copied = offset == total and total > 0
+            argv = self._native_sftp_argv()
+            if not copied and argv is not None and _native_safe(local_path, part):
+                copied = self._native_put(argv, local_path, part, offset, total, progress, sftp)
+                if not copied:  # carry on with paramiko from wherever the OpenSSH client stopped
+                    offset = _resume_offset(sftp, part, total, local_stat.st_mtime)
+            if not copied:
+                _paramiko_put(sftp, local_path, part, offset, total, progress)
+            landed = int(sftp.stat(part).st_size or 0)
+            if landed != total:
+                raise GatewayError(
+                    f"Upload of {local_path} stopped at {landed} of {total} bytes.",
+                    stage="ssh_put",
+                )
+            if progress is not None:
+                progress(total, total)
             try:
                 sftp.posix_rename(part, remote_path)
             except (OSError, paramiko.SSHException):
@@ -537,6 +563,168 @@ class SSHExecutor:
             ) from exc
         finally:
             sftp.close()
+
+    # Measured 2026-10-08, eyeserver -> access-hpc3 -> dfs3b, 8.6 GB of random data:
+    #   paramiko (the SFTP above)             101 MB/s; bigger windows 99; 4 threads 75 in total (GIL)
+    #   OpenSSH sftp / scp                    ~320 MB/s; scp -c aes128-gcm 438 MB/s
+    #   4 OpenSSH sftp processes in parallel  763 MB/s in total
+    # The eyeserver link is 10 Gb/s, so paramiko, not the network, was the ceiling.
+    _NATIVE_CIPHERS = "aes128-gcm@openssh.com,chacha20-poly1305@openssh.com,aes128-ctr"
+
+    def _native_sftp_argv(self) -> list[str] | None:
+        """argv for the OpenSSH ``sftp`` client in batch mode, talking to the transfer host — or
+        None when it cannot run unattended: no transfer host, no key FILE (a password session
+        without a saved key), an encrypted key that could not be loaded into this session's agent,
+        no ``sftp`` binary, or ``AISCIENTIST_NATIVE_SFTP=0``. Never the login node: that is
+        paramiko's fallback to warn about, not something to speed up."""
+        if self.transfer_host is None or self._transfer_disabled:
+            return None
+        if os.environ.get("AISCIENTIST_NATIVE_SFTP", "1").strip().lower() in ("0", "false", "no", "off"):
+            return None
+        key = getattr(self, "_transfer_key_path", None)
+        if not key or not os.path.isfile(key):
+            return None
+        binary = shutil.which("sftp")
+        if not binary:
+            return None
+        if getattr(self, "_transfer_key_encrypted", False):
+            sock = self._agent_socket(key)
+            if sock is None:
+                return None
+            identity = ["-o", f"IdentityAgent={sock}", "-o", "IdentityFile=none"]
+        else:
+            identity = ["-i", key, "-o", "IdentitiesOnly=yes", "-o", "IdentityAgent=none"]
+        state = os.environ.get("AISCIENTIST_STATE_DIR", "").strip()
+        known_hosts = Path(state) / "ssh_known_hosts" if state else Path.home() / ".ssh" / "aiscientist_known_hosts"
+        return [
+            binary, "-q", "-b", "-", "-P", str(self.port), "-c", self._NATIVE_CIPHERS, *identity,
+            "-o", "BatchMode=yes",
+            "-o", "StrictHostKeyChecking=accept-new", "-o", f"UserKnownHostsFile={known_hosts}",
+            "-o", f"ConnectTimeout={int(self._connect_timeout)}", "-o", "ServerAliveInterval=30",
+            f"{self.username}@{self.transfer_host}",
+        ]
+
+    def _agent_socket(self, key: str) -> str | None:
+        """The socket of an ``ssh-agent`` that holds this session's passphrase-protected key, started
+        on first use. None when that is not possible; the copy then stays on paramiko.
+
+        The agent is this session's alone: its socket sits in a directory only the gateway's account
+        can enter, it holds one key, and :meth:`close` kills it. The passphrase reaches ``ssh-add``
+        through an askpass helper and that one process's environment, never a command line; the
+        decrypted key exists only in the agent's memory, as it already does in paramiko's."""
+        import tempfile
+
+        lock = getattr(self, "_agent_lock", None)
+        passphrase = getattr(self, "_transfer_key_passphrase", None)
+        if lock is None or not passphrase:
+            return None
+        with lock:
+            agent = getattr(self, "_agent", None)
+            if agent is not None and agent.poll() is None and self._agent_dir:
+                return os.path.join(self._agent_dir, "agent.sock")
+            if getattr(self, "_agent_failed", False):
+                return None
+            self._stop_agent()
+            agent_bin, add_bin = shutil.which("ssh-agent"), shutil.which("ssh-add")
+            why = "ssh-agent or ssh-add is not installed"
+            if agent_bin and add_bin:
+                home = tempfile.mkdtemp(prefix="aisc-agent-")        # 0700, ours alone
+                sock = os.path.join(home, "agent.sock")
+                self._agent_dir = home
+                try:
+                    self._agent = subprocess.Popen([agent_bin, "-D", "-a", sock], stdin=subprocess.DEVNULL,
+                                                   stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                    deadline = time.monotonic() + 5.0
+                    while not os.path.exists(sock) and time.monotonic() < deadline and self._agent.poll() is None:
+                        time.sleep(0.02)
+                    askpass = os.path.join(home, "askpass")
+                    with open(os.open(askpass, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o700), "w") as f:
+                        # Answers once: asked again means the passphrase was wrong, and ssh-add
+                        # would otherwise keep asking until the timeout.
+                        f.write('#!/bin/sh\n[ -e "$0.asked" ] && exit 1\n: > "$0.asked"\n'
+                                'printf \'%s\\n\' "$AISCIENTIST_KEY_PASSPHRASE"\n')
+                    env = {**os.environ, "SSH_AUTH_SOCK": sock, "SSH_ASKPASS": askpass,
+                           "SSH_ASKPASS_REQUIRE": "force", "DISPLAY": os.environ.get("DISPLAY") or "none",
+                           "AISCIENTIST_KEY_PASSPHRASE": passphrase}
+                    try:
+                        added = subprocess.run([add_bin, "-q", key], env=env, stdin=subprocess.DEVNULL,
+                                               capture_output=True, timeout=20, start_new_session=True)
+                    finally:
+                        for leftover in (askpass, askpass + ".asked"):
+                            try:
+                                os.unlink(leftover)
+                            except OSError:
+                                pass
+                    if added.returncode == 0:
+                        return sock
+                    why = (added.stderr.decode(errors="replace").strip().splitlines() or ["ssh-add failed"])[-1]
+                except (OSError, subprocess.SubprocessError) as exc:
+                    why = str(exc) or type(exc).__name__
+            self._stop_agent()
+            self._agent_failed = True
+        self._emit("warning", "ssh_transfer",
+                   f"The passphrase-protected key could not be loaded for fast copies ({why}); "
+                   "copies use the slower built-in client.")
+        return None
+
+    def _stop_agent(self) -> None:
+        agent, home = getattr(self, "_agent", None), getattr(self, "_agent_dir", None)
+        self._agent = self._agent_dir = None
+        if agent is not None:
+            try:
+                agent.kill()
+                agent.wait(timeout=5)
+            except Exception:  # noqa: BLE001
+                pass
+        if home:
+            shutil.rmtree(home, ignore_errors=True)
+
+    def native_transfer_available(self) -> bool:
+        """True when bulk copies run the OpenSSH client, so parallel copies really run in parallel;
+        False when they fall back to paramiko, where extra threads only contend for the GIL."""
+        return self._native_sftp_argv() is not None
+
+    def _native_put(self, argv: list[str], local_path: str, part: str, offset: int, total: int,
+                    progress: "Callable[[int, int], None] | None",
+                    sftp: "paramiko.SFTPClient") -> bool:
+        """Copy ``local_path`` to ``part`` with the OpenSSH client; True when it finished.
+
+        ``put -a`` appends from the remote size but refuses a file that does not exist yet, hence a
+        plain ``put`` for a fresh copy. Progress comes from polling the ``.part`` size over the
+        paramiko channel; an exception from ``progress`` kills the client and propagates."""
+        import tempfile
+
+        verb = "put -a" if offset > 0 else "put"
+        batch = f"{verb} {_sftp_quote(local_path)} {_sftp_quote(part)}\n"
+        with tempfile.TemporaryFile() as err:
+            proc = subprocess.Popen(argv, stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=err)
+            try:
+                assert proc.stdin is not None
+                proc.stdin.write(batch.encode())
+                proc.stdin.close()
+                while True:
+                    try:
+                        proc.wait(timeout=2.0)
+                        break
+                    except subprocess.TimeoutExpired:
+                        if progress is not None:
+                            try:
+                                sent = int(sftp.stat(part).st_size or 0)
+                            except OSError:
+                                continue
+                            progress(min(sent, total), total)
+            except BaseException:
+                proc.kill()
+                proc.wait()
+                raise
+            if proc.returncode == 0:
+                return True
+            err.seek(0)
+            why = err.read().decode(errors="replace").strip().splitlines()
+        self._emit("warning", "ssh_transfer",
+                   f"The OpenSSH client could not copy {os.path.basename(local_path)} "
+                   f"({why[-1] if why else f'exit {proc.returncode}'}); continuing with paramiko.")
+        return False
 
     def read_bytes(self, remote_path: str, max_bytes: int | None = None) -> bytes:
         """Read (at most ``max_bytes`` of) a remote file, over SFTP.
@@ -562,6 +750,33 @@ class SSHExecutor:
                 return handle.read(max_bytes)
         except (OSError, paramiko.SSHException):
             return b""
+        finally:
+            sftp.close()
+
+    def read_stream(self, remote_path: str, block: int = 16 * 1024 * 1024) -> Iterator[bytes]:
+        """Yield a remote file's bytes in order, over SFTP on the transfer host, for a download
+        that is passed on while it is read.
+
+        One window of ``block`` bytes is requested at a time (its 32 KB reads pipelined, so it is
+        as fast as a prefetch) and the next only once this one has been handed on. ``prefetch()``
+        would request the whole file at once and hold whatever the consumer had not taken yet: a
+        multi-GB matrix read from dfs3b at 100 MB/s and sent to a browser on a home line would sit
+        in this process's memory. Raises :class:`GatewayError` if the file ends early."""
+        sftp = self._open_sftp()
+        try:
+            with sftp.open(remote_path, "rb") as handle:
+                size = int(handle.stat().st_size or 0)
+                offset = 0
+                while offset < size:
+                    for data in handle.readv([(offset, min(block, size - offset))]):
+                        if not data:
+                            raise GatewayError(
+                                f"{remote_path} ended at {offset} of {size} bytes.", stage="ssh_get")
+                        offset += len(data)
+                        yield data
+        except (OSError, paramiko.SSHException) as exc:
+            raise GatewayError(f"Failed to read {remote_path}.", stage="ssh_get",
+                               detail=error_detail(exc)) from exc
         finally:
             sftp.close()
 
@@ -677,7 +892,54 @@ class SSHExecutor:
             except Exception:
                 pass
             self._transfer_client = None
+        lock = getattr(self, "_agent_lock", None)
+        if lock is not None:
+            with lock:
+                self._stop_agent()       # the agent holds a decrypted key: it ends with the session
         try:
             self._client.close()
         except Exception:
             pass
+
+
+# --- helpers for put_file_resumable ---------------------------------------------------------------
+
+def _resume_offset(sftp: "paramiko.SFTPClient", part: str, total: int, local_mtime: float) -> int:
+    """Bytes of ``part`` to keep. A ``.part`` that is longer than the source, or was last written
+    before the source last changed, belongs to some other file: restart rather than append to it."""
+    try:
+        st = sftp.stat(part)
+    except OSError:
+        return 0
+    size = int(st.st_size or 0)
+    if size > total or (st.st_mtime is not None and st.st_mtime < int(local_mtime)):
+        return 0
+    return size
+
+
+def _paramiko_put(sftp: "paramiko.SFTPClient", local_path: str, part: str, offset: int, total: int,
+                  progress: "Callable[[int, int], None] | None") -> None:
+    with open(local_path, "rb") as src, sftp.open(part, "r+b" if offset else "wb") as dst:
+        dst.set_pipelined(True)
+        src.seek(offset)
+        dst.seek(offset)
+        sent = offset
+        while True:
+            chunk = src.read(4 * 1024 * 1024)
+            if not chunk:
+                break
+            dst.write(chunk)
+            sent += len(chunk)
+            if progress is not None:
+                progress(sent, total)
+
+
+def _native_safe(*paths: str) -> bool:
+    """The OpenSSH client globs a ``put`` source and reads its batch line by line: paths with glob
+    characters or line breaks go through paramiko instead."""
+    return not any(c in p for p in paths for c in "*?[]\n\r")
+
+
+def _sftp_quote(path: str) -> str:
+    """One argument of an OpenSSH sftp batch command."""
+    return '"' + path.replace("\\", "\\\\").replace('"', '\\"') + '"'

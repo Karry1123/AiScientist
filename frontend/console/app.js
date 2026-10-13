@@ -33,7 +33,7 @@ const state = {
   serverRoots: [],             // server folders a dataset can be bound from by path (empty = off)
   serverOfferDismissed: new Set(),   // pasted server paths the user said "Not now" to
   serverBoundTyped: new Set(),       // pasted server paths already bound (as typed, before resolving)
-  uploads: [],                 // in-flight/failed uploads shown in the Datasets tab: {id,name,size,sent,status,file,error}
+  uploads: [],                 // upload cards of the Datasets tab: {id,kind,name,size,sent,status,error,note,file,ctrl,jobId,serverFolder,…}
   boundPaths: [],              // the BIND-SET (feature ②): the server paths of every data file attached
                                // for the next run (a VCF + a BED panel + a 2nd VCF). Ordered by attach;
                                // the server re-ranks to pick the primary. Posted as `datasets`.
@@ -605,7 +605,8 @@ function onModeChange() {
 // ---- Axis B: chat (fast path) vs research (full lab) ----------------------
 // Which ENGINE answers, independent of Axis A (`mode`, one scientist vs a Virtual-Lab team,
 // which only applies inside the research engine). Saved per-chat like `mode`, so a chat used
-// for quick questions stays in chat mode when you switch back to it.
+// for quick questions stays in chat mode when you switch back to it. "corpus" is the exception:
+// it is saved only until its scan is sent (leaveCorpusRoute).
 function activeRoute() {
   const s = activeSession();
   return (s && s.route) || ($("routeSelect") && $("routeSelect").value) || "research";
@@ -615,26 +616,50 @@ function activeRoute() {
 // there is no plan to review and no team to convene. Disable rather than hide, so the user can see
 // what switching back to Research would give them.
 function applyRouteUI() {
-  const chat = activeRoute() === "chat";
-  for (const id of ["modeSelect", "planMode", "autonomousMode"]) {
+  const route = activeRoute();
+  const chat = route === "chat";
+  const corpus = route === "corpus";
+  // Neither the fast path nor the corpus scan has a plan to review or a team to convene.
+  const noLab = chat || corpus;
+  for (const id of ["modeSelect", "planMode", "autonomousMode", "saveResults"]) {
     const el = $(id);
-    if (el) { el.disabled = chat; if (el.closest("label")) el.closest("label").classList.toggle("dimmed", chat); }
+    if (el) { el.disabled = noLab; if (el.closest("label")) el.closest("label").classList.toggle("dimmed", noLab); }
   }
   const sel = $("modeSelect");
-  if (sel) sel.classList.toggle("dimmed", chat);
+  if (sel) sel.classList.toggle("dimmed", noLab);
   const input = $("chatInput");
   if (input && !state.planPending) {
     input.placeholder = chat
       ? "Ask a quick question — answers start immediately (no analysis, no report)…"
-      : DEFAULT_PLACEHOLDER;
+      : corpus
+        ? "Press Send to scan the whole corpus for haploinsufficient genes (the text here is only a label for the run)…"
+        : DEFAULT_PLACEHOLDER;
   }
 }
 
 function onRouteChange() {
   const s = activeSession();
   if (!s) return;
-  s.route = $("routeSelect").value || "research";
+  const next = $("routeSelect").value || "research";
+  // The engine to come back to after a corpus scan — see leaveCorpusRoute.
+  if (next !== "corpus") delete s.routeBeforeCorpus;
+  else if (s.route !== "corpus") s.routeBeforeCorpus = s.route || "research";
+  s.route = next;
   persistSessions();
+  applyRouteUI();
+}
+
+// A corpus scan is one ACTION, not an engine a chat stays on: once the scan is sent, the chat goes
+// back to the engine it was using. Left on "corpus", the next message — usually a question ABOUT
+// the tables — would start another hour-long scan with that question as its label.
+function leaveCorpusRoute(s) {
+  if (!s || s.route !== "corpus") return;
+  s.route = s.routeBeforeCorpus || "research";
+  delete s.routeBeforeCorpus;
+  persistSessions();
+  if (s !== activeSession()) return;       // the user switched chats while the request was out
+  const sel = $("routeSelect");
+  if (sel) sel.value = s.route;
   applyRouteUI();
 }
 
@@ -810,7 +835,11 @@ function messageEl(m) {
     const bundle = m.bundleUrl ? `<a class="artifact-bundle" href="${m.bundleUrl}" download>${icon("download")}Download all results (.zip)</a>` : "";
     const n = (m.items && m.items.length) || 0;
     el.innerHTML = `<div class="artifacts-title">${icon("folder_open")}<span>Results &amp; code (${n})</span></div>` + bundle +
+      `<div class="result-handoff"></div>` +
       `<div class="artifacts-hint">Browse &amp; preview every file — organized by folder — in the Downloads panel →</div>`;
+    const run = (m.bundleUrl || "").match(/\/api\/bundle\/[^/]+\/([^/]+)/);
+    if (run) showResultHandoff(el.querySelector(".result-handoff"), run[1]);
+    el.addEventListener("click", onSaveResultClick);
     return el;
   }
   const el = document.createElement("div");
@@ -1137,6 +1166,7 @@ function appendArtifacts(items, bundleUrl) {
   if (!items || !items.length) return;
   const owner = state.runSessionId || state.activeId;
   const msg = { role: "assistant", kind: "artifacts", items, bundleUrl };
+  resultHandoffs = null;                // this run may have handed something on: ask again
   pushToSession(owner, msg);
   // Only touch the visible chat + downloads panel if the run's own chat is the one
   // on screen — otherwise these would bleed into whatever chat the user switched to.
@@ -1398,6 +1428,7 @@ function applyStatus(summary) {
   // session is only usable at "ready" — there is no half-connected state to special-case.
   const isReady = summary.status === "ready";
   if (isReady) state.everConnected = true;
+  if (isReady) restoreUploads();   // copies still running, and uploads this browser had not finished
   const isProvisioning = summary.status === "connecting" || summary.status === "provisioning";
   // Full provisioning pipeline view while the session is coming up for the first time; once it
   // has been live, keep the chat on screen and report progress inline instead.
@@ -1479,6 +1510,7 @@ function applyStatus(summary) {
     if (!summary.mock) {
       try {
         localStorage.setItem(LASTCONN_KEY, JSON.stringify({
+          account: state.user ? state.user.username : null,
           username: summary.username || "", host: summary.host || "",
           model: summary.selected_model || summary.model || "",
           jobId: (summary.gpu && summary.gpu.job_id) || null,
@@ -1668,7 +1700,7 @@ function renderEndpointSelect(summary) {
   const opts = [clusterOptionsHtml()];
   for (const c of apiKeys.creds) {
     const bad = c.last_error ? " ⚠" : "";
-    opts.push(`<option value="${escapeHtml(c.id)}">${escapeHtml(c.label)} · ${escapeHtml(c.model || "no model")}${bad}</option>`);
+    opts.push(`<option value="${escapeHtml(c.id)}">${escapeHtml(c.label)} · ${escapeHtml(credRoles(c).pi || "no model")}${bad}</option>`);
   }
   opts.push(ADD_KEY_HTML);
   sel.innerHTML = opts.join("");
@@ -1744,6 +1776,22 @@ async function deleteEndpointById(credId) {
   toast(`Deleted “${cred.label}”`);
 }
 
+// Which model does what on a saved endpoint. Stored as `model` (the Scientist's tool loop,
+// required) and `lab_model` (PI / Critic / write-up, optional, defaults to `model`); shown the
+// other way round — PI & Critic first — because that is the model people mean by "which model".
+function credRoles(c) {
+  const sci = (c && c.model) || "";
+  const pi = (c && c.lab_model) || sci;
+  return { pi, sci, split: !!(pi && sci && pi !== sci) };
+}
+
+// "claude-opus-5-5" when one model does everything; "PI/Critic claude-opus-5-5 · Scientist
+// claude-sonnet-5-5" when the roles are split. Escaped, for innerHTML.
+function credRolesLabel(c) {
+  const r = credRoles(c);
+  return r.split ? `PI/Critic ${escapeHtml(r.pi)} · Scientist ${escapeHtml(r.sci)}` : escapeHtml(r.pi);
+}
+
 // A persistent banner, not a one-off toast: the session keeps sending prompts off-site for as
 // long as this endpoint is selected, so the notice has to persist too.
 function renderEgressBanner(summary) {
@@ -1751,10 +1799,7 @@ function renderEgressBanner(summary) {
   if (!el) return;
   const ep = summary && summary.llm_endpoint;
   if (!ep || !ep.remote) { el.classList.add("hidden"); el.textContent = ""; return; }
-  const roles = ep.lab_model && ep.lab_model !== ep.model
-    ? `${escapeHtml(ep.model)} · ${escapeHtml(ep.lab_model)} for PI/Critic`
-    : escapeHtml(ep.model || "");
-  el.innerHTML = `🌐 Prompts leave UCI for <strong>${escapeHtml(ep.label)}</strong> (${roles}).`
+  el.innerHTML = `🌐 Prompts leave UCI for <strong>${escapeHtml(ep.label)}</strong> (${credRolesLabel(ep)}).`
     + ` Your data files and the analysis stay on HPC3.`;
   el.classList.remove("hidden");
 }
@@ -1832,7 +1877,7 @@ function renderConnectEndpointSelect() {
   const keep = sel.value && sel.value !== ADD_KEY_OPTION ? sel.value : apiKeys.connectChoice;
   const opts = [clusterOptionsHtml()];
   for (const c of apiKeys.creds) {
-    opts.push(`<option value="${escapeHtml(c.id)}">${escapeHtml(c.label)} · ${escapeHtml(c.model || "no model")}</option>`);
+    opts.push(`<option value="${escapeHtml(c.id)}">${escapeHtml(c.label)} · ${escapeHtml(credRoles(c).pi || "no model")}</option>`);
   }
   opts.push(ADD_KEY_HTML);
   sel.innerHTML = opts.join("");
@@ -2025,9 +2070,7 @@ function renderApiKeyList() {
     const state_ = c.last_error
       ? `<span class="api-key-bad">⚠ ${escapeHtml(c.last_error)}</span>`
       : c.verified_at ? '<span class="api-key-ok">✓ verified</span>' : "<span>not tested</span>";
-    const roles = c.lab_model && c.lab_model !== c.model
-      ? `${escapeHtml(c.model)} · PI/Critic on ${escapeHtml(c.lab_model)}`
-      : c.model ? escapeHtml(c.model)
+    const roles = c.model ? credRolesLabel(c)
       : '<span class="api-key-bad">no model — pick one before this endpoint can be used</span>';
     return `<div class="api-key-row${apiKeys.editing === c.id ? " editing" : ""}" data-id="${escapeHtml(c.id)}">
       <div class="api-key-main">
@@ -2070,9 +2113,13 @@ function applyProviderPreset() {
   const p = apiKeys.providers.find((x) => x.key === $("apiKeyProvider").value);
   if (!p) return;
   $("apiKeyProviderNote").textContent = p.note || "";
-  // Only prefill an EMPTY base URL: a user editing a saved endpoint, or one who typed a custom
-  // host, must not have it overwritten by flipping the dropdown to read a note.
-  if (p.base_url && !$("apiKeyBaseUrl").value.trim()) $("apiKeyBaseUrl").value = p.base_url;
+  // Prefill the base URL when the field is empty OR still holds another preset's URL (it was
+  // prefilled, not typed): picking OpenRouter, then Anthropic, must not leave OpenRouter's host in
+  // place. A host the user typed themselves is never overwritten by flipping the dropdown.
+  const field = $("apiKeyBaseUrl");
+  const current = field.value.trim().replace(/\/+$/, "");
+  const prefilled = !current || apiKeys.providers.some((x) => x.base_url && x.base_url.replace(/\/+$/, "") === current);
+  if (prefilled) field.value = p.base_url || "";
   // Picking the provider can be what completes (base URL + key), so the model list follows either
   // order of filling the form in.
   maybeAutoFetchModels();
@@ -2230,8 +2277,10 @@ function editApiKey(cred) {
   $("apiKeyProvider").value = cred.provider || "custom";
   $("apiKeyBaseUrl").value = cred.base_url || "";
   $("apiKeyValue").value = "";
-  $("apiKeyModel").value = cred.model || "";
-  $("apiKeyLabModel").value = cred.lab_model || "";
+  // Top field = PI & Critic; the Scientist's field stays empty unless it really is a different model.
+  const roles = credRoles(cred);
+  $("apiKeyLabModel").value = roles.pi;
+  $("apiKeyModel").value = roles.split ? roles.sci : "";
   $("apiKeyLabel").value = cred.label || "";
   $("apiKeyError").classList.add("hidden");
   $("apiKeyProviderNote").textContent = "";
@@ -2260,12 +2309,16 @@ function apiKeyError(msg, cause) {
 
 async function submitApiKey(ev) {
   ev.preventDefault();
+  // The form asks for the PI & Critic model first and the Scientist's second (blank = the same);
+  // the store wants the Scientist's as `model` and the PI's as `lab_model` only when they differ.
+  const piModel = $("apiKeyLabModel").value.trim();
+  const sciModel = $("apiKeyModel").value.trim();
   const body = {
     provider: $("apiKeyProvider").value,
     base_url: $("apiKeyBaseUrl").value.trim(),
-    model: $("apiKeyModel").value.trim(),
+    model: sciModel || piModel,
     api_key: $("apiKeyValue").value.trim(),
-    lab_model: $("apiKeyLabModel").value.trim(),
+    lab_model: sciModel && sciModel !== piModel ? piModel : "",
     label: $("apiKeyLabel").value.trim() || null,
     user: apiKeyOwner(),
   };
@@ -2274,8 +2327,8 @@ async function submitApiKey(ev) {
   // A credential with no model id is refused at bind time ("Set a model on this credential"),
   // so saving one produces an endpoint that appears in the picker and then cannot be used.
   // Catch it here, where ↻ is one button away, instead of at the start of a run.
-  if (!body.model) {
-    apiKeyError("Choose the model id this endpoint should answer with — press ↻ to list them.");
+  if (!piModel) {
+    apiKeyError("Choose the model for PI & Critic — press ↻ to list what this endpoint serves.");
     return;
   }
   // Without an owner the server files this under "guest" and the session — which looks it up by
@@ -2367,7 +2420,7 @@ async function fetchEndpointModels({ silent = false } = {}) {
   try {
     const res = await fetch("/api/llm-models", {
       method: "POST", headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ base_url: baseUrl, api_key: typedKey,
+      body: JSON.stringify({ base_url: baseUrl, api_key: typedKey, provider: $("apiKeyProvider").value,
                              credential_id: useStored ? cred.id : "", user: apiKeyOwner() }),
     });
     const d = await res.json();
@@ -2377,8 +2430,8 @@ async function fetchEndpointModels({ silent = false } = {}) {
       // Asked for explicitly: show the answer rather than leaving the user to guess that the
       // closed box behind the button now knows something.
       $("apiKeyError").classList.add("hidden");
-      openModelMenu("apiKeyModel", "apiKeyModelMenu");
-      $("apiKeyModel").focus();
+      openModelMenu("apiKeyLabModel", "apiKeyLabModelMenu");
+      $("apiKeyLabModel").focus();
       toast(`${(d.models || []).length} models — type to filter`);
     }
   } catch (err) {
@@ -2468,7 +2521,12 @@ function openWs(id) {
   if (state.ws) { try { state.ws.close(); } catch {} }
   const proto = location.protocol === "https:" ? "wss" : "ws";
   const ws = new WebSocket(`${proto}://${location.host}/ws/${id}`);
-  ws.onopen = () => { if (state.wsEpoch === epoch) state.wsRetries = 0; };
+  ws.onopen = () => {
+    if (state.wsEpoch !== epoch) return;
+    const back = (state.wsRetries || 0) > 0;         // a reconnect: the server can be reached again
+    state.wsRetries = 0;
+    if (back) uploadsLinkBack();
+  };
   ws.onmessage = (ev) => {
     const msg = JSON.parse(ev.data);
     if (msg.type === "status" && msg.connection && msg.connection.gpu) {
@@ -2479,12 +2537,19 @@ function openWs(id) {
     handleWsMessage(msg);
   };
   ws.onerror = () => {};   // errors surface as onclose; the reconnect below handles them
-  ws.onclose = () => {
+  ws.onclose = (ev) => {
+    if (state.wsEpoch !== epoch || state.connectionId !== id) return;
+    // 4401/4403/4404 = the server refused this connection id (logged out, another account's, or
+    // gone). Retrying cannot change that, so forget the id instead of reconnecting forever.
+    if (ev && ev.code >= 4400 && ev.code < 4500) {
+      forgetConnection();
+      if (ev.code === 4401) showLogin();
+      return;
+    }
     // The server-side Connection + run task OUTLIVE a dropped socket (network blip,
     // laptop sleep, idle timeout). Reconnect with backoff so the WS endpoint replays:
     // continuing a live run, or RECOVERING one that finished while we were offline —
     // no manual page refresh needed.
-    if (state.wsEpoch !== epoch || state.connectionId !== id) return;
     const delay = Math.min(1000 * 2 ** (state.wsRetries || 0), 15000);
     state.wsRetries = (state.wsRetries || 0) + 1;
     setTimeout(() => { if (state.wsEpoch === epoch && state.connectionId === id) openWs(id); }, delay);
@@ -2553,6 +2618,7 @@ function handleWsMessage(msg) {
       if (state.run) state.run.text = `**Chat error:** ${msg.message || ""}`;
       finishAssistantStream(); setRunning(false); toast("Chat error"); break;
     case "artifacts": appendArtifacts(msg.items || [], msg.bundle_url); break;
+    case "upload_staging": onStagingEvent(msg.job); break;       // a copy to HPC3 moved on
     case "run_complete":
       if (msg.run_id) { state.lastRunId = msg.run_id; try { localStorage.setItem(LASTRUN_KEY, msg.run_id); } catch {} }
       break;
@@ -2692,6 +2758,15 @@ async function stopGpu() {
   await doStopGpu();
 }
 
+// Drop a stored connection the server refuses to serve to this user, without calling it.
+function forgetConnection() {
+  if (state.ws) { try { state.ws.close(); } catch {} }
+  try { localStorage.removeItem(CONN_KEY); localStorage.removeItem(RUNOWNER_KEY); } catch {}
+  state.connectionId = null;
+  state.lastJobId = null;
+  applyStatus({ status: "disconnected", model: "" });
+}
+
 async function disconnect() {
   if (!state.connectionId) { applyStatus({ status: "disconnected", model: "" }); return; }
   if (state.lastJobId && state.status === "ready") {
@@ -2776,7 +2851,8 @@ async function injectPrompt(text) {
 async function sendChat(e) {
   e.preventDefault();
   const input = $("chatInput");
-  const text = input.value.trim();
+  // The corpus scan takes no question: an empty composer sends a default label for the run.
+  const text = input.value.trim() || (activeRoute() === "corpus" ? "Corpus scan: haploinsufficient genes in retinal disease" : "");
   if (!text) return;
   // The plan-review / mid-run channels belong to the chat that OWNS the in-flight run. A message
   // typed in a DIFFERENT chat is a new question, never feedback on someone else's plan: a tester
@@ -2845,7 +2921,7 @@ async function sendChat(e) {
     // it and scopes a study by question + dataset instead). An older client omitting `route` still
     // gets today's research behaviour, because the server defaults it.
     const route = activeRoute();
-    const res = await fetch("/api/lab", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ connection_id: state.connectionId, conversation_id: state.activeId, question: text, dataset_path, datasets, case_note: (state.caseNote && state.caseNote.text) || null, plan_mode, autonomous, planner, route, history, mode: ($("modeSelect") && $("modeSelect").value) || "auto", presets: (sess && sess.presetKeys) || [], skills: (sess && sess.skillKeys) || [], preset_prompt: null }) });
+    const res = await fetch("/api/lab", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ connection_id: state.connectionId, conversation_id: state.activeId, question: text, dataset_path, datasets, case_note: (state.caseNote && state.caseNote.text) || null, plan_mode, autonomous, save_results: !!($("saveResults") && $("saveResults").checked), planner, route, history, mode: ($("modeSelect") && $("modeSelect").value) || "auto", presets: (sess && sess.presetKeys) || [], skills: (sess && sess.skillKeys) || [], preset_prompt: null }) });
     if (!res.ok) {
       const d = await res.json();
       if (res.status === 404 && /unknown connection/i.test(d.error || "")) {
@@ -2860,6 +2936,8 @@ async function sendChat(e) {
         return;
       }
       toast(d.error || "Run failed");
+    } else if (route === "corpus") {
+      leaveCorpusRoute(sess);     // accepted: one pick is one scan (a refused send keeps the pick)
     }
   } catch (err) { toast(isUnreachable(err) ? "Can't reach the local server." : "Run failed: " + err.message); }
 }
@@ -3085,142 +3163,754 @@ async function submitPlan(action, feedback) {
   } catch (err) { toast(isUnreachable(err) ? "Can't reach the local server." : "Plan submit failed: " + err.message); }
 }
 
-// Upload a local dataset file to the server (saved under the connection's per-user
-// workspace); on success fill the dataset path so the lab/pipeline can analyze it.
-// Small files go in one POST; large files (> threshold) upload in resumable chunks
-// so a dropped connection resumes from the server's byte offset instead of
-// restarting. Big matrices are still better pointed at via a server path.
-const UPLOAD_CHUNK = 8 * 1024 * 1024;               // 8 MB per chunk
-const UPLOAD_CHUNK_THRESHOLD = 16 * 1024 * 1024;    // above this → resumable chunks
+// ---- uploads ------------------------------------------------------------------------------------
+// A file reaches the gateway over tus (resumable: 8 MiB chunks, each with its SHA-256, and the
+// whole-file SHA-256 with the last one); the gateway then copies it to HPC3 in the background
+// (gateway/staging.py). One card in the Datasets tab follows an upload through both halves, and a
+// folder is one card. Cards come back after a page reload: copies still running or failed are read
+// from the server, uploads the browser had not finished from its own storage.
+const UPLOAD_CHUNK = 8 * 1024 * 1024;
+const TUS_CONCURRENCY = 3;
+// A broken connection is tried again by itself for about five minutes. The count starts over
+// whenever a chunk got through, so this is per outage, not per upload. With seven steps (69 s) a
+// 20 s outage used five of them and one more fault ended the upload (measured 2026-10-12).
+const TUS_RETRY_DELAYS = [0, 1000, 3000, 5000, 10000, 20000, 30000, 30000, 60000, 60000, 60000];
+// Uploads that have a retry pending. When the link is back (the browser says so, or the page's
+// WebSocket reconnected) they try at once instead of sitting out the rest of a long delay, and the
+// ones that had given up continue.
+const tusKicks = new Set();
+function uploadsLinkBack() {
+  for (const kick of [...tusKicks]) kick();
+  for (const u of [...state.uploads]) {
+    if (u.status !== "error" || !u.lost || u.jobId || u.serverFolder) continue;   // only what the browser still owes
+    if (u.kind === "folder" && u.files) uploadFolder(u.files);
+    else if (u.kind !== "folder" && u.file) uploadDataset(u.file);
+  }
+}
+window.addEventListener("online", uploadsLinkBack);
+// Say what stopped an upload in words the user can act on. `where` is " at 31%" or "", `next` is
+// what continuing takes. The library's own message stays available as the card's tooltip.
+function uploadFailure(err, where, next) {
+  const res = err && err.originalResponse;
+  const status = res ? res.getStatus() : 0;
+  let said = "";
+  if (res) { try { said = JSON.parse(res.getBody() || "{}").error || ""; } catch { /* not JSON */ } }
+  const detail = (err && err.message) || "";
+  const noAnswer = !!err && (err instanceof TypeError || (!!err.originalRequest && !status));
+  if (noAnswer) return { lost: true, detail, text: `The connection was lost${where}. ${next}` };
+  if (status === 507) return { lost: false, detail, text: "The server's disk is too full for this file." };
+  if (status >= 500) return { lost: true, detail, text: `The server did not answer (HTTP ${status})${where}. ${next}` };
+  if (status === 401) return { lost: false, detail, text: "You are signed out. Sign in again, then continue the upload." };
+  if (status === 413) return { lost: false, detail, text: "The file is larger than the server accepts." };
+  if (status === 460) return { lost: false, detail, text: `A piece of the file kept arriving damaged${where}. ${next}` };
+  if (status === 404 && /connection/i.test(said)) {
+    return { lost: false, detail, text: "The server no longer knows this session (it was restarted, or you were disconnected). Connect to HPC3 again, then continue the upload." };
+  }
+  if (status) return { lost: false, detail, text: said ? `The server refused the upload: ${said}` : `The server refused the upload (HTTP ${status}).` };
+  return { lost: false, detail: "", text: detail.replace(/^tus: /, "") || "upload failed" };
+}
+const STAGING_POLL_MS = 15000;      // how long to wait for a WebSocket event before asking the server
+const UPLOAD_ACTIVE = ["queued", "uploading", "staging", "verifying", "unpacking"];
+const ARCHIVE_RE = /\.(zip|tar|tar\.gz|tgz)$/i;
+let tusRunning = 0;
+const tusWaiting = [];
+function uploadSlot() {
+  if (tusRunning < TUS_CONCURRENCY) { tusRunning++; return Promise.resolve(); }
+  return new Promise((resolve) => tusWaiting.push(resolve));
+}
+function releaseUploadSlot() {
+  tusRunning--;
+  if (tusWaiting.length) { tusRunning++; tusWaiting.shift()(); }
+}
+function tusId(url) { return (url || "").split("/").pop(); }
+function tusHeaders() { return { "Tus-Resumable": "1.0.0", "X-Connection-ID": state.connectionId || "" }; }
+function postJson(url, body) {
+  return fetch(url, { method: "POST", headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ connection_id: state.connectionId, ...body }) });
+}
+const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+// 20 GB reads badly as "21474.8 MB"
+const fmtUploadSize = (n) => ((n || 0) >= 1e9 ? `${((n || 0) / 1e9).toFixed(2)} GB` : `${((n || 0) / 1e6).toFixed(1)} MB`);
 
+// -- speed and time left ----------------------------------------------------------------------------
+// Each card measures its own bytes over the last seconds, in both halves: the browser sending to the
+// server ("uploading") and the server copying to HPC3 ("staging"). An average since the start would
+// go on reporting the speed of a link that has since slowed down or stopped.
+const UPLOAD_PACE_WINDOW_MS = 15000;    // the stretch the speed is averaged over
+const UPLOAD_PACE_STALE_MS = 20000;     // no new byte for this long: there is no speed to report
+const UPLOAD_PACE_PHASES = ["uploading", "staging"];
+const uploadPaces = new Map();          // card id -> { phase, samples: [[ms, bytes], …] }
+let uploadPaceTimer = null;
+const fmtUploadSpeed = (bps) => (bps >= 1e9 ? `${(bps / 1e9).toFixed(2)} GB/s`
+  : bps >= 1e6 ? `${(bps / 1e6).toFixed(1)} MB/s` : `${Math.max(1, Math.round(bps / 1e3))} kB/s`);
+function fmtUploadEta(seconds) {
+  const s = Math.max(1, Math.round(seconds));
+  if (s < 60) return `${s} s left`;
+  const m = Math.round(s / 60);
+  if (m < 60) return `${m} min left`;
+  return m % 60 ? `${Math.floor(m / 60)} h ${m % 60} min left` : `${m / 60} h left`;
+}
+function noteUploadPace(u, now = Date.now()) {
+  if (!UPLOAD_PACE_PHASES.includes(u.status) || !u.size) { uploadPaces.delete(u.id); return; }
+  const sent = u.sent || 0;
+  let p = uploadPaces.get(u.id);
+  // the copy to HPC3 counts from 0 again, and so does a copy that is retried
+  if (!p || p.phase !== u.status || sent < p.samples[p.samples.length - 1][1]) {
+    p = { phase: u.status, samples: [[now, sent]] };
+    uploadPaces.set(u.id, p);
+  } else if (sent > p.samples[p.samples.length - 1][1]) p.samples.push([now, sent]);
+  while (p.samples.length > 2 && now - p.samples[0][0] > UPLOAD_PACE_WINDOW_MS) p.samples.shift();
+  // A card is repainted when its bytes move. One that stalls is not, and would show its last speed
+  // for ever: repaint once a second while anything is being measured.
+  if (!uploadPaceTimer) uploadPaceTimer = setInterval(() => {
+    if (uploadPaces.size) { renderUploads(); return; }
+    clearInterval(uploadPaceTimer); uploadPaceTimer = null;
+  }, 1000);
+}
+// { bps, eta } for a card whose bytes are moving, null otherwise (too early to tell, or stalled).
+function uploadPaceOf(u, now = Date.now()) {
+  const p = uploadPaces.get(u.id);
+  if (!p || p.phase !== u.status || p.samples.length < 2) return null;
+  const first = p.samples[0], last = p.samples[p.samples.length - 1];
+  if (last[0] - first[0] < 1000 || now - last[0] > UPLOAD_PACE_STALE_MS) return null;
+  const bps = ((last[1] - first[1]) * 1000) / (last[0] - first[0]);
+  return bps > 0 ? { bps, eta: Math.max(0, u.size - (u.sent || 0)) / bps } : null;
+}
+// " · 35.2 MB/s · 2 min left", or "" when there is nothing to say.
+function uploadPaceText(u) {
+  const pace = u && uploadPaceOf(u);
+  return pace ? ` · ${fmtUploadSpeed(pace.bps)} · ${fmtUploadEta(pace.eta)}` : "";
+}
+const uploadPaceTextFor = (id) => uploadPaceText(state.uploads.find((u) => u.id === id));
+const uploadDigestCache = new WeakMap();
+function hashUploadFile(file, ctrl) {
+  if (uploadDigestCache.has(file)) return uploadDigestCache.get(file);
+  const promise = new Promise((resolve, reject) => {
+    const worker = new Worker("/static/upload-hash-worker.js");
+    const abort = () => { worker.terminate(); reject(new DOMException("cancelled", "AbortError")); };
+    ctrl.signal.addEventListener("abort", abort, { once: true });
+    worker.onmessage = ({ data }) => {
+      if (data.type === "done" || data.type === "error") {
+        worker.terminate(); ctrl.signal.removeEventListener("abort", abort);
+        if (data.type === "error") reject(new Error(data.error)); else resolve(data.sha256);
+      }
+    };
+    worker.onerror = (e) => { worker.terminate(); ctrl.signal.removeEventListener("abort", abort); reject(new Error(e.message)); };
+    worker.postMessage(file);
+  });
+  uploadDigestCache.set(file, promise);
+  promise.catch(() => uploadDigestCache.delete(file));
+  return promise;
+}
+// Send one file over tus; resolves with the gateway's answer for the finished upload
+// ({status: "staging", job_id, …} when a copy to HPC3 follows, {status: "complete", …} otherwise).
+function tusUpload(file, fields, ctrl, hashPromise, onProgress, onWaitingForHash, onRetrying) {
+  if (!window.tus || !window.tus.isSupported) throw new Error("Resumable upload support is unavailable");
+  return new Promise((resolveUpload, rejectUpload) => {
+    let waiting = false;      // between two attempts: a kick starts the next one now
+    let retrying = false;     // a request failed and no chunk has got through since
+    const kick = () => {
+      if (!waiting || ctrl.signal.aborted) return;
+      waiting = false;
+      upload.abort().then(() => { if (!ctrl.signal.aborted) upload.start(); }).catch(() => {});
+    };
+    const moving = () => { if (retrying) { retrying = false; if (onRetrying) onRetrying(false); } };
+    const settled = () => { tusKicks.delete(kick); waiting = false; moving(); };
+    const resolve = (v) => { settled(); resolveUpload(v); };
+    const reject = (e) => { settled(); rejectUpload(e); };
+    const upload = new window.tus.Upload(file, {
+      endpoint: "/api/tus", chunkSize: UPLOAD_CHUNK, retryDelays: TUS_RETRY_DELAYS,
+      removeFingerprintOnSuccess: true,
+      fingerprint: async (f) => `tus:${apiKeyOwner()}:${fields.rel_path || f.name}:${f.size}:${f.lastModified}`,
+      headers: { "X-Connection-ID": state.connectionId },
+      metadata: { filename: file.name, connection_id: state.connectionId, ...fields },
+      // Asked after every failed request while attempts are left. Everything but a refusal by the
+      // server is tried again: no answer at all, a 5xx from the proxy, a chunk that arrived damaged
+      // (460), an offset the server corrects (409). The library's own rule also gives up at once
+      // when the browser reports itself offline, which is exactly when waiting is right.
+      onShouldRetry(err) {
+        const status = err.originalResponse ? err.originalResponse.getStatus() : 0;
+        const again = status !== 507 && (status < 400 || status >= 500 || status === 409 || status === 423 || status === 460);
+        if (again) {
+          waiting = true;
+          if (!retrying) { retrying = true; if (onRetrying) onRetrying(true); }
+        }
+        return again;
+      },
+      onChunkComplete: moving,
+      async onBeforeRequest(req) {
+        waiting = false;                                             // the next attempt has begun
+        if (req.getMethod() !== "PATCH") return;
+        const offset = Number(req.getHeader("Upload-Offset"));
+        if (!Number.isSafeInteger(offset)) throw new Error("Missing tus upload offset");
+        const bytes = await file.slice(offset, offset + UPLOAD_CHUNK).arrayBuffer();
+        const digest = new Uint8Array(await crypto.subtle.digest("SHA-256", bytes));
+        req.setHeader("Upload-Checksum", `sha256 ${btoa(String.fromCharCode(...digest))}`);
+        if (offset + UPLOAD_CHUNK >= file.size && hashPromise) {
+          // The last chunk carries the whole-file SHA-256. On a fast link the bytes are out before
+          // the worker has read the whole file (20 GiB locally: sent in 112 s, hashed in 287 s), so
+          // say what the wait is. A hash that failed must not strand an upload at 100%: every chunk
+          // was checked on its own, so the last one goes without the whole-file digest.
+          let sha = "", ready = false;
+          const done = hashPromise.then((v) => { sha = v; }, (e) => { if (ctrl.signal.aborted) throw e; }).finally(() => { ready = true; });
+          await Promise.resolve();
+          if (!ready && onWaitingForHash) onWaitingForHash(true);
+          try { await done; } finally { if (onWaitingForHash) onWaitingForHash(false); }
+          if (sha) req.setHeader("Upload-Final-SHA256", sha);
+        }
+      },
+      onProgress(sent, total) { if (onProgress) onProgress(sent, total); },
+      onError: reject,
+      async onSuccess() {
+        // Every byte is on the server (also when the last chunk's answer was lost and the retry
+        // found nothing left to send). Asking what became of the upload must survive a lost
+        // connection too: giving up here would offer a Resume that sends the whole file again.
+        moving();
+        for (let attempt = 0; ; attempt++) {
+          try {
+            const r = await fetch(`/api/tus/${tusId(upload.url)}`, { headers: { "X-Connection-ID": state.connectionId } });
+            if (r.status >= 500 && attempt < TUS_RETRY_DELAYS.length) throw new TypeError(`HTTP ${r.status}`);
+            const d = await r.json();
+            if (!r.ok) throw new Error(d.error || `Upload result unavailable (${r.status})`);
+            resolve(d);
+            return;
+          } catch (e) {
+            if (ctrl.signal.aborted) return;
+            if (!(e instanceof TypeError) || attempt >= TUS_RETRY_DELAYS.length) { reject(e); return; }
+            await sleep(TUS_RETRY_DELAYS[attempt] || 1000);
+          }
+        }
+      },
+    });
+    tusKicks.add(kick);
+    ctrl.signal.addEventListener("abort", () => {
+      upload.abort(true).catch(() => {});
+      reject(new DOMException("cancelled", "AbortError"));
+    }, { once: true });
+    upload.findPreviousUploads().then((previous) => {
+      if (ctrl.signal.aborted) return;
+      if (previous.length) upload.resumeFromPreviousUpload(previous[0]);
+      upload.start();
+    }).catch(reject);
+  });
+}
+
+// -- the copy to HPC3: the server pushes every change over the WebSocket ("upload_staging") --------
+const stagingJobs = new Map();       // job id -> the latest state the server pushed
+const stagingWaiters = new Set();
+function wakeStagingWaiters() { for (const wake of [...stagingWaiters]) wake(); }
+function onStagingEvent(job) {
+  if (!job || !job.id) return;
+  stagingJobs.set(job.id, job);
+  wakeStagingWaiters();
+}
+// Resolves at the next staging event, or after `ms`: the socket may be down, and then the caller
+// asks the server instead.
+function nextStagingEvent(ms) {
+  return new Promise((resolve) => {
+    const wake = () => { clearTimeout(timer); stagingWaiters.delete(wake); resolve(); };
+    const timer = setTimeout(wake, ms);
+    stagingWaiters.add(wake);
+  });
+}
+async function stagingJob(jobId) {
+  const r = await fetch(`/api/upload/staging?connection_id=${encodeURIComponent(state.connectionId)}&job_id=${encodeURIComponent(jobId)}`);
+  const d = await r.json().catch(() => ({}));
+  return d.job || null;
+}
+// Follow one background copy until it settles; returns an upload-shaped answer.
+async function finishStaging(d, id, name, size, signal) {
+  const onAbort = () => { postJson("/api/upload/staging/cancel", { job_id: d.job_id }).catch(() => {}); wakeStagingWaiters(); };
+  if (signal) signal.addEventListener("abort", onAbort, { once: true });
+  try {
+    let job = await stagingJob(d.job_id).catch(() => null);
+    for (;;) {
+      if (signal && signal.aborted) throw new DOMException("cancelled", "AbortError");
+      if (job) {
+        if (job.state === "done") return { ...d, status: "uploaded", name: job.name, path: job.remote_path,
+          size: job.size, peek: job.peek || d.peek, unpacked: job.unpacked, unpack_error: job.unpack_error };
+        if (job.state === "failed" || job.state === "cancelled") return { ...d, status: job.state, error: job.error };
+        const status = job.state === "verifying" ? "verifying" : job.state === "unpacking" ? "unpacking" : "staging";
+        // "queued" with an error is a copy waiting for its retry, or for an HPC3 session: say so
+        upsertUpload({ id, status, sent: job.sent || 0, size: job.size || size,
+          note: job.state === "queued" && job.error ? `Waiting — ${job.error}` : "" });
+        setUploadProgress(status === "verifying" ? `Verifying ${name} on HPC3…`
+          : status === "unpacking" ? `Unpacking ${name} on HPC3…`
+          : `Copying ${name} to HPC3… ${job.size ? Math.floor((100 * (job.sent || 0)) / job.size) : 0}%${uploadPaceTextFor(id)}`);
+      }
+      const seen = stagingJobs.get(d.job_id);
+      await nextStagingEvent(STAGING_POLL_MS);
+      const now = stagingJobs.get(d.job_id);
+      job = now && now !== seen ? now : await stagingJob(d.job_id).catch(() => null);
+    }
+  } finally { if (signal) signal.removeEventListener("abort", onAbort); }
+}
+// The server records a folder once every file of it is verified on HPC3; follow that.
+async function finishFolderStaging(folder, d, id, signal) {
+  const onAbort = () => { postJson("/api/upload/staging/cancel", { folder }).catch(() => {}); wakeStagingWaiters(); };
+  if (signal) signal.addEventListener("abort", onAbort, { once: true });
+  try {
+    for (;;) {
+      if (signal && signal.aborted) throw new DOMException("cancelled", "AbortError");
+      const asked = Date.now();
+      // The copies run on the server whether or not this page can reach it: an unanswered question
+      // is asked again, it does not end the card (the single-file follower does the same).
+      const r = await fetch(`/api/upload/staging?connection_id=${encodeURIComponent(state.connectionId)}&folder=${encodeURIComponent(folder)}`).catch(() => null);
+      const f = r && r.ok ? ((await r.json().catch(() => ({}))).folder || {}) : null;
+      if (f) {
+        if (f.recorded) return { ...d, status: "registered", name: folder, path: f.remote_root || d.path, size: f.size, count: f.count };
+        if (f.pending === 0 && f.failed > 0) throw new Error(`${f.failed} of ${f.count} files did not reach HPC3`);
+        upsertUpload({ id, status: "staging", filesDone: f.done || 0, filesTotal: f.count || 0, sent: f.sent || 0, size: f.size || 0 });
+        setUploadProgress(`Copying ${folder}/ to HPC3 — ${f.done || 0}/${f.count || "?"} files${uploadPaceTextFor(id)}`);
+      }
+      await nextStagingEvent(STAGING_POLL_MS);
+      // every file of a big folder sends events: ask the server at most once a second
+      const early = 1000 - (Date.now() - asked);
+      if (early > 0) await sleep(early);
+    }
+  } finally { if (signal) signal.removeEventListener("abort", onAbort); }
+}
+
+// -- one file ----------------------------------------------------------------------------------------
+// All bytes of a file are on the gateway: follow its copy to HPC3, then show the dataset.
+async function settleUpload(id, d, name, size, ctrl, attach) {
+  if (d.status === "staging") {
+    upsertUpload({ id, jobId: d.job_id, status: "staging", sent: 0, error: "" });
+    d = await finishStaging(d, id, name, size, ctrl.signal);
+  }
+  if (d.status === "failed" || d.status === "cancelled") throw new Error(d.error || `copy to HPC3 ${d.status}`);
+  upsertUpload({ id, sent: size, status: "done", note: "" });
+  const unpacked = d.unpacked;
+  // Carry the upload-time content skim (the deterministic peek gist) onto the chip so the user sees
+  // "what this is" per attached file, not just the name. An unpacked archive is its folder.
+  if (attach) addDataset({ name: unpacked ? `${unpacked.path.replace(/\/$/, "").split("/").pop()}/` : d.name,
+    path: unpacked ? unpacked.path : d.path, kind: unpacked ? "folder" : "file", gist: (d.peek && d.peek.gist) || "" });
+  if (d.unpack_error) toast(`Uploaded ${d.name}, but it was not unpacked: ${d.unpack_error}`);
+  else toast(`Uploaded ${d.name || name} (${fmtUploadSize(d.size || size)})`);   // d.name may be uniquified
+  loadDatasets();                                                  // reflect the new file in the tab
+  setTimeout(() => removeUpload(id), 4000);                        // clear the "Done" card after a beat
+}
+function failUpload(id, err, name, ctrl) {
+  if ((ctrl && ctrl.signal.aborted) || err.name === "AbortError") {      // the user cancelled: not an error
+    upsertUpload({ id, status: "cancelled", note: "" });
+    toast(`Cancelled ${name}`);
+    setTimeout(() => removeUpload(id), 4000);
+    return;
+  }
+  const u = state.uploads.find((x) => x.id === id) || {};
+  const pct = u.size ? Math.floor((100 * (u.sent || 0)) / u.size) : 0;
+  // A card with a job is past the upload: what failed is the copy, and "Retry copy" is its button.
+  const uploading = !(u.jobId || u.serverFolder);
+  const f = uploadFailure(err, uploading && pct ? ` at ${pct}%` : "",
+    uploading ? "Resume continues from there." : "Try again when the connection is back.");
+  upsertUpload({ id, status: "error", note: "", error: f.text, detail: f.detail, lost: f.lost });
+  reportUploadError(id, name, err);
+  toast(`${name}: ${f.text}`);
+}
+// A failure in the browser (the connection dropped, the file could not be read) is one the server
+// never sees by itself: tell it, so its upload log does not simply stop.
+function reportUploadError(id, name, err) {
+  const u = state.uploads.find((x) => x.id === id) || {};
+  postJson("/api/upload/report", { name, kind: u.kind || "file", size: u.size || 0, sent: u.sent || 0,
+    error: (err && err.message) || "upload failed" }).catch(() => {});
+}
 async function uploadDataset(file) {
   if (!file) return;
   if (!state.connectionId) { toast("Connect to HPC3 first."); return; }
-  // Stable per-file id (same formula as uploadResumable) so a Resume reuses the same record + the
-  // server's byte offset. The Datasets tab renders this record live so the transfer is transparent.
+  // Stable per-file id, so choosing the same file again (Resume) reuses its card.
   const id = "u" + Math.abs(hashStr(`${file.name}:${file.size}:${file.lastModified}`)).toString(36);
-  const ctrl = new AbortController();   // lets Cancel abort the in-flight chunk + stop the loop
-  upsertUpload({ id, name: file.name, size: file.size, sent: 0, status: "uploading", file, error: "", ctrl });
+  const ctrl = new AbortController();
+  // An archive is asked about once: a Resume, by hand or by itself, keeps the first answer.
+  const before = state.uploads.find((u) => u.id === id && u.status === "error");
+  let fields = before && before.fields;
+  state.uploads = state.uploads.filter((u) => !(u.status === "pending" && u.kind === "file" && u.name === file.name && u.size === file.size));
+  upsertUpload({ id, kind: "file", name: file.name, size: file.size, sent: (before && before.sent) || 0, status: "queued", file,
+    error: "", detail: "", lost: false, retrying: false, note: "", jobId: "", ctrl });
   setUploadProgress(`Uploading ${file.name}…`);
   try {
-    const onProg = (pct, phase) => {
-      upsertUpload({ id, sent: Math.round((pct / 100) * file.size), status: phase === "finalizing" ? "finalizing" : "uploading" });
-      setUploadProgress(phase === "finalizing" ? `Finalizing ${file.name}…` : `Uploading ${file.name}… ${pct}%`);
-    };
-    const d = file.size > UPLOAD_CHUNK_THRESHOLD
-      ? await uploadResumable(file, onProg, ctrl.signal, id)
-      : await uploadSingle(file, ctrl.signal);
-    if (!d) { upsertUpload({ id, status: "error", error: "upload failed" }); return; }
-    upsertUpload({ id, sent: file.size, status: "done" });
-    // Carry the upload-time content skim (feature ①'s deterministic peek gist) onto the chip so the
-    // user sees "what this is" per attached file, not just the name.
-    addDataset({ name: d.name, path: d.path, kind: "file", gist: (d.peek && d.peek.gist) || "" });
-    toast(`Uploaded ${d.name} (${(d.size / 1e6).toFixed(1)} MB)`);   // d.name may be uniquified
-    loadDatasets();                                                  // reflect the new file in the tab
-    setTimeout(() => removeUpload(id), 4000);                        // clear the "Done" card after a beat
-  } catch (err) {
-    if (ctrl.signal.aborted || err.name === "AbortError") {          // user cancelled — not an error
-      upsertUpload({ id, status: "cancelled" });
-      discardUpload(id);                                             // drop the server-side .part too
-      toast(`Cancelled ${file.name}`);
-      setTimeout(() => removeUpload(id), 4000);
-      return;
+    if (!fields) {
+      fields = ARCHIVE_RE.test(file.name) && window.confirm(`Unpack ${file.name} after verified transfer to HPC3?`)
+        ? { unpack: "1" } : {};
+      upsertUpload({ id, fields });
     }
-    upsertUpload({ id, status: "error", error: err.message || "upload failed" });
-    toast(isUnreachable(err) ? "Can't reach the local server." : "Upload failed: " + err.message);
-  } finally { setUploadProgress(null); }
+    await uploadSlot();
+    let d;
+    try {
+      if (ctrl.signal.aborted) throw new DOMException("cancelled", "AbortError");
+      const hashPromise = hashUploadFile(file, ctrl);
+      hashPromise.catch(() => {}); // cancellation before the final PATCH still has a handled promise
+      upsertUpload({ id, status: "uploading" });
+      d = await tusUpload(file, fields, ctrl, hashPromise, (sent, total) => {
+        upsertUpload({ id, sent, size: total, status: "uploading" });
+        setUploadProgress(`Uploading ${file.name}… ${total ? Math.floor((100 * sent) / total) : 0}%${uploadPaceTextFor(id)}`);
+      }, (waiting) => {
+        upsertUpload({ id, note: waiting ? "Finishing the checksum of the whole file…" : "" });
+        if (waiting) setUploadProgress(`Finishing the checksum of ${file.name}…`);
+      }, (retrying) => upsertUpload({ id, retrying }));
+    } finally { releaseUploadSlot(); }
+    await settleUpload(id, d, file.name, file.size, ctrl, true);
+  } catch (err) { failUpload(id, err, file.name, ctrl); }
+  finally { setUploadProgress(null); }
 }
 
-// --- Datasets-tab upload tracker: live progress + resume + cancel for chunked uploads ---------
+// -- the cards ---------------------------------------------------------------------------------------
 function upsertUpload(rec) {
   const i = state.uploads.findIndex((u) => u.id === rec.id);
   if (i >= 0) state.uploads[i] = { ...state.uploads[i], ...rec };
   else state.uploads.unshift(rec);
+  noteUploadPace(state.uploads[i >= 0 ? i : 0]);
   renderUploads();
 }
-function removeUpload(id) { state.uploads = state.uploads.filter((u) => u.id !== id); renderUploads(); }
-function resumeUpload(id) { const u = state.uploads.find((x) => x.id === id); if (u && u.file) uploadDataset(u.file); }
-// Cancel: abort the in-flight fetch + stop the chunk loop; uploadDataset's catch finalises the card.
+function removeUpload(id) { state.uploads = state.uploads.filter((u) => u.id !== id); uploadPaces.delete(id); renderUploads(); }
+function resumeUpload(id) {
+  const u = state.uploads.find((x) => x.id === id);
+  if (u && u.kind === "folder" && u.files) uploadFolder(u.files);    // only the missing files are sent
+  else if (u && u.file) uploadDataset(u.file);
+}
+// Cancel: abort whatever is in flight for this card; the code driving it finalises the card.
 function cancelUpload(id) { const u = state.uploads.find((x) => x.id === id); if (u && u.ctrl) u.ctrl.abort(); }
 function cancelActiveUploads() {
-  state.uploads.filter((u) => u.status === "uploading" || u.status === "finalizing").forEach((u) => cancelUpload(u.id));
+  state.uploads.filter((u) => UPLOAD_ACTIVE.includes(u.status)).forEach((u) => cancelUpload(u.id));
 }
-// Tell the server to delete the half-written .part so a cancelled upload leaves nothing behind.
-function discardUpload(id) {
-  fetch("/api/upload/discard", { method: "POST", headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ connection_id: state.connectionId, upload_id: id }) }).catch(() => {});
+// The copy to HPC3 failed (the file is still on the server): run it again, without uploading again.
+async function retryUpload(id) {
+  const u = state.uploads.find((x) => x.id === id);
+  if (!u || !(u.jobId || u.serverFolder)) return;
+  const ctrl = new AbortController();
+  try {
+    const r = await postJson("/api/upload/staging/retry", u.serverFolder ? { folder: u.serverFolder } : { job_id: u.jobId });
+    const d = await r.json().catch(() => ({}));
+    if (!r.ok || d.status !== "retrying") { toast(d.error || "Nothing left to retry: upload it again."); return; }
+    upsertUpload({ id, status: "staging", error: "", note: "", ctrl });
+    if (u.serverFolder) await followFolder(id, u.serverFolder, {}, ctrl, u.attach !== false);
+    else await settleUpload(id, { status: "staging", job_id: u.jobId, name: u.name, size: u.size }, u.name, u.size, ctrl, u.attach !== false);
+  } catch (err) { failUpload(id, err, u.name, ctrl); }
+  finally { setUploadProgress(null); }
 }
-
+// Give a failed upload up: the server drops the job and what it had kept for a retry.
+async function dismissUpload(id) {
+  const u = state.uploads.find((x) => x.id === id);
+  if (!u) return;
+  if (u.jobId || u.serverFolder) {
+    await postJson("/api/upload/staging/dismiss", u.serverFolder ? { folder: u.serverFolder } : { job_id: u.jobId }).catch(() => {});
+  }
+  removeUpload(id);
+}
+// Forget an upload the browser never finished: the gateway deletes the bytes it holds.
+async function discardUpload(id) {
+  const u = state.uploads.find((x) => x.id === id);
+  if (!u) return;
+  try {
+    if (u.tusUrl) await fetch(u.tusUrl, { method: "DELETE", headers: tusHeaders() }).catch(() => {});
+    if (u.tusKey && window.tus) await window.tus.defaultOptions.urlStorage.removeUpload(u.tusKey);
+    if (u.folderKey) { localStorage.removeItem(u.folderKey); localStorage.removeItem(`${u.folderKey}:completed`); }
+  } catch { /* the card goes either way */ }
+  removeUpload(id);
+}
+function uploadAction(act, id) {
+  if (act === "cancel") cancelUpload(id);
+  else if (act === "resume") resumeUpload(id);
+  else if (act === "retry") retryUpload(id);
+  else if (act === "dismiss") dismissUpload(id);
+  else if (act === "discard") discardUpload(id);
+  else if (act === "pickfile") $("datasetFile").click();
+  else if (act === "pickdir") $("datasetDir").click();
+}
+function uploadCardView(u) {
+  const pct = u.size ? Math.min(100, Math.round(((u.sent || 0) / u.size) * 100)) : 0;
+  const files = u.filesTotal ? `${u.filesDone || 0}/${u.filesTotal} files` : "";
+  const pace = uploadPaceText(u);
+  let stat;
+  if (u.status === "done") stat = "Done";
+  else if (u.status === "cancelled") stat = "Cancelled";
+  else if (u.status === "queued") stat = "Waiting for an upload slot…";
+  else if (u.status === "staging") stat = u.note || `Copying to HPC3… ${files || `${pct}%`}${pace}`;
+  else if (u.status === "verifying") stat = "Verifying on HPC3…";
+  else if (u.status === "unpacking") stat = "Unpacking on HPC3…";
+  else if (u.status === "error") stat = `${u.lost ? "Interrupted" : "Failed"} — ${u.error || "interrupted"}`;
+  else if (u.status === "pending") stat = u.note || "Interrupted — choose it again to continue";
+  else if (u.retrying) stat = `Connection lost at ${files ? files + ", " : ""}${pct}% — trying again…`;
+  else stat = u.note || `${files ? files + " · " : ""}${pct}% · ${fmtUploadSize(u.sent)} / ${fmtUploadSize(u.size)}${pace}`;
+  const buttons = [];
+  if (UPLOAD_ACTIVE.includes(u.status)) buttons.push(["cancel", "Cancel"]);
+  else if (u.status === "error") {
+    if (u.jobId || u.serverFolder) buttons.push(["retry", "Retry copy"]);
+    else if (u.kind === "folder") buttons.push(u.files ? ["resume", "Resume"] : ["pickdir", "Choose the folder again"]);
+    else if (u.file) buttons.push(["resume", "Resume"]);
+    buttons.push(["dismiss", "Dismiss"]);
+  } else if (u.status === "pending") {
+    buttons.push(u.kind === "folder" ? ["pickdir", "Choose folder"] : ["pickfile", "Choose file"], ["discard", "Discard"]);
+  }
+  const icon = u.status === "error" ? "error" : u.status === "cancelled" ? "cancel"
+    : u.status === "done" ? "check_circle" : u.status === "pending" ? "pause_circle"
+    : u.kind === "folder" ? "drive_folder_upload" : "upload_file";
+  // the upload library's own wording, for whoever has to debug it
+  const tip = u.status === "error" && u.detail && u.detail !== u.error ? `${stat}\n\n${u.detail}` : stat;
+  return { stat, pct, buttons, icon, tip };
+}
+// Cards are updated in place. Rebuilding them on every progress event replaced the buttons several
+// times a second, and a click whose press and release fell on two different buttons was lost.
 function renderUploads() {
   const host = $("uploadsPanel");
   if (!host) return;
-  if (!state.uploads.length) { host.innerHTML = ""; host.classList.add("hidden"); return; }
-  host.classList.remove("hidden");
-  host.innerHTML = state.uploads.map((u) => {
-    const pct = u.size ? Math.min(100, Math.round((u.sent / u.size) * 100)) : 0;
-    const ic = u.status === "error" ? "error" : u.status === "cancelled" ? "cancel"
-      : u.status === "done" ? "check_circle" : "upload_file";
-    const stat = u.status === "done" ? "Done"
-      : u.status === "cancelled" ? "Cancelled"
-      : u.status === "finalizing" ? "Finalizing on HPC3…"
-      : u.status === "error" ? `Failed — ${u.error || "interrupted"}`
-      : `${pct}% · ${(u.sent / 1e6).toFixed(1)} / ${(u.size / 1e6).toFixed(1)} MB`;
-    const active = u.status === "uploading" || u.status === "finalizing";
-    const btn = active ? `<button type="button" class="ghost small" data-cancel="${u.id}">Cancel</button>`
-      : (u.status === "error" && u.file ? `<button type="button" class="ghost small" data-resume="${u.id}">Resume</button>` : "");
-    return `<div class="upload-card ${u.status}"><div class="upload-row">` +
-      `<span class="material-symbols-outlined msym">${ic}</span>` +
-      `<span class="upload-name" title="${escapeHtml(u.name)}">${escapeHtml(u.name)}</span>` +
-      `<span class="upload-stat">${escapeHtml(stat)}</span>${btn}</div>` +
-      `<div class="meter"><div class="meter-fill${u.status === "done" ? " mem" : ""}" style="width:${pct}%"></div></div></div>`;
-  }).join("");
+  host.classList.toggle("hidden", !state.uploads.length);
+  const have = new Map([...host.children].map((el) => [el.dataset.uploadId, el]));
+  const wanted = new Set(state.uploads.map((u) => u.id));
+  for (const [id, el] of have) if (!wanted.has(id)) el.remove();
+  let prev = null;
+  for (const u of state.uploads) {
+    const v = uploadCardView(u);
+    const shape = `${u.status}|${v.icon}|${v.buttons.map((b) => b[0]).join(",")}`;
+    let el = have.get(u.id);
+    if (!el || el.dataset.shape !== shape) {
+      const fresh = document.createElement("div");
+      fresh.className = `upload-card ${u.status}`;
+      fresh.dataset.uploadId = u.id;
+      fresh.dataset.shape = shape;
+      fresh.innerHTML = `<div class="upload-row"><span class="material-symbols-outlined msym">${v.icon}</span>` +
+        `<span class="upload-name"></span><span class="upload-stat"></span>` +
+        v.buttons.map(([act, label]) => `<button type="button" class="ghost small" data-act="${act}">${escapeHtml(label)}</button>`).join("") +
+        `</div><div class="meter"><div class="meter-fill"></div></div>`;
+      if (el) el.replaceWith(fresh);
+      el = fresh;
+    }
+    const nameEl = el.querySelector(".upload-name");
+    nameEl.textContent = u.name; nameEl.title = u.name;
+    const statEl = el.querySelector(".upload-stat");
+    statEl.textContent = v.stat; statEl.title = v.tip;
+    const fill = el.querySelector(".meter-fill");
+    fill.style.width = `${v.pct}%`;
+    fill.classList.toggle("mem", u.status === "done");
+    const at = prev ? prev.nextElementSibling : host.firstElementChild;
+    if (at !== el) host.insertBefore(el, at);
+    prev = el;
+  }
 }
 
+// -- a folder: one card ------------------------------------------------------------------------------
+// Every file of the folder is registered: follow the copies to HPC3, then show the one dataset.
+async function followFolder(id, folder, d, ctrl, attach, onRecorded) {
+  upsertUpload({ id, serverFolder: folder, status: "staging", error: "", note: "" });
+  d = await finishFolderStaging(folder, d, id, ctrl.signal);
+  const card = state.uploads.find((u) => u.id === id) || {};
+  upsertUpload({ id, status: "done", sent: card.size || d.size || 0, filesDone: d.count, filesTotal: d.count });
+  // recorded: the browser's resume notes for this folder have nothing left to resume
+  if (card.folderKey) { try { localStorage.removeItem(card.folderKey); localStorage.removeItem(`${card.folderKey}:completed`); } catch { /* private mode */ } }
+  if (attach) addDataset({ name: `${d.name}/`, path: d.path, kind: "folder" });
+  if (onRecorded) onRecorded();
+  toast(`Uploaded folder ${d.name}/ (${d.count} files, ${fmtUploadSize(d.size)})`);
+  loadDatasets();
+  setTimeout(() => removeUpload(id), 4000);
+}
 // Upload a WHOLE folder (webkitdirectory) — every file keeps its nested relative path, so
 // a multi-level folder round-trips intact. Registered as ONE dataset entry; all uploads
 // this session stay reachable to the agent (server exposes the uploads tree to run_code).
 async function uploadFolder(fileList) {
-  const files = Array.from(fileList || []).filter((f) => f && f.size >= 0);
+  const files = Array.from(fileList || []).filter((f) => f && f.size >= 0)
+    .sort((a, b) => {
+      const left = a.webkitRelativePath || a.name, right = b.webkitRelativePath || b.name;
+      return left < right ? -1 : left > right ? 1 : 0;
+    });
   if (!files.length) return;
   if (!state.connectionId) { toast("Connect to HPC3 first."); return; }
   const folder0 = (files[0].webkitRelativePath || files[0].name).split("/")[0];
+  const signature = hashStr(files.map((f) => `${f.webkitRelativePath}:${f.size}:${f.lastModified}`).join("|"));
+  const folderKey = `upload-folder:${apiKeyOwner()}:${folder0}:${files.length}:${signature}`;
+  const bitsKey = `${folderKey}:completed`;
+  const doneBits = new Uint8Array(Math.ceil(files.length / 8));
+  const isDone = (i) => !!(doneBits[i >> 3] & (1 << (i & 7)));
+  try {
+    const saved = localStorage.getItem(bitsKey);
+    if (saved) {
+      const bytes = Uint8Array.from(atob(saved), (c) => c.charCodeAt(0));
+      if (bytes.length === doneBits.length) doneBits.set(bytes);
+    }
+  } catch { /* An unavailable browser store must not fail a completed transfer. */ }
+  const id = "F" + Math.abs(hashStr(folderKey)).toString(36);       // the same id a restored "interrupted" card has
+  const total = files.reduce((n, f) => n + f.size, 0);
+  const ctrl = new AbortController();
+  // `files` stays on the card: while the page is open, a Resume does not need the folder chosen again
+  upsertUpload({ id, kind: "folder", name: `${folder0}/`, size: total, sent: 0, filesDone: 0, filesTotal: files.length,
+    status: "uploading", error: "", detail: "", lost: false, retrying: false, note: "", jobId: "", serverFolder: "", folderKey, files, ctrl });
   setUploadProgress(`Preparing ${folder0}/…`);
+  let folder = folder0, failedRel = "";
   try {
     // Reserve a NON-colliding top-level folder name first, so a second upload of the same
-    // folder lands in "name (1)/" instead of merging into / overwriting the first.
-    let folder = folder0;
-    try {
-      const rr = await fetch("/api/upload/reserve-folder", {
-        method: "POST", headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ connection_id: state.connectionId, name: folder0 }),
-      });
+    // folder lands in "name_2/" instead of merging into / overwriting the first.
+    let savedFolder = "";
+    try { savedFolder = localStorage.getItem(folderKey) || ""; } catch { /* private mode */ }
+    if (!savedFolder) {
+      doneBits.fill(0);
+      const rr = await postJson("/api/upload/reserve-folder", { name: folder0 });
       const rd = await rr.json().catch(() => ({}));
-      if (rr.ok && rd.folder) folder = rd.folder;
-    } catch { /* fall back to the raw name */ }
-    let done = 0;
-    for (const f of files) {
-      const rel0 = f.webkitRelativePath || `${folder0}/${f.name}`;
-      const parts = rel0.split("/"); parts[0] = folder; const rel = parts.join("/");
-      const fd = new FormData();
-      fd.append("connection_id", state.connectionId);
-      fd.append("rel_path", rel);
-      fd.append("file", f);
-      const res = await fetch("/api/upload", { method: "POST", body: fd });
-      if (!res.ok) { const e = await res.json().catch(() => ({})); throw new Error(e.error || `upload failed (${res.status})`); }
-      done += 1;
-      setUploadProgress(`Uploading ${folder}/ — ${done}/${files.length}`);
+      if (!rr.ok || !rd.folder) throw new Error(rd.error || "folder reservation failed");
+      folder = rd.folder;
+      try { localStorage.setItem(folderKey, folder); } catch { /* upload still works this session */ }
+    } else folder = savedFolder;
+    let done = 0, doneBytes = 0, nextFile = 0, stopped = false, firstError = null, storageWarned = false, painted = 0;
+    let retryingFiles = 0;
+    files.forEach((f, i) => { if (isDone(i)) { done++; doneBytes += f.size; } });
+    const inFlight = new Map();         // file index -> bytes of it sent so far
+    const controllers = new Set();
+    ctrl.signal.addEventListener("abort", () => { stopped = true; for (const c of controllers) c.abort(); }, { once: true });
+    const paint = (force) => {
+      if (!force && Date.now() - painted < 250) return;
+      painted = Date.now();
+      let sent = doneBytes;
+      for (const n of inFlight.values()) sent += n;
+      upsertUpload({ id, name: `${folder}/`, sent, filesDone: done, status: "uploading" });
+      setUploadProgress(`Uploading ${folder}/ — ${done}/${files.length} files${uploadPaceTextFor(id)}`);
+    };
+    paint(true);
+    async function folderWorker() {
+      while (!stopped && nextFile < files.length) {
+        const index = nextFile++;
+        const f = files[index];
+        if (isDone(index)) continue;
+        const parts = (f.webkitRelativePath || `${folder0}/${f.name}`).split("/");
+        parts[0] = folder;
+        const rel = parts.join("/");
+        const fctrl = new AbortController();
+        controllers.add(fctrl);
+        try {
+          await uploadSlot();
+          let d;
+          try {
+            if (stopped || fctrl.signal.aborted) throw new DOMException("cancelled", "AbortError");
+            const hashPromise = hashUploadFile(f, fctrl);
+            hashPromise.catch(() => {});
+            d = await tusUpload(f, { folder, rel_path: rel }, fctrl, hashPromise, (sent) => { inFlight.set(index, sent); paint(false); },
+              null, (retrying) => {
+                retryingFiles += retrying ? 1 : -1;
+                upsertUpload({ id, retrying: retryingFiles > 0 });
+              });
+          } finally { releaseUploadSlot(); }
+          if (d.status === "failed" || d.status === "cancelled") throw new Error(d.error || `upload ${d.status}`);
+          doneBits[index >> 3] |= 1 << (index & 7);
+          try { localStorage.setItem(bitsKey, btoa(String.fromCharCode(...doneBits))); }
+          catch { storageWarned = true; }
+          inFlight.delete(index);
+          done++; doneBytes += f.size;
+          paint(true);
+        } catch (error) {
+          inFlight.delete(index);
+          if (!firstError && !stopped) { firstError = error; failedRel = rel; }   // the error itself: it says what kind of failure
+          stopped = true;
+          for (const other of controllers) if (other !== fctrl) other.abort();
+        } finally { controllers.delete(fctrl); }
+      }
     }
-    const reg = await fetch("/api/upload/register-folder", {
-      method: "POST", headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ connection_id: state.connectionId, folder }),
-    });
+    await Promise.all(Array.from({ length: Math.min(TUS_CONCURRENCY, files.length) }, () => folderWorker()));
+    if (ctrl.signal.aborted) throw new DOMException("cancelled", "AbortError");
+    if (firstError) throw firstError;
+    const reg = await postJson("/api/upload/register-folder", { folder, count: files.length });
     const d = await reg.json().catch(() => ({}));
     if (!reg.ok) throw new Error(d.error || "folder registration failed");
-    addDataset({ name: d.name + "/", path: d.path, kind: "folder" });
-    toast(`Uploaded folder ${d.name}/ (${d.count} files, ${(d.size / 1e6).toFixed(1)} MB)`);
+    const forget = () => {
+      try { localStorage.removeItem(folderKey); localStorage.removeItem(bitsKey); } catch { /* no effect on uploaded data */ }
+      if (storageWarned) toast("Upload completed; browser storage could not save resume progress.");
+    };
+    if (d.status === "staging") {
+      upsertUpload({ id, filesDone: 0, sent: 0 });                  // now counting copies to HPC3, from none
+      await followFolder(id, folder, d, ctrl, true, forget);
+    }
+    else {                                                           // no copy to HPC3 in this session
+      upsertUpload({ id, status: "done", sent: total, filesDone: files.length });
+      addDataset({ name: `${d.name}/`, path: d.path, kind: "folder" });
+      forget();
+      toast(`Uploaded folder ${d.name}/ (${d.count} files, ${fmtUploadSize(d.size)})`);
+      loadDatasets();
+      setTimeout(() => removeUpload(id), 4000);
+    }
   } catch (err) {
-    toast(isUnreachable(err) ? "Can't reach the local server." : "Folder upload failed: " + err.message);
+    if (ctrl.signal.aborted || err.name === "AbortError") {
+      upsertUpload({ id, status: "cancelled", note: "" });
+      toast(`Cancelled ${folder}/ — choose the folder again to continue where it stopped.`);
+      setTimeout(() => removeUpload(id), 4000);
+    } else {
+      const f = uploadFailure(err, "", "Resume uploads only the files that are still missing.");
+      const text = failedRel && !f.lost ? `${failedRel}: ${f.text}` : f.text;   // a refusal names its file
+      upsertUpload({ id, status: "error", note: "", error: text, detail: f.detail, lost: f.lost });
+      reportUploadError(id, `${folder}/`, err);
+      toast(`${folder}/: ${text}`);
+    }
   } finally { setUploadProgress(null); }
+}
+
+// -- after a page reload -----------------------------------------------------------------------------
+// Copies to HPC3 run on the server whether or not a page is open; uploads the browser had not finished
+// wait in its storage. Bring both back as cards, once per connection.
+let uploadsRestoredFor = "";
+async function restoreUploads() {
+  const cid = state.connectionId;
+  if (!cid || uploadsRestoredFor === cid) return;
+  uploadsRestoredFor = cid;
+  await Promise.all([restoreStagingCards().catch(() => {}), restorePendingCards().catch(() => {})]);
+}
+async function restoreStagingCards() {
+  const r = await fetch(`/api/upload/staging?connection_id=${encodeURIComponent(state.connectionId)}&summary=1`);
+  if (!r.ok) return;
+  const d = await r.json().catch(() => ({}));
+  const tracked = new Set(state.uploads.flatMap((u) => [u.jobId, u.serverFolder && `folder:${u.serverFolder}`]).filter(Boolean));
+  for (const job of d.jobs || []) {
+    if (tracked.has(job.id) || job.state === "done" || job.state === "cancelled") continue;
+    const id = `j${job.id}`;
+    const base = { id, kind: "file", name: job.name, size: job.size, sent: job.sent || 0, jobId: job.id, attach: false, note: "" };
+    if (job.state === "failed") { upsertUpload({ ...base, status: "error", error: job.error || "the copy to HPC3 failed" }); continue; }
+    const ctrl = new AbortController();
+    upsertUpload({ ...base, status: "staging", error: "", ctrl });
+    settleUpload(id, { status: "staging", job_id: job.id, name: job.name, size: job.size }, job.name, job.size, ctrl, false)
+      .catch((err) => failUpload(id, err, job.name, ctrl)).finally(() => setUploadProgress(null));
+  }
+  for (const f of d.folders || []) {
+    // not registered = the browser had not sent every file: the "interrupted" card below covers it
+    if (f.recorded || !f.registered || tracked.has(`folder:${f.name}`)) continue;
+    const id = `jf${Math.abs(hashStr(f.name)).toString(36)}`;
+    const base = { id, kind: "folder", name: `${f.name}/`, size: f.size || 0, sent: f.sent || 0, filesDone: f.done || 0,
+      filesTotal: f.count || 0, serverFolder: f.name, attach: false, note: "" };
+    if (!f.pending && f.failed) { upsertUpload({ ...base, status: "error", error: `${f.failed} of ${f.count} files did not reach HPC3` }); continue; }
+    const ctrl = new AbortController();
+    upsertUpload({ ...base, status: "staging", error: "", ctrl });
+    followFolder(id, f.name, {}, ctrl, false).catch((err) => failUpload(id, err, `${f.name}/`, ctrl)).finally(() => setUploadProgress(null));
+  }
+}
+async function restorePendingCards() {
+  const owner = apiKeyOwner();
+  if (window.tus && window.tus.defaultOptions && window.tus.defaultOptions.urlStorage) {
+    const storage = window.tus.defaultOptions.urlStorage;
+    for (const up of await storage.findAllUploads()) {
+      // key: tus::<fingerprint>::<n>, fingerprint: tus:<owner>:<name or path>:<size>:<modified>
+      const fingerprint = String(up.urlStorageKey || "").split("::")[1] || "";
+      const meta = up.metadata || {};
+      if (!fingerprint.startsWith(`tus:${owner}:`) || meta.rel_path || !up.uploadUrl) continue;   // a folder's file: its folder card speaks for it
+      let offset = -1, length = up.size || 0;
+      try {
+        const h = await fetch(up.uploadUrl, { method: "HEAD", headers: tusHeaders() });
+        if (h.status === 200) { offset = Number(h.headers.get("Upload-Offset")); length = Number(h.headers.get("Upload-Length")) || length; }
+        else if (h.status >= 400 && h.status < 500) { await storage.removeUpload(up.urlStorageKey); continue; }   // gone on the server
+        else continue;
+      } catch { continue; }                                                                       // unreachable now: ask again next time
+      if (!(offset >= 0) || offset >= length) { if (offset >= length) await storage.removeUpload(up.urlStorageKey); continue; }
+      const name = meta.filename || "upload";
+      if (state.uploads.some((u) => u.name === name && u.size === length && u.status !== "pending")) continue;   // already running again
+      upsertUpload({ id: `p${Math.abs(hashStr(fingerprint)).toString(36)}`, kind: "file", name, size: length, sent: offset,
+        status: "pending", error: "", note: `Interrupted at ${Math.floor((100 * offset) / length)}% — choose the file again to continue`,
+        tusUrl: up.uploadUrl, tusKey: up.urlStorageKey });
+    }
+  }
+  let keys = [];
+  try { keys = Object.keys(localStorage).filter((k) => k.startsWith(`upload-folder:${owner}:`) && !k.endsWith(":completed")); } catch { /* private mode */ }
+  for (const key of keys) {
+    const id = "F" + Math.abs(hashStr(key)).toString(36);
+    if (state.uploads.some((u) => u.id === id)) continue;
+    const parts = key.split(":");                       // upload-folder : owner : name… : count : signature
+    const count = Number(parts[parts.length - 2]) || 0;
+    let done = 0;
+    try { for (const c of atob(localStorage.getItem(`${key}:completed`) || "")) { let b = c.charCodeAt(0); while (b) { done += b & 1; b >>= 1; } } } catch { /* no bitmap yet */ }
+    upsertUpload({ id, kind: "folder", name: `${localStorage.getItem(key) || parts.slice(2, -2).join(":")}/`, size: 0, sent: 0,
+      filesDone: done, filesTotal: count, status: "pending", error: "", folderKey: key,
+      note: `Interrupted — ${done} of ${count} files uploaded; choose the folder again to continue` });
+  }
 }
 
 // ---- dataset selection: one active chip + a "Data" popover -------------------
@@ -3431,7 +4121,7 @@ function setUploadProgress(text) {
   el.classList.remove("hidden");
   el.textContent = text;
   // Show the composer's Cancel button while any upload is actually in flight.
-  if (cb) cb.classList.toggle("hidden", !state.uploads.some((u) => u.status === "uploading" || u.status === "finalizing"));
+  if (cb) cb.classList.toggle("hidden", !state.uploads.some((u) => UPLOAD_ACTIVE.includes(u.status)));
 }
 
 function toggleDataMenu(force) {
@@ -3457,74 +4147,6 @@ async function loadDatasetChips() {
   // a new question). Prior uploads still appear as clickable chips; the user picks one explicitly.
   renderDatasetChips();
   renderDataMenuRecent();
-}
-
-async function uploadSingle(file, signal) {
-  const fd = new FormData();
-  fd.append("connection_id", state.connectionId);
-  fd.append("file", file);
-  const res = await fetch("/api/upload", { method: "POST", body: fd, signal });
-  const d = await res.json().catch(() => ({}));
-  if (!res.ok) { toast(d.error || "Upload failed"); return null; }
-  return d;
-}
-
-// Resumable chunked upload: ask the server how much it already has, then send the
-// rest in chunks (each retried with backoff). The upload id is stable per
-// (name + size + mtime) so retrying the SAME file resumes; a different file is fresh.
-async function uploadResumable(file, onProgress, signal, uploadId) {
-  uploadId = uploadId || ("u" + Math.abs(hashStr(`${file.name}:${file.size}:${file.lastModified}`)).toString(36));
-  const abort = () => { if (signal && signal.aborted) throw new DOMException("cancelled", "AbortError"); };
-  let received = 0;
-  try {
-    const st = await api("GET", `/api/upload/status?connection_id=${encodeURIComponent(state.connectionId)}&upload_id=${encodeURIComponent(uploadId)}`);
-    received = Math.min(st.received || 0, file.size);
-  } catch { received = 0; }
-  let offset = received;
-  while (offset < file.size) {
-    abort();
-    const end = Math.min(offset + UPLOAD_CHUNK, file.size);
-    const isLast = end >= file.size;
-    // The `done` chunk also stages the whole file to HPC3 server-side (can take a while for a big
-    // matrix) — surface that as a "finalizing" phase so a slow last request never looks stuck.
-    if (isLast) onProgress && onProgress(100, "finalizing");
-    const d = await postChunkWithRetry(uploadChunkForm(file, uploadId, offset, end, isLast), 6, signal);
-    if (d.status === "uploaded") { onProgress && onProgress(100); return d; }
-    offset = typeof d.received === "number" ? d.received : end;   // server is the source of truth
-    onProgress && onProgress(Math.floor((offset / file.size) * 100));
-  }
-  // All bytes are on the server but it was never finalized (resumed exactly at EOF, e.g. after a
-  // finalize that timed out): send a final done-chunk to finalize/re-stage.
-  abort();
-  onProgress && onProgress(100, "finalizing");
-  return await postChunkWithRetry(uploadChunkForm(file, uploadId, file.size, file.size, true), 6, signal);
-}
-
-function uploadChunkForm(file, uploadId, start, end, done) {
-  const fd = new FormData();
-  fd.append("connection_id", state.connectionId);
-  fd.append("upload_id", uploadId);
-  fd.append("name", file.name);
-  fd.append("offset", String(start));
-  fd.append("done", done ? "true" : "false");
-  fd.append("chunk", file.slice(start, end), "chunk");
-  return fd;
-}
-
-async function postChunkWithRetry(fd, tries = 6, signal) {
-  let lastErr;
-  for (let i = 0; i < tries; i++) {
-    if (signal && signal.aborted) throw new DOMException("cancelled", "AbortError");
-    try {
-      const res = await fetch("/api/upload/chunk", { method: "POST", body: fd, signal });
-      const d = await res.json().catch(() => ({}));
-      if (res.ok) return d;
-      if (res.status === 409 && typeof d.received === "number") return d;   // resync to true offset
-      lastErr = new Error(d.error || `chunk failed (${res.status})`);
-    } catch (e) { if (e.name === "AbortError") throw e; lastErr = e; }       // cancel → stop, don't retry
-    await new Promise((r) => setTimeout(r, Math.min(5000, 500 * 2 ** i)));  // exp backoff (capped 5s)
-  }
-  throw lastErr || new Error("chunk upload failed");
 }
 
 function hashStr(s) {
@@ -3575,6 +4197,17 @@ function applyUiPrefs() {
   try { prefs = JSON.parse(localStorage.getItem(UI_KEY) || "{}"); } catch {}
   setPanel("left", prefs.left !== false);
   setPanel("right", prefs.right === true);   // downloads/log panel collapsed by default
+  // "Save results to my data" is a standing choice, not a per-run one: it stays as it was left.
+  const save = $("saveResults");
+  if (save) {
+    save.checked = prefs.saveResults === true;
+    save.addEventListener("change", () => {
+      let now = {};
+      try { now = JSON.parse(localStorage.getItem(UI_KEY) || "{}"); } catch {}
+      now.saveResults = save.checked;
+      try { localStorage.setItem(UI_KEY, JSON.stringify(now)); } catch {}
+    });
+  }
 }
 
 function setPanel(side, open) {
@@ -3690,6 +4323,9 @@ function showApp(user) {
   $("userChip").textContent = user ? (user.username + (user.role === "admin" ? " · admin" : "")) : "accounts off";
   document.querySelectorAll(".admin-only").forEach((el) => el.classList.toggle("hidden", !user || user.role !== "admin"));
   const lo = $("leftLogoutBtn"); if (lo) lo.classList.toggle("hidden", !user);   // sign-out lives in the left panel now
+  // Mock mode runs the agent's code on the gateway server, so with accounts on only an admin gets it.
+  const mock = $("mockCheck");
+  if (mock && mock.closest("label")) mock.closest("label").classList.toggle("hidden", !!user && user.role !== "admin");
   if (!_appInited) { init(); initShell(); _appInited = true; }
   renderAccount(user);
   switchView("research");
@@ -3736,8 +4372,9 @@ function initShell() {
   $("skillReviewList").addEventListener("click", onSkillReviewClick);
   $("datasetsList").addEventListener("click", onDatasetsClick);
   $("uploadsPanel").addEventListener("click", (e) => {
-    const r = e.target.closest("[data-resume]"); if (r) { resumeUpload(r.dataset.resume); return; }
-    const c = e.target.closest("[data-cancel]"); if (c) { cancelUpload(c.dataset.cancel); }
+    const b = e.target.closest("button[data-act]");
+    const card = b && b.closest("[data-upload-id]");
+    if (card) uploadAction(b.dataset.act, card.dataset.uploadId);
   });
   const uc = $("uploadCancel");
   if (uc) uc.addEventListener("click", cancelActiveUploads);   // composer-side Cancel
@@ -3907,43 +4544,74 @@ async function loadRuns() {
   const owner = state.user ? state.user.username : "";
   try {
     const items = (await (await fetch("/api/runs")).json()).runs || [];
-    // The processed dataset each run handed on (an .h5ad kept beside the run, not in the zip).
-    let results = {};
-    try {
-      const rd = (await (await fetch("/api/result-datasets")).json()).result_datasets || [];
-      results = Object.fromEntries(rd.map((r) => [r.run_id, r]));
-    } catch {}
+    const results = await loadResultHandoffs(true);
     el.innerHTML = items.length ? items.map((x) => {
       const done = x.status === "done" || x.status === "incomplete";
       const zip = done
         ? `<a class="ghost small" href="/api/bundle/${encodeURIComponent(owner)}/${encodeURIComponent(x.run_id)}" download>${icon("download")} Results (.zip)</a>`
         : `<span class="muted small">${escapeHtml(x.status)}</span>`;
-      const r = results[x.run_id];
-      const dataset = r ? `<div class="run-dataset">` +
-        `<span class="muted small">📦 ${escapeHtml(r.name || "")} · ${r.n_cells} cells × ${r.n_genes} genes · ${(Number(r.size_bytes || 0) / 1e6).toFixed(0)} MB</span>` +
-        (r.saved_to
-          ? `<span class="ok small" title="${escapeHtml(r.saved_to)}">Saved to my data</span>`
-          : `<span class="muted small">kept ${escapeHtml(String(r.kept_days ?? ""))} days ${r.location === "hpc3" ? "on HPC3" : "on the server"}</span>` +
-            `<button class="ghost small" data-save-result="${escapeHtml(x.run_id)}">Save to my data</button>`) +
-        `</div>` : "";
       return `<div class="card run-card"><div class="card-main"><strong>${escapeHtml((x.question || "").slice(0, 90))}</strong>` +
-        `<span class="muted">${escapeHtml(x.status)}${x.plan_mode ? " · planned" : ""} · ${fmtDate(x.created_at)}</span>${dataset}</div>${zip}</div>`;
+        `<span class="muted">${escapeHtml(x.status)}${x.plan_mode ? " · planned" : ""} · ${fmtDate(x.created_at)}</span>${resultHandoffHtml(x.run_id, results[x.run_id])}</div>${zip}</div>`;
     }).join("") : '<div class="empty-hint">No runs yet.</div>';
   } catch { el.innerHTML = '<div class="empty-hint">Failed to load.</div>'; }
 }
 
-async function onRunsClick(e) {
+// What a run hands on besides its bundle, neither of them in the zip: the processed dataset (an
+// .h5ad) and, after CellQC, CellQC's whole result folder with the per-library matrices. Both are
+// kept beside the run for a few days; "Save to my data" makes one a dataset, and the folder also
+// downloads as one zip. Shown on the run's card and under the results in its chat.
+let resultHandoffs = null;              // a promise of { run id: row }; null = ask the server again
+function loadResultHandoffs(fresh) {
+  if (fresh || !resultHandoffs) {
+    resultHandoffs = fetch("/api/result-datasets").then((r) => r.json())
+      .then((d) => Object.fromEntries((d.result_datasets || []).map((r) => [r.run_id, r]))).catch(() => ({}));
+  }
+  return resultHandoffs;
+}
+function resultHandoffHtml(runId, r) {
+  if (!r) return "";
+  const mb = (n) => `${(Number(n || 0) / 1e6).toFixed(0)} MB`;
+  const kept = (x, label, what) => (x.saved_to
+    ? `<span class="ok small" title="${escapeHtml(x.saved_to)}">Saved to my data</span>`
+    : `<span class="muted small">kept ${escapeHtml(String(x.kept_days ?? ""))} days ${x.location === "hpc3" ? "on HPC3" : "on the server"}</span>` +
+      `<button class="ghost small" data-save-result="${escapeHtml(runId)}" data-what="${what}" data-label="${escapeHtml(label)}">${escapeHtml(label)}</button>`);
+  let html = "";
+  if (r.name) {
+    html += `<div class="run-dataset"><span class="muted small">📦 ${escapeHtml(r.name)} · ${r.n_cells} cells × ${r.n_genes} genes · ${mb(r.size_bytes)}</span>` +
+      kept(r, "Save to my data", "dataset") + `</div>`;
+  }
+  const q = r.cellqc;
+  if (q) {
+    const matrices = q.n_matrices ? `, ${q.n_matrices} per-library .h5ad` : "";
+    html += `<div class="run-dataset"><span class="muted small" title="${escapeHtml(q.name || "")}">🧪 CellQC result/ · ${q.n_files} files${matrices} · ${mb(q.size_bytes)}</span>` +
+      `<a class="ghost small" href="${escapeHtml(q.download_url)}" download title="CellQC's complete result folder as one zip: reports, tables, slides and the per-library .h5ad, obs and var">${icon("download")} CellQC results (.zip)</a>` +
+      kept(q, "Save folder to my data", "cellqc") + `</div>`;
+  }
+  return html;
+}
+async function showResultHandoff(host, runId) {
+  if (!host) return;
+  const r = (await loadResultHandoffs())[runId];
+  host.innerHTML = resultHandoffHtml(runId, r);
+}
+
+async function onSaveResultClick(e) {
   const b = e.target.closest("[data-save-result]");
   if (!b) return;
+  const runId = b.dataset.saveResult, label = b.dataset.label || "Save to my data";
   b.disabled = true; b.textContent = "Saving…";
   try {
-    const r = await fetch(`/api/result-datasets/${encodeURIComponent(b.dataset.saveResult)}/save`, { method: "POST" });
+    const r = await fetch(`/api/result-datasets/${encodeURIComponent(runId)}/save?what=${encodeURIComponent(b.dataset.what || "dataset")}`, { method: "POST" });
     const j = await r.json();
-    if (!r.ok) { toast(j.error || "Could not save the dataset."); b.disabled = false; b.textContent = "Save to my data"; return; }
+    if (!r.ok) { toast(j.error || "Could not save it."); b.disabled = false; b.textContent = label; return; }
     toast(`Saved to ${j.path} — it is in your Datasets now.`);
-    loadRuns();
-  } catch (err) { toast("Could not save the dataset: " + err.message); b.disabled = false; b.textContent = "Save to my data"; }
+    await loadResultHandoffs(true);
+    const inChat = b.closest(".result-handoff");
+    if (inChat) showResultHandoff(inChat, runId); else loadRuns();
+    loadDatasets();
+  } catch (err) { toast("Could not save it: " + err.message); b.disabled = false; b.textContent = label; }
 }
+const onRunsClick = onSaveResultClick;
 
 // ---- Admin view ----
 async function loadAdminUsers() {
@@ -4301,6 +4969,12 @@ async function restoreConnection() {
   if (!id) return;
   try {
     const res = await fetch(`/api/connections/${id}`);
+    if (res.status === 401 || res.status === 403) {
+      // Stored by another account on this browser (or before a logout): not ours to reattach to
+      // or to advertise — drop it, run owner included.
+      forgetConnection();
+      return;
+    }
     if (!res.ok) {
       // Connection is gone — almost always a gateway restart (e.g. a redeploy). The GPU
       // job on HPC3 usually OUTLIVES it, so reconnecting reattaches instead of re-queuing.
@@ -4332,6 +5006,8 @@ function showReattachHint() {
   let rec = null;
   try { rec = JSON.parse(localStorage.getItem(LASTCONN_KEY) || "null"); } catch {}
   if (!rec) return;
+  // Another account's session on this browser: its UCInetID and job are not this user's business.
+  if (state.user && rec.account !== state.user.username) return;
   // Prefill first and unconditionally — useful for re-login even when the GPU job is long gone.
   if (rec.username && $("userInput") && !$("userInput").value) $("userInput").value = rec.username;
   if (rec.host && $("hostInput")) $("hostInput").value = rec.host;

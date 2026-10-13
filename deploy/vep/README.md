@@ -6,8 +6,8 @@ offline-tested (`src/aiscientist/tools/annotate_variants/offline.py` + `variant_
 `SlurmAnalysisExecutor` with an injected runner — no cluster, no VEP, no network in CI:
 `tests/test_vcf_offline.py`). This folder is the **image + cache build kit**.
 
-> ⚠️ macOS cannot build `.sif`. Build on **HPC3** (a **login node** — the cache download needs
-> internet; compute nodes don't) or any Linux host with `singularity`.
+> ⚠️ macOS cannot build `.sif`. Build on an **HPC3 compute node** (`standard` nodes have egress for the
+> cache download; RCIC bans builds and downloads on login nodes) or any Linux host with `apptainer`.
 
 ## Why this exists
 
@@ -24,13 +24,13 @@ A full WGS VCF forks through in ~30–60 min under `#SBATCH --mem` (a real cgrou
 ## Build & stage
 
 ```bash
-# on an HPC3 LOGIN node, from a checkout of this repo:
-module load singularity            # HPC3 has apptainer/1.4.5, singularity/3.11.3
+# on HPC3, from a checkout of this repo (builds + downloads go to a COMPUTE node: RCIC bans them on
+# the login nodes, and `standard` compute nodes have egress):
 cd deploy/vep
 
-# 1. build the image (deps-only: vep + bcftools + python3) — pick a route the script prints
-singularity build --fakeroot vep.sif vep.def       # if RCIC enables --fakeroot
-#   ...or `singularity build --remote vep.sif vep.def`
+# 1. build the image (deps-only: vep + bcftools + python3) — Apptainer --fakeroot, no /etc/subuid entry needed
+sbatch -p standard -A ruic20_lab -c 8 --mem=16G -t 04:00:00 -J build-vep --wait \
+  --wrap 'module load apptainer/1.4.5 && APPTAINER_CACHEDIR=$TMPDIR/ac apptainer build --fakeroot vep.sif vep.def'
 
 # 2. stage the .sif + download BOTH caches (GRCh38 + GRCh37) and the ClinVar VCFs to dfs3b
 BUILT=1 ./build_and_stage.sh

@@ -175,6 +175,25 @@ def get_credential(owner: str, cred_id: str) -> dict | None:
     return None
 
 
+def own_key_path(owner: str, key_path: str) -> str | None:
+    """``key_path`` resolved, if it is one of ``owner``'s own saved keys — under the current store or
+    where one of their rows recorded it — else None. A typed key path goes straight to paramiko, so on
+    a shared gateway it must never name another account's key."""
+    try:
+        want = Path(key_path).expanduser().resolve()
+    except (OSError, RuntimeError, ValueError):
+        return None
+    if not want.is_file():
+        return None
+    if want.is_relative_to(_owner_dir(owner).resolve()):
+        return str(want)
+    for r in _load_index(owner):
+        recorded = [_key_file(owner, r)] + ([Path(r["key_path"])] if r.get("key_path") else [])
+        if any(want == p.resolve() for p in recorded):
+            return str(want)
+    return None
+
+
 def delete_credential(owner: str, cred_id: str) -> bool:
     rows = _load_index(owner)
     keep = [r for r in rows if r["id"] != cred_id]

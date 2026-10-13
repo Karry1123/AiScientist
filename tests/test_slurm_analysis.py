@@ -14,6 +14,9 @@ from aiscientist.gateway.executor import ExecResult
 from aiscientist.gateway.slurm_analysis import SlurmAnalysisExecutor
 from aiscientist.gateway.slurm_job import slurm_time_to_seconds
 
+# The directory the gateway gives this job line: <shared_root>/Temp/<user>/scratch/analysis.
+SCRATCH = "/dfs/lab/Temp/tester/scratch/analysis"
+
 
 class FakeHPC:
     """Submits complete immediately (squeue empty -> sacct COMPLETED); ``cat`` of the result file
@@ -79,6 +82,7 @@ class FakeHPC:
 
 
 def _ex(hpc, **kw):
+    kw.setdefault("scratch_dir", SCRATCH)
     return SlurmAnalysisExecutor(
         remote=hpc, container_image="/dfs/lab/analysis.sif",
         remote_workspace="/dfs/lab/run", remote_dataset="/dfs/lab/ds.h5ad",
@@ -106,7 +110,8 @@ def _capture_run_timeout(hpc, monkeypatch, **kw):
 
     monkeypatch.setattr(sa, "run_batch_job", fake_run_batch_job)
     SlurmAnalysisExecutor(remote=hpc, container_image="/img.sif", remote_workspace="/ws",
-                          remote_dataset="/ds", **kw).run_tool("annotate_variants", {}, ctx=None)
+                          remote_dataset="/ds", scratch_dir=SCRATCH,
+                          **kw).run_tool("annotate_variants", {}, ctx=None)
     return seen["run_timeout_s"]
 
 
@@ -158,7 +163,7 @@ def test_no_remote_falls_back_in_process():
         calls["tool"] = tool
         return {"status": "ok", "src": "local"}
 
-    ex = SlurmAnalysisExecutor(remote=None, container_image="/img.sif", local_fallback=fake_local)
+    ex = SlurmAnalysisExecutor(remote=None, container_image="/img.sif", scratch_dir=SCRATCH, local_fallback=fake_local)
     out = ex.run_tool("run_de", {}, ctx=None)
     assert out["src"] == "local" and out["execution_mode"] == "local_fallback"
     assert "no live HPC" in out["fallback_reason"] and calls["tool"] == "run_de"
@@ -168,7 +173,7 @@ def test_on_fallback_hook_fires_with_reason():
     # The gateway uses this hook to LOG why the offline VEP line degraded to REST (not just that it did).
     seen = {}
     ex = SlurmAnalysisExecutor(
-        remote=None, container_image="/img.sif",
+        remote=None, container_image="/img.sif", scratch_dir=SCRATCH,
         local_fallback=lambda tool, args, ctx: {"status": "ok"},
         on_fallback=lambda reason: seen.__setitem__("reason", reason))
     ex.run_tool("annotate_variants", {}, ctx=None)
@@ -181,18 +186,19 @@ def test_on_fallback_hook_error_never_breaks_fallback():
         raise RuntimeError("logging blew up")
 
     ex = SlurmAnalysisExecutor(
-        remote=None, container_image="/img.sif",
+        remote=None, container_image="/img.sif", scratch_dir=SCRATCH,
         local_fallback=lambda tool, args, ctx: {"status": "ok", "src": "local"}, on_fallback=boom)
     out = ex.run_tool("annotate_variants", {}, ctx=None)
     assert out["status"] == "ok" and out["src"] == "local"
 
 
 def test_scratch_home_is_resolved_no_literal_dollar_leaks():
-    # Regression: scratch_dir defaults to "$HOME/.bioagent/analysis". The --args path is shlex-quoted
-    # (single quotes), so a literal $HOME would reach the Python CLI unexpanded and fail to open the
-    # args file. The executor must expand $HOME on the remote first so no '$' leaks into any command.
+    # Regression: a scratch_dir with a shell variable in it (the default was once
+    # "$HOME/.bioagent/analysis"). The --args path is shlex-quoted (single quotes), so a literal
+    # $HOME would reach the Python CLI unexpanded and fail to open the args file. The executor must
+    # expand $HOME on the remote first so no '$' leaks into any command.
     hpc = FakeHPC({"status": "ok"})
-    out = _ex(hpc).run_tool("run_de", {"groupby": "leiden"}, ctx=None)
+    out = _ex(hpc, scratch_dir="$HOME/.bioagent/analysis").run_tool("run_de", {"groupby": "leiden"}, ctx=None)
     assert out["status"] == "ok"
     joined = "\n".join(hpc.all_cmds)
     assert "/data/homezvol/tester/.bioagent/analysis" in joined   # expanded to a concrete path
@@ -205,10 +211,26 @@ def test_scratch_home_is_resolved_no_literal_dollar_leaks():
 
 def test_scratch_resolved_once_and_cached():
     hpc = FakeHPC({"status": "ok"})
-    ex = _ex(hpc)
+    ex = _ex(hpc, scratch_dir="$HOME/.bioagent/analysis")
     ex.run_tool("run_de", {}, ctx=None)
     ex.run_tool("run_clustering", {}, ctx=None)
     assert sum(1 for c in hpc.all_cmds if c.startswith("echo ")) == 1   # resolved once, then cached
+
+
+def test_every_job_file_goes_to_the_scratch_dir_the_gateway_gave():
+    # RCHENLAB/AiScientist#2: the scanpy line wrote its sbatch script, args/result JSON, Slurm log
+    # and tool log under the user's home directory. The directory is the caller's to name, it is
+    # used as given (no lookup on the login node), and nothing is written outside it.
+    hpc = FakeHPC({"status": "ok"})
+    assert _ex(hpc).run_tool("run_qc", {}, ctx=None)["status"] == "ok"
+    joined = "\n".join(hpc.all_cmds)
+    name = "bioagent_analysis_run_qc_1"
+    assert f"#SBATCH --output={SCRATCH}/{name}-%j.log" in joined          # the scheduler's log
+    assert f"> {SCRATCH}/{name}.result.json 2> {SCRATCH}/{name}.log" in joined
+    assert f"cat > {SCRATCH}/{name}.args.json" in joined and f"cat > {SCRATCH}/{name}.sbatch" in joined
+    assert f"sbatch {SCRATCH}/{name}.sbatch" in joined
+    assert "$HOME" not in joined and ".bioagent" not in joined
+    assert not any(c.startswith("echo ") for c in hpc.all_cmds)
 
 
 def test_no_result_marker_is_an_error():
@@ -219,7 +241,7 @@ def test_no_result_marker_is_an_error():
 
 
 def test_container_start_failure_surfaces_sbatch_job_log():
-    # A singularity bind-mount FATAL happens BEFORE the tool runs, so the result file has no marker
+    # An apptainer bind-mount FATAL happens BEFORE the tool runs, so the result file has no marker
     # and the inner {name}.log is empty — the real error lands ONLY in the SBATCH --output job log.
     # _collect must read that job log, else the model gets a useless "produced no result".
     hpc = FakeHPC({}, sacct="FAILED")
@@ -258,7 +280,7 @@ def test_run_tool_cancel_returns_cancelled_without_fallback(monkeypatch):
     from aiscientist.gateway.slurm_job import JobCancelled
     called = {"fallback": False}
     ex = SlurmAnalysisExecutor(
-        remote=object(), container_image="/img.sif", remote_workspace="/dfs/ws",
+        remote=object(), container_image="/img.sif", scratch_dir=SCRATCH, remote_workspace="/dfs/ws",
         local_fallback=lambda tool, args, ctx: called.__setitem__("fallback", True) or {"status": "ok"},
     )
     monkeypatch.setattr(ex, "_run_on_slurm",

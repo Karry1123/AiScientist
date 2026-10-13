@@ -76,7 +76,7 @@ def image_sif_name(ref: str) -> str:
     return re.sub(r"[^\w.\-]", "_", stem) + ".sif"
 
 
-def provision_command(ref: str, sif: str, container_bin: str = "singularity",
+def provision_command(ref: str, sif: str, container_bin: str = "apptainer",
                       pkgs_cache: str = "") -> str:
     """Shell that makes ``sif`` exist: a pull for a ``docker://`` image, a build for ``bioconda:``
     (reusing the lab's shared conda download cache ``pkgs_cache`` when one is given)."""
@@ -99,7 +99,7 @@ def provision_resources(ref: str) -> "tuple[int, int, str]":
     return PULL_CPUS, PULL_MEM_GB, PULL_TIME_LIMIT
 
 
-def build_command(specs: "list[str]", sif: str, container_bin: str = "singularity",
+def build_command(specs: "list[str]", sif: str, container_bin: str = "apptainer",
                   pkgs_cache: str = "") -> str:
     """Shell that builds ``sif`` from conda ``specs`` without root, inside a Slurm job.
 
@@ -129,8 +129,9 @@ def build_command(specs: "list[str]", sif: str, container_bin: str = "singularit
         'W="${TMPDIR:-/tmp}/aisci-build-$SLURM_JOB_ID"',
         'mkdir -p "$W/tmp" "$W/pkgs" "$W/cache"',
         'trap \'rm -rf "$W"\' EXIT',
-        'export SINGULARITY_CACHEDIR="$W/cache" APPTAINER_CACHEDIR="$W/cache"',
-        'export SINGULARITY_TMPDIR="$W/tmp" APPTAINER_TMPDIR="$W/tmp"',
+        'export APPTAINER_CACHEDIR="$W/cache" APPTAINER_TMPDIR="$W/tmp"',
+        # The SINGULARITY_* names keep a rollback to the singularity module off $HOME as well.
+        'export SINGULARITY_CACHEDIR="$W/cache" SINGULARITY_TMPDIR="$W/tmp"',
     ]
     if pkgs_cache:
         q_cache = shlex.quote(pkgs_cache.rstrip("/"))
@@ -139,7 +140,7 @@ def build_command(specs: "list[str]", sif: str, container_bin: str = "singularit
     lines += [
         f"if [ ! -s {q_sif} ]; then",
         f'  {container_bin} build --sandbox "$W/box" {shlex.quote(BUILD_BASE)}',
-        # HPC3's singularity.conf binds site paths (/data, ...) into every container, and a writable
+        # HPC3's apptainer.conf binds site paths (/data, ...) into every container, and a writable
         # sandbox cannot create their mount points ("destination /data doesn't exist in container").
         # The install needs none of them; the mount points are created for later runs of the image.
         '  mkdir -p "$W/box/aisci-pkgs" "$W/box/aisci-shared-pkgs" "$W/box/data" "$W/box/dfs3b" '
@@ -160,7 +161,8 @@ def build_command(specs: "list[str]", sif: str, container_bin: str = "singularit
         f'  cp "$W/box/opt/conda/aiscientist-lock.txt" {q_lock} 2>/dev/null || true',
         # `exec` skips the image's entrypoint, which is what puts the env on PATH in Docker. The
         # jobs also run `bash -lc`, and Debian's /etc/profile resets PATH for a login shell, so the
-        # same line goes into /etc/profile.d as well (sourced after that reset).
+        # same line goes into /etc/profile.d as well (sourced after that reset). Apptainer still reads
+        # /.singularity.d/env (verified on HPC3: a CellQC image built this way runs under both).
         '  mkdir -p "$W/box/.singularity.d/env" "$W/box/etc/profile.d"',
         "  printf 'export PATH=/opt/conda/bin:$PATH\\n' > \"$W/box/.singularity.d/env/90-aiscientist-conda.sh\"",
         "  printf 'export PATH=/opt/conda/bin:$PATH\\n' > \"$W/box/etc/profile.d/90-aiscientist-conda.sh\"",
@@ -174,23 +176,24 @@ def build_command(specs: "list[str]", sif: str, container_bin: str = "singularit
     return "\n".join(lines)
 
 
-def pull_command(ref: str, sif: str, container_bin: str = "singularity") -> str:
+def pull_command(ref: str, sif: str, container_bin: str = "apptainer") -> str:
     """Shell that pulls ``ref`` to ``sif`` atomically, inside a Slurm job. The layer cache goes to
     the node's local scratch and is removed afterwards, so nothing but the finished image lands on
     the shared filesystem."""
     # The partial name carries $SLURM_JOB_ID, so it is double-quoted for the shell to expand.
     q_sif, q_partial = shlex.quote(sif), f'"{sif}.partial.$SLURM_JOB_ID"'
     return "\n".join([
-        'export SINGULARITY_CACHEDIR="${TMPDIR:-/tmp}/sing-cache-$SLURM_JOB_ID"',
-        'export APPTAINER_CACHEDIR="$SINGULARITY_CACHEDIR"',
-        'export SINGULARITY_TMPDIR="${TMPDIR:-/tmp}"',
-        'mkdir -p "$SINGULARITY_CACHEDIR"',
+        'export APPTAINER_CACHEDIR="${TMPDIR:-/tmp}/sing-cache-$SLURM_JOB_ID"',
+        'export APPTAINER_TMPDIR="${TMPDIR:-/tmp}"',
+        # The SINGULARITY_* names keep a rollback to the singularity module off $HOME as well.
+        'export SINGULARITY_CACHEDIR="$APPTAINER_CACHEDIR" SINGULARITY_TMPDIR="$APPTAINER_TMPDIR"',
+        'mkdir -p "$APPTAINER_CACHEDIR"',
         f"if [ ! -s {q_sif} ]; then",
         f"  {container_bin} pull --name {q_partial} {shlex.quote(ref)}",
         f"  mv -n {q_partial} {q_sif}",
         "fi",
         f"rm -f {q_partial}",
-        'rm -rf "$SINGULARITY_CACHEDIR"',
+        'rm -rf "$APPTAINER_CACHEDIR"',
         f"test -s {q_sif}",
         f'echo "image ready: {sif}"',
     ])

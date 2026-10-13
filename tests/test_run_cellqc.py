@@ -7,6 +7,7 @@ import gzip
 import io
 import json
 import os
+import shutil
 import stat
 import sys
 import tarfile
@@ -74,7 +75,8 @@ _METRICS = ('Estimated Number of Cells,Median Genes per Cell,Number of Reads,Val
             'Median UMI Counts per Cell\n"4","2","342,370,742",97.8%,"4"\n')
 
 
-def _write_10x_h5(path, counts=_COUNTS, *, types=_TYPES, genome="GRCm39", dtype="int32", v2=False):
+def _write_10x_h5(path, counts=_COUNTS, *, types=_TYPES, genome="GRCm39", dtype="int32", v2=False,
+                  gene_names=None):
     h5py = pytest.importorskip("h5py")
     np = pytest.importorskip("numpy")
     dense = np.asarray(counts, dtype=dtype)
@@ -93,7 +95,8 @@ def _write_10x_h5(path, counts=_COUNTS, *, types=_TYPES, genome="GRCm39", dtype=
         g["shape"] = np.asarray([n_features, n_barcodes], dtype="int32")
         g["barcodes"] = np.asarray([f"AAAC{i}-1".encode() for i in range(n_barcodes)])
         ids = np.asarray([f"ENSMUSG{i:011d}".encode() for i in range(n_features)])
-        names = np.asarray([f"Gene{i}".encode() for i in range(n_features)])
+        names = np.asarray([(gene_names[i] if gene_names else f"Gene{i}").encode()
+                            for i in range(n_features)])
         if v2:
             g["genes"], g["gene_names"] = ids, names
         else:
@@ -322,6 +325,10 @@ for k, s in enumerate(samples):
                        index=[f"{{s['sample']}}_BC{{i}}" for i in range(n)])
     var = pd.DataFrame({{"gene_ids": genes, "mt": [g.startswith("mt-") for g in genes]}}, index=genes)
     ad.AnnData(X=X, obs=obs, var=var).write_h5ad(res / f"{{s['sample']}}.h5ad")
+    obs.to_csv(res / f"{{s['sample']}}_obs.txt.gz", sep="\t")
+    var.to_csv(res / f"{{s['sample']}}_var.txt.gz", sep="\t")
+    (res / f"{{s['sample']}}_doublet_summary.txt").write_text("doublets 4\n")
+    (res / f"{{s['sample']}}_doublet_concordance.txt").write_text("kappa 0.1\n")
     man.append({{"sample": s["sample"], "included": "True", "ncell": n, "reason": "", "fallback": ""}})
     st.append({{"sample": s["sample"], "step": "nuclear_fraction", "status": "skipped",
                 "message": "no BAM"}})
@@ -345,6 +352,8 @@ write(res / "metrics.csv", rows)
 write(res / "manifest.tsv", man, "\t")
 write(res / "qc_status.csv", st)
 (res / "report.html").write_text("<html>CellQC report</html>")
+(res / "report_slides.tex").write_text("\\documentclass{{beamer}}")
+(res / "report_slides.pdf").write_bytes(b"%PDF-1.5")
 sys.exit(int(os.environ.get("FAKE_CELLQC_RC", "0")))
 '''
 
@@ -441,8 +450,74 @@ def test_cellqc_end_to_end_with_a_fake_pipeline(tmp_path, delivery, fake_cellqc)
     assert out["libraries"][0]["ambient_decontx_contamination_mean"] == 0.07   # the compared method
     assert "agree poorly (kappa 0.10)" in text
     assert "nuclear_fraction" not in text                       # skipped without a BAM is expected
-    assert (ws / "artifacts" / "cellqc" / "report.html").is_file()
     assert out["libraries"][0]["removed_only_by"]["max_pct_mt"] == 7
+
+
+# CellQC's result/ directory, as a single-library run writes it (RCHENLAB/AiScientist issue 3).
+_RESULT_FILES = {"manifest.tsv", "metrics.csv", "qc_status.csv", "report.html", "report_slides.pdf",
+                 "report_slides.tex", "S1_doublet_concordance.txt", "S1_doublet_summary.txt",
+                 "S1.h5ad", "S1_obs.txt.gz", "S1_var.txt.gz"}
+
+
+def test_the_whole_cellqc_result_directory_is_handed_on(tmp_path, delivery, fake_cellqc):
+    """The bundle used to get seven hand-picked files under ``cellqc/`` (filed under ``extra/`` at
+    publish): no per-library matrix, no obs/var tables, no slide source."""
+    pytest.importorskip("scanpy")
+    from aiscientist.tools.api import CELLQC_RESULT_POINTER
+    from aiscientist.tools.run_cellqc.tool import run_cellqc
+    ws = tmp_path / "run"
+    out = run_cellqc({"samples": ["S1"]}, _ctx(ws, delivery))
+    assert out["status"] == "ok", out
+
+    # Complete, beside the run's other deliverable data and outside artifacts/.
+    full = ws / "result" / "cellqc"
+    assert {p.name for p in full.iterdir()} == _RESULT_FILES
+    produced = ws / "work" / "cellqc" / "out" / "result"
+    assert (full / "S1.h5ad").read_bytes() == (produced / "S1.h5ad").read_bytes()
+    assert (produced / "S1.h5ad").is_file()                # CellQC's own copy is left where it was
+
+    # The bundle has CellQC's directory under its own name, without the matrix.
+    bundled = ws / "artifacts" / "result"
+    assert {p.name for p in bundled.iterdir()} == _RESULT_FILES - {"S1.h5ad"}
+    assert not (ws / "artifacts" / "cellqc").exists()
+    assert sorted(out["cellqc_outputs"]) == sorted(f"result/{n}" for n in _RESULT_FILES - {"S1.h5ad"})
+
+    # The pointer the console reads: where the complete directory is, and what is in it.
+    pointer = json.loads((ws / "artifacts" / "data" / CELLQC_RESULT_POINTER).read_text())
+    assert pointer["path"] == str(full) and pointer["saved_to"] is None
+    assert {f["name"] for f in pointer["files"]} == _RESULT_FILES
+    assert pointer["size_bytes"] == sum(p.stat().st_size for p in full.iterdir())
+    assert pointer["matrices"] == ["S1.h5ad"] and pointer["libraries"] == ["S1"]
+    assert pointer["not_in_bundle"] == ["S1.h5ad"]
+    assert out["cellqc_result"]["n_files"] == len(_RESULT_FILES)
+    assert out["cellqc_result"]["matrices"] == ["S1.h5ad"]
+
+
+def test_a_table_too_big_for_the_bundle_stays_with_the_complete_directory(tmp_path, delivery, fake_cellqc,
+                                                                         monkeypatch):
+    pytest.importorskip("scanpy")
+    from aiscientist.tools.run_cellqc import tool
+    monkeypatch.setattr(tool, "_BUNDLE_FILE_MAX", 30)          # the bundle is re-copied after every step
+    ws = tmp_path / "run"
+    out = tool.run_cellqc({"samples": ["S1"]}, _ctx(ws, delivery))
+    assert out["status"] == "ok", out
+    pointer = json.loads((ws / "artifacts" / "data" / "cellqc_result.json").read_text())
+    assert "S1_obs.txt.gz" in pointer["not_in_bundle"] and "S1_doublet_summary.txt" not in pointer["not_in_bundle"]
+    assert (ws / "result" / "cellqc" / "S1_obs.txt.gz").is_file()
+    assert not (ws / "artifacts" / "result" / "S1_obs.txt.gz").exists()
+    assert (ws / "artifacts" / "result" / "S1_doublet_summary.txt").is_file()
+
+
+def test_a_second_cellqc_run_replaces_the_first_runs_result_files(tmp_path, delivery, fake_cellqc):
+    pytest.importorskip("scanpy")
+    from aiscientist.tools.run_cellqc.tool import run_cellqc
+    ws = tmp_path / "run"
+    assert run_cellqc({}, _ctx(ws, delivery))["status"] == "ok"
+    assert (ws / "result" / "cellqc" / "S2.h5ad").is_file()
+    shutil.rmtree(ws / "work" / "cellqc" / "out")          # as a fresh output directory would be
+    assert run_cellqc({"samples": ["S1"]}, _ctx(ws, delivery))["status"] == "ok"
+    assert not (ws / "result" / "cellqc" / "S2.h5ad").exists()
+    assert not (ws / "artifacts" / "result" / "S2_obs.txt.gz").exists()
 
 
 def test_a_nonzero_exit_with_results_is_a_warning_not_a_failure(tmp_path, delivery, fake_cellqc,
@@ -534,3 +609,17 @@ def test_text_columns_are_written_as_plain_strings_for_the_older_anndata_downstr
     assert a.raw.var["gene_ids"].dtype == object
     if hasattr(pd.options, "future") and hasattr(pd.options.future, "infer_string"):
         pd.set_option("future.infer_string", False)
+
+
+def test_the_most_abundant_genes_hint_at_the_tissue(tmp_path):
+    # A delivery has no tissue label; on 2026-10-08 the PI planned "a general mouse hematopoietic/immune
+    # panel" for a retina. The upload profile now names the curated reference the top genes point to.
+    from aiscientist.tools._lib.cellranger import describe_10x_h5, tissue_hint
+    names = ["Rho", "Gnat1", "Malat1", "Pde6b", "Ptprc"]
+    m = describe_10x_h5(str(_write_10x_h5(tmp_path / "f.h5", gene_names=names)))
+    top = m["counts"]["top_genes"]
+    assert top == ["Pde6b", "Malat1", "Rho", "Gnat1"]       # by total UMIs; row 4 is an antibody
+    hint = tissue_hint(top)
+    assert "most likely retina" in hint and "Rho (Rod photoreceptor)" in hint
+    assert 'reference: "retina"' in hint
+    assert tissue_hint(["Alb", "Apoa1", "Ttr", "Ptprc"]) == ""

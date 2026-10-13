@@ -589,6 +589,58 @@ def _genesets_dir() -> Path:
     return Path(d) if d else Path(__file__).resolve().parents[1] / "genesets"
 
 
+def counts_not_logged(adata: Any, use_raw: bool = True) -> "str | None":
+    """Why the expression a tool is about to read is unusable for it, or None.
+
+    Run 7f2955e8e (2026-10-08): the plan asked for log2 fold-changes "on per-cell integer UMI means",
+    so the Scientist saved an .h5ad whose X AND .raw held integer counts and passed it as run_de's
+    `input`. rank_genes_groups treats its input as log1p, so every log2FC it reported was wrong, and
+    run_marker_annotation, reading the checkpoint run_de then wrote, compared counts with thresholds in
+    log units: 52.9% of the cells, most rods and every cone, came out Unassigned. Checks the first 500
+    cells: integer values with a maximum above 50 are counts (log1p of 10k-normalised data stays near
+    10). None when it looks log-normalised or cannot be told."""
+    try:
+        import numpy as np
+        raw = use_raw and getattr(adata, "raw", None) is not None
+        X = adata.raw.X if raw else adata.X
+        sub = X[: min(500, X.shape[0])]
+        vals = np.asarray(sub.data if hasattr(sub, "toarray") else sub).ravel()
+        vals = vals[vals != 0]
+        if vals.size and float(vals.max()) > 50 and np.allclose(vals, np.round(vals)):
+            return (f"the expression in {'.raw' if raw else 'X'} is integer counts (max "
+                    f"{float(vals.max()):.0f}), not log-normalised expression. This tool works on "
+                    "log-normalised values: read the checkpoint the QC and clustering tools wrote "
+                    "(its .raw is log1p-normalised; the counts stay in layers['counts']), and do not "
+                    "pass an object whose X or .raw was replaced by counts.")
+    except Exception:  # noqa: BLE001 - a check that cannot run must not block the tool
+        return None
+    return None
+
+
+def installed_gene_sets() -> list[str]:
+    """The gene-set libraries actually present (``<name>.gmt`` in :func:`_genesets_dir`)."""
+    try:
+        return sorted(p.stem for p in _genesets_dir().glob("*.gmt"))
+    except OSError:
+        return []
+
+
+def gene_sets_note(requested: "list[str] | None" = None) -> str:
+    """What a model needs when it names a library that is not here: which ones ARE, and that no other
+    can be had during a run. Run 7f2955e8e (2026-10-08) planned MSigDB "M5"/"M6"; the error said only
+    "run scripts/fetch_genesets.py", and the Scientist spent three attempts hunting for the script and
+    for .gmt files instead of using the three libraries that were installed."""
+    have = installed_gene_sets()
+    if not have:
+        return ("No gene-set library is installed on this host; an administrator adds them with "
+                "scripts/fetch_genesets.py. Do not search for one during a run.")
+    asked = [g for g in (requested or []) if g not in have]
+    return ((f"Not installed: {', '.join(asked)}. " if asked else "")
+            + f"Installed (use these names exactly): {', '.join(have)}. No other library is "
+              "available offline and none can be downloaded during a run — do not search for one; "
+              "say in the report which library was used instead.")
+
+
 def scrna_analysis_summary(results: dict[str, Any]) -> str:
     """Render a small markdown section from the step result dicts (for the report)."""
     lines = ["## Single-cell analysis pipeline", ""]

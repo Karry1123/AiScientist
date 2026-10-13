@@ -422,6 +422,10 @@ class ResearchHarness:
                 assistant_msg: dict[str, Any] = {"role": "assistant", "content": message.get("content") or ""}
                 if native_calls:
                     assistant_msg["tool_calls"] = native_calls
+                # A provider that must see its own raw turn again (Claude's thinking blocks) returns
+                # it here; it rides on the turn and only that provider's adapter reads it.
+                if message.get("provider_blocks"):
+                    assistant_msg["provider_blocks"] = message["provider_blocks"]
                 messages.append(assistant_msg)
 
                 calls = native_calls

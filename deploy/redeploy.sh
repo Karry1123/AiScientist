@@ -2,7 +2,7 @@
 #
 # Production redeploy: push local code to eyeserver, then restart the systemd service.
 # This is the frequent-update workflow once the console runs under systemd (see
-# deploy/systemd/bioagent.service) behind nginx.
+# deploy/systemd/aiscientist.service) behind nginx.
 #
 #   ./deploy/redeploy.sh           # rsync + restart + show the live version fingerprint
 #   ./deploy/redeploy.sh -n        # dry-run the rsync only (no restart)
@@ -25,7 +25,7 @@ for _old in $(compgen -v BIOAGENT_ || true); do _new="AISCIENTIST_${_old#BIOAGEN
 REMOTE_HOST="${REMOTE_HOST:?set REMOTE_HOST in .deploy.env}"
 REMOTE_USER="${REMOTE_USER:-<ucinetid>}"
 REMOTE_PORT="${REMOTE_PORT:-}"
-SERVICE="${AISCIENTIST_SERVICE:-bioagent}"
+SERVICE="${AISCIENTIST_SERVICE:-aiscientist}"
 
 if [ "${1:-}" = "-n" ]; then
   exec ./scripts/push.sh -n

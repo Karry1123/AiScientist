@@ -324,9 +324,10 @@ def my_runs(request: Request) -> dict:
 # --- recording helpers (called by the gateway when a user is logged in) -------
 
 
-def record_dataset(user_id: int, name: str, path: str, size_bytes: int, kind: str) -> int | None:
+def record_dataset(user_id: int, name: str, path: str, size_bytes: int, kind: str,
+                   sha256: str | None = None) -> int | None:
     with session_scope() as s:
-        d = Dataset(user_id=user_id, name=name, path=path, size_bytes=size_bytes, kind=kind)
+        d = Dataset(user_id=user_id, name=name, path=path, size_bytes=size_bytes, kind=kind, sha256=sha256)
         s.add(d)
         s.commit()
         return d.id

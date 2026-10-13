@@ -61,13 +61,23 @@ unchanged.
 
 ## Outputs
 
-- `work/adata_qc.h5ad`: the merged libraries (obs `sampleid`), counts in `layers["counts"]`,
-  log-normalised `.X` and `.raw`, highly-variable genes (per library when there are several). The
+- `work/adata_qc.h5ad`: the merged libraries (obs `sampleid`), CellQC's AMBIENT-CORRECTED integer
+  counts in `layers["counts"]` (not the Cell Ranger matrix; `uns["counts_layer"]` and the result's
+  `counts_layer` say so), log-normalised `.X` and `.raw`, highly-variable genes (per library when there are several). The
   obs keep CellQC's columns: `pct_counts_mt`/`_ribo`/`_hb`, the uncorrected `raw_*` metrics, both
   doublet callers' scores and classes, and `nuclear_fraction` when a BAM was present.
-- `artifacts/cellqc/`: CellQC's own `report.html`, `report_slides.pdf`, `metrics.csv`,
-  `qc_status.csv`, `manifest.tsv` and the per-library doublet summaries; `tables/cellqc_metrics.csv`;
-  a per-library QC violin in `figures/`.
+- CellQC's own `result/` directory, complete and under its own name:
+  - `artifacts/result/` (in the results bundle and the files browser): every file except the
+    per-library matrices — `report.html`, `report_slides.pdf` and `.tex`, `metrics.csv`,
+    `qc_status.csv`, `manifest.tsv`, and per library `<sample>_obs.txt.gz`, `<sample>_var.txt.gz`,
+    `<sample>_doublet_summary.txt`, `<sample>_doublet_concordance.txt`.
+  - `<run>/result/cellqc/` (beside the run, on HPC3 for an HPC3 run): every file, the per-library
+    `<sample>.h5ad` included. It is outside `artifacts/` for the reason the processed dataset is:
+    everything under artifacts is copied to the gateway after each step. `data/cellqc_result.json`
+    lists it. The console downloads it as one zip (`result/…`, read from HPC3 as it is sent) and
+    "Save to my data" moves it to the user's folder as a dataset; unsaved, it goes with the run's
+    process files.
+- `tables/cellqc_metrics.csv`; a per-library QC violin in `figures/`.
 - Result: per-library cells in → after filtering → after doublets, which threshold removed them
   (`removed_only_by`), ambient load, doublet counts and caller agreement (kappa), nuclear fraction;
   the assumptions it made (species, chemistry, doublet rate, `nreaction`) and where each came from;

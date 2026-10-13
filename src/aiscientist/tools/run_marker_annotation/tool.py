@@ -19,6 +19,7 @@ from .._lib.scrna import (
     _rel,
     _run_rel,
     _step_input,
+    counts_not_logged,
     _write_table,
 )
 from ..sdk import HarnessTool
@@ -35,6 +36,8 @@ _REFERENCES = Path(__file__).with_name("references")
 # in enough of the cluster's cells.
 _CANON_MIN_DELTA = 0.5
 _CANON_MIN_FRACTION = 0.2
+# More cells than this unassigned means the labelling failed, whatever the reason.
+_MAX_UNASSIGNED_SHARE = 0.30
 
 
 def available_references() -> list[str]:
@@ -84,12 +87,23 @@ def _resolve_panel(args: dict[str, Any], present: set[str]) -> "tuple[dict, dict
         ref, ref_name = _load_reference(wanted), wanted
         if ref is None:
             raise ValueError(f"no curated reference '{wanted}'; available: {available_references()}")
-    elif wanted == "auto" and caller_panel:
+    elif caller_panel:
+        # "none" does not opt a panel out of a reference whose cell types it names. Run 4de7ab04a239
+        # (2026-10-08) passed reference "none" with a panel it wrote from the DE tables: "Cone
+        # photoreceptor" = Rho/Prph2/Nrl/Cnga1, "Rod photoreceptor" = Pde6c/Opn1mw/Arr3, "RPE" =
+        # Mlc1/Col9a1 (Muller glia genes) — 8,132 rods came out cones. A cell-type name is a claim
+        # about its markers; where a curated definition of the name exists, it is the one used.
         for name in available_references():
             cand = _load_reference(name) or {}
             types = next(iter(cand.get("species", {}).values()), {})
             if sum(_match_type(types, c) is not None for c in caller_panel) >= 3:
                 ref, ref_name, auto = cand, name, True
+                if wanted == "none":
+                    warnings.append(
+                        f"`reference: none` was overridden: the panel names "
+                        f"{sum(_match_type(types, c) is not None for c in caller_panel)} {name} cell "
+                        f"types, and a cell-type name stands for its curated {name} markers, not for "
+                        "the genes listed under it.")
                 break
     if ref is None:
         return dict(caller_panel), dict(caller_disc), {}, warnings
@@ -101,10 +115,19 @@ def _resolve_panel(args: dict[str, Any], present: set[str]) -> "tuple[dict, dict
     owner = {g: t for t, spec in types.items() for g in spec["discriminators"]}
     mapped: dict[str, str] = {}
     dropped: dict[str, list[str]] = {}
+    contradictions: dict[str, str] = {}
     for cname, genes in caller_panel.items():
         ref_type = _match_type(types, cname)
         if ref_type:
             mapped[cname] = ref_type        # the curated definition wins
+            # ...and say where the caller's own genes named a different lineage.
+            other = sorted({owner[g] for g in list(genes) + list(caller_disc.get(cname) or [])
+                            if g in owner and owner[g] != ref_type})
+            if other:
+                wrong = sorted(g for g in list(genes) + list(caller_disc.get(cname) or [])
+                               if g in owner and owner[g] != ref_type)
+                contradictions[cname] = (f"given {', '.join(wrong)} — markers of "
+                                         f"{', '.join(other)}")
             continue
         keep = [g for g in genes if g not in owner]
         lost = sorted(set(genes) - set(keep))
@@ -115,15 +138,22 @@ def _resolve_panel(args: dict[str, Any], present: set[str]) -> "tuple[dict, dict
         if keep:
             panel[cname] = keep
             disc[cname] = [g for g in (caller_disc.get(cname) or keep) if g not in owner] or keep
+    if contradictions:
+        warnings.append("The panel's own gene lists contradicted its cell-type names (the curated "
+                        "markers were used instead): " + "; ".join(
+                            f"'{k}' {v}" for k, v in contradictions.items()) + ".")
     info = {"name": ref_name, "species": species, "auto_applied": auto, "types": list(types),
             "caller_types_mapped": mapped, "genes_dropped": dropped,
+            "caller_panel_contradictions": contradictions,
             "expected": ref.get("expected", []), "usually": ref.get("usually", []),
+            "defining": {t: list(spec["defining"]) for t, spec in types.items() if spec.get("defining")},
             "source": ref.get("source", "")}
     return panel, disc, info, warnings
 
 
 def _canonical_check(sc: Any, adata: Any, cluster_key: str, labels: dict[str, dict[str, Any]],
-                     disc: dict[str, list[str]], use_raw: bool, warnings: list[str]) -> list[str]:
+                     disc: dict[str, list[str]], use_raw: bool, warnings: list[str],
+                     defining: "dict[str, list[str]] | None" = None) -> list[str]:
     """Withdraw a label none of whose lineage-specific markers is enriched in its cluster.
 
     Enriched = the cluster's mean (log-normalised) exceeds the mean over cells of clusters given a
@@ -131,7 +161,12 @@ def _canonical_check(sc: Any, adata: Any, cluster_key: str, labels: dict[str, di
     the cluster's cells. Comparing against other LINEAGES, not all other cells, keeps a dominant
     lineage testable (in a bipolar-rich sample most "other cells" are bipolar too). The raw check
     asks which lineage's markers are highest; this asks whether the winner's markers are there at
-    all — a cluster called ganglion on CHL1=1.30 with RBPMS=0.06 passes the first, not this one."""
+    all — a cluster called ganglion on CHL1=1.30 with RBPMS=0.06 passes the first, not this one.
+
+    Where the reference names ``defining`` markers for a lineage, one of THOSE must be enriched: run
+    f3b8268c4fd4 called a 27-cell cluster Muller glia on Glul alone (+2.81) while Rlbp1, the marker
+    that sets Muller glia apart, was +0.28 in 44% of its cells, and the cluster's own top genes
+    (Best2, Ptgds, Trpm3) belong to no retinal neuron or glia."""
     genes = sorted({g for gs in disc.values() for g in gs})
     if not genes:
         return []
@@ -151,18 +186,26 @@ def _canonical_check(sc: Any, adata: Any, cluster_key: str, labels: dict[str, di
         delta = df.loc[inside, markers].mean() - df.loc[outside, markers].mean()
         frac = (df.loc[inside, markers] > 0).mean()
         ok = [g for g in markers if delta[g] >= _CANON_MIN_DELTA and frac[g] >= _CANON_MIN_FRACTION]
-        if ok:
+        need = [g for g in (defining or {}).get(lab, []) if g in df.columns]
+        if ok and (not need or set(ok) & set(need)):
             info["canonical_markers_enriched"] = ok
             continue
         failed.append(cl)
         shown = ", ".join(f"{g} {delta[g]:+.2f} in {frac[g]:.0%}" for g in markers)
-        info.update({"cell_type": "Unassigned", "confidence": "none",
-                     "withdrawn_label": lab,
-                     "evidence": f"{lab} withdrawn: none of its markers is enriched ({shown})"})
+        if ok:
+            why = (f"{lab} withdrawn: {', '.join(need)}, the marker{'s' if len(need) > 1 else ''} "
+                   f"{'it' if len(need) == 1 else 'they'} cannot stand without, "
+                   f"{'is' if len(need) == 1 else 'are'} not enriched; {', '.join(ok)} alone is "
+                   f"shared with other cell types ({shown})")
+        else:
+            why = f"{lab} withdrawn: none of its markers is enriched ({shown})"
+        info.update({"cell_type": "Unassigned", "confidence": "none", "withdrawn_label": lab,
+                     "unassigned_reason": "withdrawn", "evidence": why})
     if failed:
-        warnings.append(f"{len(failed)} cluster(s) lost their label because none of that lineage's "
-                        f"specific markers is enriched in them: {', '.join(sorted(failed, key=_ckey))}. "
-                        "See withdrawn_label / evidence in cluster_cell_types.csv.")
+        warnings.append(f"{len(failed)} cluster(s) lost their label because the lineage's specific "
+                        f"markers are not enriched in them: {', '.join(sorted(failed, key=_ckey))}. "
+                        "See withdrawn_label / evidence in cluster_cell_types.csv, and describe these "
+                        "clusters by their top_markers, not by the withdrawn label.")
     return sorted(failed, key=_ckey)
 
 
@@ -198,6 +241,44 @@ def _plausibility(sc: Any, adata: Any, labels: dict[str, dict[str, Any]], ref_in
                 if float(frac.median()) < 0.05 else
                 "Its markers ARE detected, so it may sit inside an Unassigned or mislabelled "
                 "cluster: check before reporting the composition."))
+
+
+def _cluster_top_markers(adata: Any, cluster_key: str, use_raw: bool,
+                         n: int = 8) -> "dict[str, list[str]]":
+    """Each cluster's own most distinguishing genes, so a cluster left Unassigned (or stripped of a
+    label) can be described by what it expresses rather than by the label it did not get. Run
+    f3b8268c4fd4's report filled that gap with "rare or transitional neuronal subtypes".
+
+    The marker test run_de left in the checkpoint is used when it was grouped by this cluster key
+    (Wilcoxon ranks favour specific genes over merely abundant ones). Otherwise: genes ranked by how
+    much more often the cluster's cells detect them than all other cells do, among genes detected in
+    at least 30% of the cluster. Never raises — missing top markers cost a column, not the labels."""
+    try:
+        import numpy as np
+        rgg = getattr(adata, "uns", {}).get("rank_genes_groups")
+        if isinstance(rgg, dict) and (rgg.get("params") or {}).get("groupby") == cluster_key:
+            names, lfc = rgg["names"], rgg.get("logfoldchanges")
+            return {str(g): [str(x) for i, x in enumerate(names[g])
+                             if lfc is None or float(lfc[g][i]) > 0][:n]
+                    for g in names.dtype.names}
+        from scipy import sparse
+        X = adata.raw.X if use_raw else adata.X
+        var = np.asarray(adata.raw.var_names if use_raw else adata.var_names)
+        hit = sparse.csr_matrix(X > 0) if sparse.issparse(X) else sparse.csr_matrix(np.asarray(X) > 0)
+        clusters = adata.obs[cluster_key].astype(str).to_numpy()
+        total = np.asarray(hit.sum(axis=0)).ravel()
+        out: dict[str, list[str]] = {}
+        for c in sorted(set(clusters), key=_ckey):
+            inside_cells = clusters == c
+            k, rest = int(inside_cells.sum()), int((~inside_cells).sum())
+            if not k or not rest:
+                continue
+            inside = np.asarray(hit[inside_cells].sum(axis=0)).ravel()
+            gap = np.where(inside / k >= 0.3, inside / k - (total - inside) / rest, -1.0)
+            out[c] = [str(var[i]) for i in np.argsort(-gap)[:n] if gap[i] > 0]
+        return out
+    except Exception:  # noqa: BLE001 - descriptive extra; the annotation stands without it
+        return {}
 
 
 def _ckey(cluster: str) -> "tuple[int, str]":
@@ -246,6 +327,10 @@ def run_marker_annotation(args: dict[str, Any], ctx: Any) -> dict[str, Any]:
                 "error": f"cluster_key '{cluster_key}' not in obs; available: {list(adata.obs.columns)}"}
 
     use_raw = adata.raw is not None
+    problem = counts_not_logged(adata, use_raw)
+    if problem:
+        return {"status": "error", "step": "annotation", "read_from": _run_rel(ctx, ckpt),
+                "error": f"{problem} The marker thresholds are in log units."}
     present = set(adata.raw.var_names if use_raw else adata.var_names)
     try:
         panel, discriminators, ref_info, warnings = _resolve_panel(args, present)
@@ -311,6 +396,21 @@ def run_marker_annotation(args: dict[str, Any], ctx: Any) -> dict[str, Any]:
         runner, runner_val = ranked[1] if len(ranked) > 1 else ("", 0.0)
         dominant = best_val >= min_mean and (runner_val <= 0 or best_val >= ratio * runner_val)
         fp = str(first_pass.get(cl, "")) if cl in first_pass.index else ""
+
+        def shown(ct: str) -> str:
+            return ", ".join(f"{g}={raw_means.loc[cl, g]:.2f}" for g in disc.get(ct, [])[:5])
+        if dominant:
+            why, reason = shown(best), ""
+        elif best_val < min_mean:
+            # Nothing in the panel is expressed: a type the reference does not list, or empty drops.
+            why, reason = (f"weak: no lineage's markers reach {min_mean:g} (highest {best} "
+                           f"{best_val:.2f}: {shown(best)})"), "weak"
+        else:
+            # Two lineages both expressed: doublets, ambient RNA from the commoner one, or a type
+            # outside the panel that shares markers with both. Saying which two is the evidence.
+            why, reason = (f"mixed: {best} ({shown(best)}) and {runner} ({shown(runner)}) are both "
+                           f"present, {best_val / runner_val:.2f}x apart where {ratio:g}x is "
+                           "required — doublets, ambient RNA, or a type the panel lacks"), "mixed"
         labels[cl] = {
             "cell_type": best if dominant else "Unassigned",
             "first_pass_label": fp,
@@ -320,12 +420,38 @@ def run_marker_annotation(args: dict[str, Any], ctx: Any) -> dict[str, Any]:
                            else "medium" if dominant else "none"),
             "discriminator_mean": round(best_val, 4),
             "runner_up": runner, "runner_up_mean": round(runner_val, 4),
-            "evidence": ", ".join(f"{g}={raw_means.loc[cl, g]:.2f}"
-                                  for g in disc.get(best, [])[:5]) if dominant
-                        else "no dominant lineage signal",
+            "evidence": why, "unassigned_reason": reason,
         }
 
-    canonical_failed = _canonical_check(sc, adata, cluster_key, labels, disc, use_raw, warnings)
+    canonical_failed = _canonical_check(sc, adata, cluster_key, labels, disc, use_raw, warnings,
+                                        ref_info.get("defining"))
+    top = _cluster_top_markers(adata, cluster_key, use_raw)
+    # A label can pass every check and still not be the cluster's story: run f3b8268c4fd4's cluster 13
+    # was Rod photoreceptor on Rho/Nrl/Gnat1 while its own top genes were Srgap1, Elavl2, Nefm, Nefl
+    # (ganglion-cell genes). Name another lineage's markers when they outrank every marker of the
+    # cluster's own label among its top genes — the cluster's strongest identity signal is not its label.
+    owner: dict[str, set[str]] = {}
+    for source in (panel, disc):
+        for ct, gs in source.items():
+            for g in gs:
+                owner.setdefault(g, set()).add(ct)
+    crossed: list[str] = []
+    for cl, info in labels.items():
+        info["top_markers"] = top.get(cl, [])
+        lab = info["cell_type"]
+        if lab == "Unassigned":
+            continue
+        own = [i for i, g in enumerate(info["top_markers"]) if lab in owner.get(g, set())]
+        lead = info["top_markers"][:own[0]] if own else info["top_markers"]
+        other = [f"{g} ({', '.join(sorted(owner[g]))})" for g in lead
+                 if g in owner and lab not in owner[g]]
+        if other:
+            info["top_markers_of_other_lineages"] = other
+            crossed.append(f"{cl} ({lab}): {', '.join(other)}")
+    if crossed:
+        warnings.append("Labelled cluster(s) whose own top marker genes include another lineage's "
+                        "markers — possible doublets or a mixed cluster; say so when reporting them: "
+                        + "; ".join(sorted(crossed, key=lambda t: _ckey(t.split(" ", 1)[0]))) + ".")
     composition_notes: list[str] = []
     if ref_info:
         _plausibility(sc, adata, labels, ref_info, disc, use_raw, warnings, composition_notes)
@@ -339,6 +465,13 @@ def run_marker_annotation(args: dict[str, Any], ctx: Any) -> dict[str, Any]:
 
     comp = adata.obs["cell_type"].value_counts()
     total = int(comp.sum()) or 1
+    unassigned_share = int(comp.get("Unassigned", 0)) / total
+    if unassigned_share > _MAX_UNASSIGNED_SHARE:
+        # Run 7f2955e8e: 52.9% unassigned (counts read as log values) and the figure step that drew
+        # it was accepted at 0.88. A sample is not mostly cells of no type; the labelling failed.
+        warnings.insert(0, f"{unassigned_share:.0%} of the cells are Unassigned. That is a failed "
+                           "annotation, not a finding: check the input (log-normalised?), the "
+                           "reference and the species before reporting any composition.")
     _write_table(tables / "celltype_composition.csv",
                  [{"cell_type": str(k), "n_cells": int(v), "pct": round(100 * int(v) / total, 2)}
                   for k, v in comp.items()], ["cell_type", "n_cells", "pct"])
@@ -346,7 +479,8 @@ def run_marker_annotation(args: dict[str, Any], ctx: Any) -> dict[str, Any]:
                  [{"cluster": c, **{k: v for k, v in d.items()}} for c, d in sorted(labels.items())],
                  ["cluster", "cell_type", "first_pass_label", "corrected_by_raw_check",
                   "n_cells", "confidence", "discriminator_mean", "runner_up", "runner_up_mean",
-                  "evidence", "canonical_markers_enriched", "withdrawn_label"])
+                  "evidence", "canonical_markers_enriched", "withdrawn_label",
+                  "unassigned_reason", "top_markers", "top_markers_of_other_lineages"])
     (tables / "cluster_cell_types.json").write_text(json.dumps(labels, indent=2), encoding="utf-8")
 
     corrected = sorted(c for c, v in labels.items() if v["corrected_by_raw_check"])
@@ -361,6 +495,13 @@ def run_marker_annotation(args: dict[str, Any], ctx: Any) -> dict[str, Any]:
         # clusters are invisible cannot be reviewed by anyone.
         "corrected_by_raw_check": corrected,
         "unassigned_clusters": unassigned,
+        # Why each one is unassigned (mixed / weak / withdrawn) and what it does express: describe
+        # these clusters by their top markers, never by a guessed identity.
+        "unassigned_detail": {c: {"n_cells": labels[c]["n_cells"],
+                                  "reason": labels[c].get("unassigned_reason", ""),
+                                  "evidence": labels[c]["evidence"],
+                                  "top_markers": labels[c].get("top_markers", [])}
+                              for c in unassigned},
         "lineages_not_testable": not_testable,
         "panel_genes_absent_from_object": absent,
         # Labels withdrawn because none of their lineage-specific markers is enriched in the
@@ -394,14 +535,19 @@ def make_tool() -> HarnessTool:
         "symbols]}); a panel whose types match a reference uses the reference automatically. "
         "Signature scores give a first-pass z-argmax; the final label comes from RAW marker "
         "expression, assigned only when that lineage's discriminators dominate AND at least "
-        "one of them is enriched in the cluster versus other lineages; otherwise 'Unassigned'. "
-        "Returns which clusters the raw check CORRECTED, which are unassigned or WITHDRAWN, "
-        "and warnings (e.g. a lineage every sample of the tissue contains is missing); all "
-        "belong in the report.",
+        "one of them (one of its DEFINING markers, where the reference names them) is enriched "
+        "in the cluster versus other lineages; otherwise 'Unassigned'. Returns which clusters the "
+        "raw check CORRECTED, which are unassigned and why (mixed / weak / withdrawn, with each "
+        "cluster's own top marker genes), labelled clusters led by another lineage's genes, and "
+        "warnings (e.g. a lineage every sample of the tissue contains is missing); all belong in "
+        "the report. Describe an unassigned cluster by its top markers, not by a guessed name.",
         {"type": "object", "properties": {
             "reference": {"type": "string", "enum": ["auto", "none", *available_references()],
                           "description": ("curated marker reference for the tissue; 'auto' (default) "
-                                          "applies one when your panel's cell types match it")},
+                                          "applies one when your panel's cell types match it. "
+                                          "'none' is for a tissue without one: a panel naming three "
+                                          "or more of a reference's cell types uses the reference "
+                                          "whatever is passed")},
             "panel": {"type": "object"}, "discriminators": {"type": "object"},
             "cluster_key": {"type": "string"},
             "min_discriminator_mean": {"type": "number"},

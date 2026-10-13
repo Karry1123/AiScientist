@@ -33,7 +33,7 @@ from ..tools.api import ANALYSIS_ENTRYPOINT
 from .executor import RemoteExecutor
 from .slurm_job import (
     AcquireConfig, JobCancelled, RunConfig, SlurmJobError, SlurmJobSpec, build_analysis_script,
-    run_batch_job, singularity_exec, slurm_time_to_seconds)
+    run_batch_job, container_exec, slurm_time_to_seconds)
 
 _ARGS_EOF = "AISCIENTIST_ANALYSIS_ARGS_EOF"
 _RESULT_MARKER = "AISCIENTIST_RESULT_JSON "
@@ -43,7 +43,7 @@ _LEGACY_RESULT_MARKER = "BIOAGENT_RESULT_JSON "
 
 def provision_image(remote: Any, ref: str, images_dir: str, *, scratch: str, job_name: str,
                     partition: str, account: str = "", container_module: str = "",
-                    container_bin: str = "singularity", startup_timeout_s: int = 600,
+                    container_bin: str = "apptainer", startup_timeout_s: int = 600,
                     should_cancel: "Callable[[], bool] | None" = None, pkgs_cache: str = "",
                     say: "Callable[[str, str], None] | None" = None) -> str:
     """The dfs3b path of image ``ref`` in ``images_dir``, provisioned first if it is not there.
@@ -110,7 +110,9 @@ class SlurmAnalysisExecutor:
     # Appended to PYTHONPATH after `source_dir` and bind-mounted read-only. None -> the tools'
     # own loud fallbacks cover the gap.
     deps_dir: str | None = None
-    scratch_dir: str = "$HOME/.bioagent/analysis"
+    # Where each job's script, args/result files and logs go. Required, with no default: the
+    # gateway passes a directory under <shared_root>/Temp/<user>/scratch/, never the user's home.
+    scratch_dir: str = field(kw_only=True)
     entrypoint: str = f"python -m {ANALYSIS_ENTRYPOINT}"
     job_prefix: str = "bioagent_analysis"   # squeue job-name prefix (variant line overrides it)
     mem_gb: int = 64
@@ -119,7 +121,7 @@ class SlurmAnalysisExecutor:
     account: str = ""
     time_limit: str = "01:00:00"
     container_module: str = ""
-    container_bin: str = "singularity"
+    container_bin: str = "apptainer"
     startup_timeout_s: int = 600
     # 0 = AUTO: derive the job-wait from the SBATCH --time (`time_limit`) + a margin, so the gateway
     # waits as long as Slurm allows and never scancels a healthy, still-progressing job early. The old
@@ -405,7 +407,7 @@ class SlurmAnalysisExecutor:
         The dir is referenced both **unquoted** in shell (``mkdir``/heredoc — ``$HOME`` expands)
         AND **shlex-quoted** as the CLI ``--args`` path. In the quoted form the single quotes stop
         the shell from expanding ``$HOME``, so the Python tool receives a literal ``$HOME/...`` and
-        fails with ``No such file or directory``. It also leaks into the ``singularity -B`` binds and
+        fails with ``No such file or directory``. It also leaks into the ``apptainer -B`` binds and
         ``#SBATCH --output`` (Slurm does not expand ``$HOME`` there either). Resolving to an absolute
         path up front keeps every use site correct and lets us quote paths safely everywhere. If the
         remote lookup can't fully expand it (offline/mock), we keep the literal so behaviour is
@@ -446,7 +448,7 @@ class SlurmAnalysisExecutor:
 
         # Stage the args as a JSON file (quoted heredoc → no shell expansion of the payload).
         payload = json.dumps(args)
-        # Create the WORKSPACE too, not only scratch. Singularity refuses to bind-mount a source
+        # Create the WORKSPACE too, not only scratch. Apptainer refuses to bind-mount a source
         # that does not exist ("mount source … doesn't exist" → FATAL, exit 127), and the paperqa
         # executor's workspace (`Temp/<user>/paperqa`) was never created by anything: every
         # deep_literature job on HPC3 — 28 of 28 across two users since the feature shipped — died
@@ -494,7 +496,7 @@ class SlurmAnalysisExecutor:
         binds_ro = tuple(p for p in (root_dir, ds_dir, self.source_dir, deps_dir,
                                      *self.extra_ro_binds) if p)
         binds_rw = tuple(p for p in (ws, scratch, *self.extra_rw_binds) if p)
-        inner = singularity_exec(
+        inner = container_exec(
             job["image"], inner_payload,
             binds_ro=binds_ro, binds_rw=binds_rw, nv=False, network=sandbox_network_enabled(),
             container_bin=self.container_bin)
@@ -536,7 +538,7 @@ class SlurmAnalysisExecutor:
                     out["slurm_state"] = result.state
                     return out
         # No result marker → surface the REAL failure. The inner tool's stderr goes to log_f, but a
-        # container / module / sbatch failure BEFORE the tool ever runs (e.g. a singularity "FATAL:
+        # container / module / sbatch failure BEFORE the tool ever runs (e.g. an apptainer "FATAL:
         # container creation failed" bind-mount error) lands ONLY in the SBATCH --output log
         # ({name}-{jobid}.log — see build_analysis_script) which log_f is NOT. Read BOTH, else those
         # failures degrade to a useless "produced no result" and the model flails blind.

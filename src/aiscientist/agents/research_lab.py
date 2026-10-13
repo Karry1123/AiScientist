@@ -47,6 +47,7 @@ from . import claim_audit
 from .dag import LabPlan, TaskNode, lift_agenda_to_dag, parse_dag
 from .hypotheses import DesignFacts, HypothesisLedger
 from .loop_utils import safe_json_loads
+from .scope import RunScope, read_scope
 from .marker_claims import check_marker_claims
 from .preset_pipelines import (
     PresetPipeline,
@@ -115,6 +116,9 @@ _PI_SYSTEM = (
     "small step limit — completeness beats brevity: a thorough single-cell study is commonly 6-12 "
     "steps and up to ~20 is perfectly acceptable; never compress or merge real analyses to hit a "
     "smaller number. "
+    "THE USER'S OWN LIMITS COME FIRST: when the request says to do only certain analyses, or not to "
+    "run certain ones, plan exactly that — a limit the user set is not an omission to repair, and "
+    "the completeness rule above applies only inside it. "
     "Each step must be ACHIEVABLE WITH THE AVAILABLE TOOLS (do not plan steps the tools cannot do; if a tool is "
     "limited, scope the step to what it returns). RULES: each step is ONE tool's worth of work — do "
     "NOT combine multiple analyses into one step (e.g. don't say 'run DE AND enrichment AND make a "
@@ -1118,8 +1122,11 @@ _LITERATURE_STEP_RE = re.compile(
     r"|\bliterature\s+context\b|\bbiological\s+context\b|\bbiological\s+interpretation\b",
     re.I,
 )
+# "references" in the plural only, and not the things an analysis is run AGAINST: "annotate with
+# the retina reference" and "align to the reference genome" are not requests for citations.
 _REQUESTS_LITERATURE_RE = re.compile(
-    r"\b(literature|references?|citations?|published papers?|paper search)\b"
+    r"\b(literature|citations?|published papers?|paper search|bibliography)\b"
+    r"|\breferences\b(?!\s+(?:genomes?|atlas(?:es)?|datasets?|panels?|markers?|samples?))"
     r"|\b(?:published|biomedical|biological|scientific|literature)\s+background\b"
     r"|\bliterature\s+context\b|\bbiological\s+context\b|\bbiological\s+interpretation\b",
     re.I,
@@ -1173,7 +1180,105 @@ def _step_headline(step: str) -> str:
 
 #judging whether user is asking for literature
 def _requests_literature(*texts: str | None) -> bool:
-    return any(_REQUESTS_LITERATURE_RE.search(text or "") for text in texts)
+    return _literature_wish(*texts) is True
+
+
+# What a sentence SAYS about literature, not only whether it names it. A mention used to count as
+# a request whatever the sentence said, so in plan review "also discard the literature" put back
+# the step it asked to remove (prod run 1e887ed2bf8e). Chinese is read too: users type it.
+_LITERATURE_ZH_RE = re.compile(r"文献|引文|引用")
+_WISH_CLAUSE_SPLIT_RE = re.compile(r"[,;.!?，；。！？\n]+|\bbut\b|\bthen\b|但是?|然后|另外")
+_NEGATION = (r"(?:(?:do|does|did|should|would|could|will|can|must|need)\s+)?not|\w+n['’]t|never"
+             r"|no\s+need\s+to")
+# The verbs that ask for a step: those of ``_ADD_INTENT_RE``, and the ones that keep it or ask for
+# what it produces ("give me references", "ground it in the literature").
+_ASK_VERBS = (r"add|insert|include|append|introduce|keep|restore|cite|ground|search|find|review"
+              r"|provide|give|attach|want|need")
+_REMOVAL_CUE_RE = re.compile(
+    # A negation takes its verb with it ("don't add", "no need to include"), so that verb is not
+    # then read as a request of its own. Not across "and": "don't skip QC and cite the literature".
+    r"\b(?:" + _NEGATION + r")\s+(?:(?!and\b|or\b)\w+\s+){0,4}?"
+    r"(?:" + _ASK_VERBS + r"|run|do|plan|use|perform)\b"
+    r"|\b(?:" + _NEGATION + r"|remov(?:e|es|ed|ing)|delet(?:e|es|ed|ing)|drop(?:s|ped|ping)?"
+    r"|discard(?:s|ed|ing)?|skip(?:s|ped|ping)?|omit(?:s|ted|ting)?|exclud(?:e|es|ed|ing)"
+    r"|scrap|ditch|get\s+rid\s+of|take\s+out|leave\s+out|cut|without|no\s+need|no|instead\s+of"
+    r"|rather\s+than)\b"
+    r"|不(?:再)?(?:需要|要|用|做|加|跑|含|包括|保留|搜|查|进行|执行|必)|无需|无须|没必要"
+    r"|别(?:做|跑|加|搜|查|要|用)|去掉|去除|删|移除|取消|跳过|省略|拿掉|砍掉",
+    re.I)
+_KEEP_CUE_RE = re.compile(
+    r"\b(?:" + _ASK_VERBS + r"|also\s+run|also\s+do|put\s+back|bring\s+back)\b"
+    r"|加上|加一|增加|新增|添加|再跑|也跑|保留|加入|加回|补上|恢复",
+    re.I)
+# The removal said AFTER the thing it removes: "the literature step is not needed", "文献去掉".
+_REMOVAL_AFTER_RE = re.compile(
+    r"(?:\bnot|\bno\s+longer|n['’]t)\s+(?:\w+\s+)?(?:needed|necessary|required|wanted|relevant|useful)\b"
+    r"|\bunnecessary\b"
+    r"|\b(?:can|could|should|may|must)\s+(?:go|be\s+(?:removed|dropped|deleted|skipped|omitted|"
+    r"discarded|excluded|cut))\b"
+    r"|^\W*(?:steps?|search|part|section|review|grounding)?\W*(?:too\W+|also\W+)?"
+    r"(?:remove|delete|drop|discard|skip|omit|out|off|gone|no)\b"
+    r"|不(?:再)?(?:需要|要|用|做|加|跑|保留|搜|查|必)|无需|无须|没必要|别(?:做|跑|加|搜|查|要)"
+    r"|去掉|去除|删|移除|取消|跳过|省略|拿掉|砍掉|算了|免了",
+    re.I)
+# A plan-review note that asks for something to go: a removal, or a narrowing / replacing /
+# shortening of the plan ("only keep step 1", "replace step 3", "make it simpler", "只保留第一步").
+_PLAN_CUT_RE = re.compile(
+    _REMOVAL_CUE_RE.pattern
+    + r"|\b(?:only|just|nothing\s+(?:else|more)|replac(?:e|es|ed|ing)|instead|swap(?:s|ped|ping)?"
+      r"|simpl(?:er|ify|ified)|short(?:er|en|ened)|fewer|less|reduc(?:e|es|ed|ing)|trim(?:med)?"
+      r"|minimal|merg(?:e|es|ed|ing))\b"
+      r"|只|仅|换成|改成|替换|简化|精简|减少|缩短|合并",
+    re.I)
+
+
+def _literature_wish(*texts: str | None) -> "bool | None":
+    """What the user's own words LAST said about literature: ``True`` asked for it, ``False`` asked
+    for none, ``None`` never mentioned it. ``texts`` are read in order (the question, then the
+    review notes), clause by clause, so a later sentence overrules an earlier one.
+
+    Within a clause the cue nearest BEFORE the mention decides ("remove GSEA and add a literature
+    step" asks for one; "don't add references" does not); with no cue before it, a removal said
+    after it does ("文献步骤不要了"); a plain mention is a request. When the two readings are
+    close this leans to ``False``: not forcing a step costs the user one more message, forcing one
+    they declined is the failure this replaces."""
+    wish: "bool | None" = None
+    for text in texts:
+        for clause in _WISH_CLAUSE_SPLIT_RE.split(text or ""):
+            mention = _REQUESTS_LITERATURE_RE.search(clause) or _LITERATURE_ZH_RE.search(clause)
+            if not mention:
+                continue
+            before = clause[:mention.start()]
+            cut = max((m.end() for m in _REMOVAL_CUE_RE.finditer(before)), default=-1)
+            keep = max((m.start() for m in _KEEP_CUE_RE.finditer(before)), default=-1)
+            if cut >= 0 or keep >= 0:
+                # A keep cue AFTER the last removal cue. Strictly after: Chinese writes the
+                # negation against its verb ("不要保留文献"), which is one removal, not a keep.
+                wish = keep > cut
+            else:
+                wish = not _REMOVAL_AFTER_RE.search(clause[mention.end():])
+    return wish
+
+
+def _literature_step_wanted(agenda: list[str], *, question: str, feedback: str,
+                            prior_agenda: "list[str] | None", latest_feedback: str) -> bool:
+    """Should the guard make sure ``agenda`` has a literature step?
+
+    A first draft follows the user's words. A revision is judged against the plan the user just
+    reviewed, because that plan is what their note is about: a literature step it did not have is
+    added only when the note asks for one, and one it had is put back only when the note asked
+    for nothing to go. "Remove step 2", "only keep 1 … discard all other step" and "只保留第一步"
+    name no literature, and the redraft dropping the literature step is the user's request, not a
+    slip to repair."""
+    said = _literature_wish(question, feedback)
+    note = (latest_feedback or feedback or "").strip()
+    if prior_agenda is None or not note:
+        return said is True
+    if any(_is_literature_step(s) for s in agenda):
+        return said is True              # planned already; only duplicates are left to collapse
+    if any(_is_literature_step(s) for s in prior_agenda):
+        return said is not False and not _PLAN_CUT_RE.search(note)
+    return _literature_wish(note) is True
 
 #if the 5 steps are full kick out ... in priority
 # obs columns that carry an EXISTING cell-type annotation (as opposed to de-novo cluster labels
@@ -1736,6 +1841,48 @@ _LIT_QUERY_SYSTEM = (
 )
 
 
+# deep_literature (PaperQA) answers a QUESTION; it was handed the Europe PMC keyword string. Run
+# f3b8268c4fd4's step asked for "the established single-cell marker profile and expected cell-type
+# composition of the inferred tissue", and the corpus was asked "Regulation Of Voltage-Gated Calcium
+# Channel Activity (GO:1901385) Malat1 Rpgrip1 Cadm2" — it said "I cannot answer", and the report went
+# out with no references.
+_DEEP_LIT_QUESTION_SYSTEM = (
+    "You write the ONE question a literature corpus (PaperQA over published papers) will answer to "
+    "ground a study's interpretation. Read the study request, the literature step's brief and the "
+    "accepted findings, and write a single self-contained scientific question in plain English (one "
+    "or two sentences, at most 60 words) about the biology the brief asks to check. Name the tissue "
+    "and species and the cell types, marker genes or pathways the findings are about. No tool names, "
+    "file names, statistics jargon or instructions. Reply with the question only."
+)
+# PaperQA's own refusal, at the start of its answer ("I cannot answer.", "I cannot answer this
+# question due to having no papers").
+_CANNOT_ANSWER = re.compile(r"^\s*(?:I\s+)?(?:cannot|can't|am unable to) answer\b", re.IGNORECASE)
+
+
+def _deep_literature_fallback_question(step: str) -> str:
+    """The step brief as a plain question when no model writes one: title and markup stripped."""
+    text = re.sub(r"^\s*\*\*[^*]+\*\*\s*[—–:-]\s*", "", step or "")
+    text = re.sub(r"`[^`]*`", "", text)
+    text = re.sub(r"\s+", " ", text.replace("*", "")).strip()
+    sentences = re.split(r"(?<=[.?!])\s+", text)
+    body = " ".join(sentences[:2])[:400].strip()
+    return f"What does the published literature say about the following: {body}" if body else ""
+
+
+def _annotated_cell_types(rounds: "list[LabRound]") -> list[str]:
+    """The cell-type labels an accepted annotation step assigned (Unassigned left out)."""
+    found: list[str] = []
+    for r in rounds:
+        if r.verdict.verdict != "accept":
+            continue
+        for s in r.scientist_result.get("steps", []):
+            res = s.get("result") if isinstance(s.get("result"), dict) else {}
+            for lab in (res.get("labels") or {}).values() if isinstance(res.get("labels"), dict) else []:
+                if lab and lab != "Unassigned" and lab not in found:
+                    found.append(str(lab))
+    return found
+
+
 def _grounding_vocab(rounds: "list[LabRound]") -> str:
     """A CLOSED vocabulary the report writer must stay within — the exact cell-class labels and the
     exact enriched pathway terms the tools actually produced. Injected into the synthesize prompt so
@@ -2256,14 +2403,23 @@ def _ensure_literature_agenda(
     max_steps: int,
     has_literature_tool: bool,
     author: "Callable[[str], str] | None" = None,
+    prior_agenda: "list[str] | None" = None,
+    latest_feedback: str = "",
 ) -> list[str]:
     """Deterministically preserve a literature step when the user requested one.
 
     The guard decides THAT the step exists. WHAT it says comes from ``author`` (the PI writing one
     step from the full question + dataset profile) when one is wired; the string template
     ``_literature_step_text`` is only the offline fallback. A PI-written literature step that is
-    already in the plan is kept as written — it is not replaced by anything."""
-    if not has_literature_tool or not _requests_literature(question, guidance, feedback):
+    already in the plan is kept as written — it is not replaced by anything.
+
+    Whether the user requested one is :func:`_literature_step_wanted`: their own words, and on a
+    revision the plan they reviewed (``prior_agenda``) and the note they just typed
+    (``latest_feedback``). ``guidance`` is not read: a protocol names literature, or a "reference
+    panel", in every pipeline, which says nothing about what this user asked for."""
+    if not has_literature_tool or not _literature_step_wanted(
+            agenda, question=question, feedback=feedback,
+            prior_agenda=prior_agenda, latest_feedback=latest_feedback):
         return agenda
     existing_lit = [existing for existing in agenda if _is_literature_step(existing)]
     if existing_lit:
@@ -2284,8 +2440,10 @@ def _ensure_literature_agenda(
                 continue
             deduped.append(existing)
         return deduped[:max_steps]
+    # A step the redraft lost goes back as the user reviewed it, not as a newly written one.
+    reviewed = max((s for s in prior_agenda or [] if _is_literature_step(s)), key=len, default="")
     fallback = _literature_step_text(question)
-    step = author(fallback) if author is not None else fallback
+    step = reviewed or (author(fallback) if author is not None else fallback)
     if len(agenda) < max_steps:
         return [*agenda, step]
     if not agenda:
@@ -2506,6 +2664,8 @@ _NEXT_CYCLE_SYSTEM = (
 )
 _PLAN_REVIEW_CRITIC_SYSTEM = (
     "You are the Scientific Critic reviewing a DRAFT analysis plan with the PI, BEFORE any step runs. "
+    "When `user_scope` is given, the user limited this run on purpose: an analysis it rules out is "
+    "NOT a gap — do not flag its absence and do not add it in a revision. "
     "You are given the research question, the dataset profile, the ordered draft agenda, and "
     "`tools_named_in_plan` — what each tool the plan names computes and returns, in the words "
     "the tool's own contract uses. "
@@ -2676,7 +2836,8 @@ def plan_tool_contracts(agenda: "list[str]", catalog: "list[Any]") -> "dict[str,
 
 _PLAN_REVIEW_PI_SYSTEM = (
     "You are the Principal Investigator finalizing the analysis plan after the Critic reviewed it, "
-    "BEFORE any step runs. You OWN the plan. You are given the question, the dataset profile, the draft "
+    "BEFORE any step runs. You OWN the plan. When `user_scope` is given, the user limited this run "
+    "on purpose: the final agenda stays inside it. You are given the question, the dataset profile, the draft "
     "agenda, and the Critic's issues + proposed revision. Decide the FINAL agenda: adopt the fixes you "
     "agree with, keep steps you still want, never drop a step you believe is needed — but DO remove a "
     "genuinely orphan, circular, or redundant step. Do NOT put back, in its place, a 'reconciliation', "
@@ -3257,6 +3418,9 @@ class ResearchLab:
         # plan.md / run_state.json, so a run read months later can answer "which protocol was this,
         # and which of its choices did the protocol not actually specify".
         self._self_sourced: str = ""
+        # What the user limited this run to ("only QC", "no DE"): read once in _run_inner, enforced
+        # wherever a step can enter the plan (agents/scope.py).
+        self._scope: RunScope = RunScope()
         # The skills steering THIS run: the user-PINNED ones (mandatory) + one the PI auto-selects on
         # top (Axis B), extended in ``run()``. Carry their reference-code templates (progressive
         # disclosure). Empty = free planning.
@@ -3303,6 +3467,11 @@ class ResearchLab:
         later could not say which protocol it followed, nor whether the plan followed it. Empty
         when the run planned from scratch — which is itself worth recording."""
         return [{"key": s.key, "label": s.label} for s in getattr(self, "_skills", []) or []]
+
+    @property
+    def scope(self) -> RunScope:
+        """The limit the user's request put on this run (empty when it set none)."""
+        return self._scope
 
     @property
     def self_sourced(self) -> str:
@@ -3429,7 +3598,16 @@ class ResearchLab:
         # the pinned set (never replaces it), deduped by key. A user-EDITED free-text override
         # (``self._guidance`` from ``preset_prompt``) turns auto OFF — "I'm taking over the guidance";
         # pinned skills do NOT (they leave ``self._guidance`` None), so they still get the auto pick.
-        if self._guidance is None and self.config.auto_select_skill:
+        # The limit the request itself sets ("only QC", "no DE, no enrichment", "a short report"),
+        # read before anything that could widen the plan.
+        self._scope = read_scope(
+            question, {t.name: t.description for t in self.scientist.catalog},
+            lambda m: self._complete(m, role="classify"))
+        if self._scope.limited or self._scope.brief_report:
+            emit({"type": "scope", **self._scope.to_dict(), "text": self._scope.describe()})
+        # A request limited to named analyses is planned from the data profile alone: a matched
+        # protocol exists to lay out the WHOLE pipeline, which is what the user just declined.
+        if self._guidance is None and self.config.auto_select_skill and not self._scope.keep:
             # Feature ② Phase B: the run-start content triage (peek/describe) stamped the PRIMARY
             # file's modality into decisions; hand it to the router so a file's actual CONTENT — not
             # its extension — picks the modality bucket. Absent/low-confidence → the router falls back
@@ -3509,7 +3687,14 @@ class ResearchLab:
                                  "Stopped by the user before the plan was drafted — no tools ran.")
             return None
 
-        self._mode = self._route_mode(question, emit) if self.config.mode == "auto" else self.config.mode
+        if self._scope.keep and self.config.mode == "auto":
+            # The design meeting exists to widen a study; a request that names the only analyses it
+            # wants has nothing for it to design.
+            self._mode = "single"
+            emit({"type": "mode_selected", "mode": "single", "reason": "scope"})
+        else:
+            self._mode = (self._route_mode(question, emit) if self.config.mode == "auto"
+                          else self.config.mode)
         exec_roster, exec_multi = self.config.specialists, self.config.multi_specialist
         if self._mode == "team":
             self._team = self._form_team(question, emit)
@@ -3534,7 +3719,7 @@ class ResearchLab:
         # has already been critiqued still decides everything; they just decide with the Critic's
         # objections in front of them instead of without them.
         if plan_review is not None and kind == "agenda":
-            payload = self._plan_review(question, list(payload), emit)
+            payload = self._apply_scope(self._plan_review(question, list(payload), emit), emit)
             emit({"type": "pi_agenda", "agenda": payload})
 
         # Plan mode (human-in-the-loop): the user does NOT text-edit the plan — they
@@ -3640,7 +3825,7 @@ class ResearchLab:
         # In plan mode this already ran ABOVE, before the human saw the plan; here it covers the
         # autonomous path, where nothing else ever reads the plan back.
         if plan_review is None:
-            agenda = self._plan_review(question, agenda, emit)
+            agenda = self._apply_scope(self._plan_review(question, agenda, emit), emit)
 
         # Read-back guard (deterministic). A step that only re-reads a table an earlier step wrote
         # produces nothing and consumes a slot a real analysis needed. The PI prompt already forbids
@@ -3765,7 +3950,7 @@ class ResearchLab:
                 synthesize=synthesize, decision_review=decision_review,
                 should_compact=should_compact)
 
-        if self.config.max_cycles <= 1:
+        if self.config.max_cycles <= 1 or self._scope.limited:
             return _execute(agenda, synthesize=True)   # single cycle — today's path, untouched
         return self._run_campaign(question, agenda, _execute, emit, should_cancel)
 
@@ -5608,6 +5793,8 @@ class ResearchLab:
         # still drafts the agenda — adapting the guidance to this dataset — and plan mode
         # still lets the user shape the result, in natural language, before any tool runs.
         parts = [f"Research question:\n{question}\n"]
+        if self._scope.limited:
+            parts.append(self._scope.prompt_block() + "\n")
         if self._guidance:
             parts.append(f"Follow this research-path guidance when planning:\n{self._guidance}\n")
         dataset_ctx = self._dataset_context()
@@ -5669,14 +5856,22 @@ class ResearchLab:
                 emit({"type": "steps_pruned", "reason": "question_echo", "steps": echoed})
             #after PI generate agenda, check if the literature is inside
             _agenda_now = list(payload)
+            # Only the user's own words ask for literature. The protocol text mentions it in every
+            # pipeline, so reading the guidance here forced a literature step into every plan
+            # (prod run 1e887ed2bf8e: "Run CellQC … quality control report" planned CellQC and a
+            # literature step). It is a separate step, run on request.
             payload = _ensure_literature_agenda(
                 _agenda_now,
                 question=question,
-                guidance=self._guidance,
+                guidance=None,
                 feedback=feedback,
                 max_steps=self.config.max_steps,
-                has_literature_tool=any(t.name in ("deep_literature", "literature_search")
-                                        for t in self.scientist.catalog),
+                # The limit the first message set holds until a review note asks for literature:
+                # the scope is read once, and a note typed at the plan is the newer instruction.
+                has_literature_tool=(self._scope.allows_literature()
+                                     or _requests_literature(feedback)) and any(
+                    t.name in ("deep_literature", "literature_search")
+                    for t in self.scientist.catalog),
                 author=lambda fb: self._author_step(
                     question, _agenda_now,
                     brief=("A literature step near the end: search the published literature with "
@@ -5685,9 +5880,28 @@ class ResearchLab:
                            "biological interpretation. Name the biological subject of THIS "
                            "question; do not restate the analysis steps."),
                     fallback=fb),
+                prior_agenda=prior_agenda,
+                latest_feedback=request,
             )
+            # The user's own limit, applied to the draft. Not when they are revising the plan in
+            # chat: what they ask for there is the newer instruction, and the PI has both.
+            if not feedback:
+                payload = self._apply_scope(list(payload), emit)
             emit({"type": "pi_agenda", "agenda": payload})
         return kind, payload
+
+    def _apply_scope(self, agenda: list[str], emit: EventFn) -> list[str]:
+        """Drop the steps the request ruled out (:class:`~aiscientist.agents.scope.RunScope`)."""
+        if not self._scope.limited:
+            return agenda
+        kept, dropped = self._scope.filter(agenda, _primary_tool)
+        if dropped:
+            emit({"type": "steps_pruned", "reason": "user_scope", "dropped": dropped})
+        elif len(kept) == len(agenda) and not any(self._scope.allows(_primary_tool(s)) for s in agenda):
+            # Every step falls outside the limit: it could not be matched to this plan, so the plan
+            # is shown whole rather than empty, and says so.
+            emit({"type": "scope_unmatched", "text": self._scope.describe()})
+        return kept
 
     def _accepted_findings_block(self, rounds: list[LabRound]) -> str:
         """Accepted upstream findings, each with the artifact paths that back it, framed for
@@ -5861,6 +6075,33 @@ class ResearchLab:
             queries = []
         return queries or fallback
 
+    def _deep_literature_question(self, question: str, step: str, rounds: list[LabRound]) -> str:
+        """ONE natural-language question for deep_literature, written from the step brief and the
+        accepted findings; the step brief itself (plain) when the model gives nothing usable, and the
+        old keyword query only as a last resort."""
+        try:
+            digest = _literature_findings_digest(rounds)
+        except Exception:  # noqa: BLE001
+            digest = ""
+        types = _annotated_cell_types(rounds)
+        try:
+            raw = self._complete([
+                {"role": "system", "content": _DEEP_LIT_QUESTION_SYSTEM},
+                {"role": "user", "content": (
+                    f"Study request: {question}\n"
+                    f"Literature step brief: {step}\n"
+                    + (f"Cell types the analysis found: {', '.join(types)}\n" if types else "")
+                    + (f"Accepted findings (per cluster):\n{digest}\n" if digest else "")
+                    + "\nWrite the question now.")},
+            ])
+        except Exception:  # noqa: BLE001 - question writing must never break the run
+            raw = ""
+        q = re.sub(r"\s+", " ", str(raw or "")).strip().strip('"').strip()
+        if len(q.split()) >= 6 and not q.startswith(("{", "[")) and len(q) <= 600:
+            return q
+        return (_deep_literature_fallback_question(step)
+                or _literature_query(question, step, rounds) or step or question)
+
     def _run_literature_step(self, question: str, step: str, rounds: list[LabRound],
                              lit_tool: Any, specialist: Specialist,
                              emit: EventFn) -> HarnessResult:
@@ -5928,7 +6169,7 @@ class ResearchLab:
         own corpus instead of pulling arbitrary online preprints. deep_literature does its OWN
         retrieval, so there is no multi-query planning here — one focused corpus question suffices."""
         emit({"type": "scientist_start", "step": step, "specialist": specialist.name})
-        q = _literature_query(question, step, rounds) or step or question
+        q = self._deep_literature_question(question, step, rounds)
         args = {"question": q}
         emit({"type": "tool_start", "tool": "deep_literature", "args": args})
         try:
@@ -5967,7 +6208,10 @@ class ResearchLab:
         # answer. Returning "ok" here blocked the Europe PMC fallback in production (run
         # 97dfc89dc5aa: the retigene corpus holds no DDX41 papers → status ok, contexts=[], and
         # References shipped empty although the broader keyword search existed as the fallback).
-        if ok and cites:
+        # "I cannot answer" WITH a context is no answer either: run f3b8268c4fd4 got one tangential
+        # passage, returned "ok", and the Europe PMC fallback never ran.
+        bare = str((output.get("answer") if isinstance(output, dict) else "") or answer_text)
+        if ok and cites and not _CANNOT_ANSWER.search(bare):
             lines = [answer_text] if answer_text else []
             if cites:
                 lines += ["", "Citations from the indexed corpus (use ONLY these in the References "
@@ -6004,7 +6248,18 @@ class ResearchLab:
                     return result
                 emit({"type": "literature_fallback", "from": "deep_literature",
                       "to": "literature_search", "reason": getattr(result, "stop_reason", "")})
-                return self._run_literature_step(question, step, rounds, lit_tool, specialist, emit)
+                fallback = self._run_literature_step(question, step, rounds, lit_tool, specialist, emit)
+                # Run 7f2955e8e: the Critic revised the fallback (0.35) because the step "called for
+                # deep_literature" and keyword searches ran instead — so the report had no
+                # references although Europe PMC had returned 11 papers. The switch is the
+                # platform's, not the Scientist's: say so where the Critic reads it.
+                fallback.final_answer = (
+                    "(Platform note: the indexed corpus, deep_literature, returned no usable answer "
+                    f"to \"{(result.steps[0].get('args') or {}).get('question', '') if result.steps else ''}\"; "
+                    "the platform then searched Europe PMC with literature_search, as it always does in "
+                    "that case. Judge the citations below on their relevance to the step's question, "
+                    "not on which of the two tools found them.)\n\n" + (fallback.final_answer or ""))
+                return fallback
             if lit_tool is not None:
                 return self._run_literature_step(question, step, rounds, lit_tool, specialist, emit)
 
@@ -6381,8 +6636,8 @@ class ResearchLab:
 
         Never raises: any parse/LLM failure degrades to "nothing new", i.e. today's behaviour.
         """
-        if not self.config.hypothesis_driven:
-            return []
+        if not self.config.hypothesis_driven or self._scope.limited:
+            return []   # a run the user limited does not grow new steps
         room = min(self.config.max_new_steps - self._new_steps_added,
                    self.config.max_steps - len(plan_steps))
         if room <= 0:
@@ -6505,11 +6760,14 @@ class ResearchLab:
         # a run_code step that re-derived the per-direction depth verdict run_depth_matched_de
         # already returns, and a figures step re-drawing what run_de/run_enrichment write.
         contracts = plan_tool_contracts(agenda, self.scientist.catalog)
+        # A limit the user set is not a gap in the plan: both reviewers are told, and the result
+        # is filtered by the callers.
+        scope_note = ({"user_scope": self._scope.prompt_block()} if self._scope.limited else {})
         raw_critic = self._complete([
             {"role": "system", "content": _PLAN_REVIEW_CRITIC_SYSTEM},
             {"role": "user", "content": json.dumps(
                 {"research_question": question, "dataset_profile": profile, "draft_agenda": agenda,
-                 "tools_named_in_plan": contracts})},
+                 "tools_named_in_plan": contracts, **scope_note})},
         ], role="critic")
         critic = _parse_verdict(raw_critic)
         if critic is None:
@@ -6526,7 +6784,7 @@ class ResearchLab:
             {"role": "system", "content": _PLAN_REVIEW_PI_SYSTEM},
             {"role": "user", "content": json.dumps(
                 {"research_question": question, "dataset_profile": profile, "draft_agenda": agenda,
-                 "tools_named_in_plan": contracts,
+                 "tools_named_in_plan": contracts, **scope_note,
                  "critic_issues": issues, "critic_revised_agenda": proposed})},
         ], role="plan")) or {}
         final = [str(s).strip() for s in (pi.get("final_agenda") or []) if str(s).strip()]

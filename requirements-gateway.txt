@@ -3,3 +3,5 @@
 paramiko>=3.4
 fastapi>=0.110
 uvicorn[standard]>=0.29
+# A user's own Anthropic (Claude) key — the native transport, gateway/anthropic_client.py.
+anthropic>=1.13,<2

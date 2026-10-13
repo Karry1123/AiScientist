@@ -132,7 +132,11 @@ def runs_on_md(m, tool) -> str:
         lines.append("Needs: " + ", ".join(f"`{r}`" for r in tool.requires) + ".")
     lines.append("Reads private data: " + ("yes; its results stay inside the run." if tool.reads_private_data
                                           else "no."))
-    lines.append("On the fast chat path: " + ("yes." if m.chat else "no (research runs only)."))
+    if m.research:
+        lines.append("On the fast chat path: " + ("yes." if m.chat else "no (research runs only)."))
+    else:
+        lines.append("In the research agents' catalog: no" + ("; the fast chat can call it." if m.chat else
+                     ". No model can call it: it runs only from its own console line."))
     return "\n\n".join(lines)
 
 

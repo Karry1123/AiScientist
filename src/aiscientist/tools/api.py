@@ -41,6 +41,7 @@ _EXPORTS: dict[str, tuple[str, str]] = {
     # figures (make_schematic), also used for the report's workflow figure
     "render_dot": ("aiscientist.tools.make_schematic.tool", "render_dot"),
     "workflow_schematic_dot": ("aiscientist.tools.make_schematic.tool", "workflow_schematic_dot"),
+    "render_workflow_schematic": ("aiscientist.tools.make_schematic.tool", "render_workflow_schematic"),
     # literature
     "focus_literature_query": ("aiscientist.tools.literature_search.tool", "focus_literature_query"),
     "QUERY_STOPWORDS": ("aiscientist.tools.literature_search.tool", "_QUERY_STOPWORDS"),
@@ -68,6 +69,9 @@ _EXPORTS: dict[str, tuple[str, str]] = {
     "export_result_dataset": ("aiscientist.tools._lib.result_dataset", "export"),
     "result_dataset_name": ("aiscientist.tools._lib.result_dataset", "result_name"),
     "RESULT_DATASET_POINTER": ("aiscientist.tools._lib.result_dataset", "POINTER"),
+    # CellQC's complete result/ directory, kept with the run (run_cellqc writes the pointer)
+    "CELLQC_RESULT_POINTER": ("aiscientist.tools._lib.result_dataset", "CELLQC_POINTER"),
+    "cellqc_result_name": ("aiscientist.tools._lib.result_dataset", "cellqc_result_name"),
     "resolve_run_dependency": ("aiscientist.tools.run_deps", "resolve"),
     "DEPS_DIRNAME": ("aiscientist.tools.run_deps", "DEPS_DIRNAME"),
     "SITECUSTOMIZE": ("aiscientist.tools.run_deps", "SITECUSTOMIZE"),

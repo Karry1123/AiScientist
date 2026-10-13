@@ -226,3 +226,28 @@ def test_an_unsaved_local_result_expires_with_the_checkpoints(tmp_path, gw):
     past = time.time() - 30 * 86400
     os.utime(f, (past, past))
     assert gw_app._expire_old_checkpoints(tmp_path, 7) == 1 and not old.exists()
+
+
+def test_a_stopped_run_still_exports_its_dataset(tmp_path):
+    # Run 7f2955e8e: after one Stop the write-up ran, but the export job inherited the Stop flag
+    # and was cancelled ("Run cancelled by the user"). The flag is lifted for the export only.
+    import asyncio
+    from types import SimpleNamespace
+    from aiscientist.gateway.app import _export_result_dataset
+
+    seen = {}
+
+    class Executor:
+        should_cancel = staticmethod(lambda: True)
+
+        def run_tool(self, name, args, ctx):
+            seen["cancel_during"] = self.should_cancel
+            return {"status": "skipped", "reason": "test"}
+
+    ex = Executor()
+    conn = SimpleNamespace(settings=SimpleNamespace(temp_ttl_days=3, checkpoint_ttl_days=7),
+                           workspace=tmp_path, owner="u")
+    asyncio.run(_export_result_dataset(conn, "r1", {"dataset_path": "/x/a.h5ad"}, ex, "q",
+                                       lambda *a, **k: None))
+    assert seen["cancel_during"] is None
+    assert ex.should_cancel() is True                       # restored afterwards

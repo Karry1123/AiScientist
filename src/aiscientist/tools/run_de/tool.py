@@ -24,6 +24,7 @@ from .._lib.scrna import (
     _schema,
     _slug,
     _step_input,
+    counts_not_logged,
     _write_table,
 )
 from ..sdk import HarnessTool
@@ -198,6 +199,12 @@ def run_de(args: dict[str, Any], ctx: Any) -> dict[str, Any]:
     contrast = reference != "rest"
 
     adata = sc.read_h5ad(ckpt)
+    problem = counts_not_logged(adata, use_raw=True)
+    if problem:
+        return {"status": "error", "step": "de", "read_from": _run_rel(ctx, ckpt),
+                "error": (f"{problem} rank_genes_groups computes its log2 fold-changes from "
+                          "log-normalised means; on counts they are wrong. Report the tool's "
+                          "log2FC as computed from normalised expression.")}
     obs_cols = list(adata.obs.columns)
     if groupby not in adata.obs:
         return {"status": "error", "error": f"groupby '{groupby}' not in obs; available: {obs_cols}"}
@@ -430,7 +437,10 @@ def run_de(args: dict[str, Any], ctx: Any) -> dict[str, Any]:
         if rank_fig.exists():
             figures.append(_rel(art, rank_fig))
         if not contrast:
-            marker_genes = {g: top_by_group[g][:min(5, n_genes)] for g in top_by_group}
+            # At most ~60 columns: run f3b8268c4fd4's 25 clusters x 5 genes drew a 125-gene dot plot
+            # 3,746 px wide that no page could show legibly.
+            per = max(2, min(5, n_genes, 60 // max(1, len(top_by_group))))
+            marker_genes = {g: top_by_group[g][:per] for g in top_by_group}
             try:
                 sc.pl.dotplot(adata, marker_genes, groupby=groupby, show=False, save="_markers.png")
             except Exception:  # noqa: BLE001 - dotplot can fail on degenerate inputs

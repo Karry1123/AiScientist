@@ -10,6 +10,9 @@ from __future__ import annotations
 from aiscientist.gateway.slurm_sandbox import SlurmCodeExecutor
 from aiscientist.gateway.executor import ExecResult
 
+# The directory the gateway gives this job line: <shared_root>/Temp/<user>/scratch/runcode.
+SCRATCH = "/dfs/lab/Temp/tester/scratch/runcode"
+
 
 class FakeHPC:
     """Fake HPC host: submits complete immediately (squeue empty -> sacct COMPLETED), and ``cat``
@@ -65,6 +68,7 @@ class FakeHPC:
 
 
 def _executor(hpc, **kw):
+    kw.setdefault("scratch_dir", SCRATCH)
     return SlurmCodeExecutor(
         remote=hpc, container_image="/dfs/lab/analysis.sif",
         dataset_path="/dfs/lab/ds.h5ad", work_dir="/dfs/lab/run/work",
@@ -120,7 +124,7 @@ def test_a_bound_folder_is_mounted_whole_so_the_files_beside_the_primary_are_rea
 
     hpc = Recording({".out": "", ".err": "", ".rc": "0\n"})
     SlurmCodeExecutor(
-        remote=hpc, container_image="/dfs/lab/analysis.sif",
+        remote=hpc, container_image="/dfs/lab/analysis.sif", scratch_dir=SCRATCH,
         dataset_path="/dfs/up/lib/outs/filtered_feature_bc_matrix.h5", dataset_root="/dfs/up/lib",
         work_dir="/dfs/lab/run/work", artifacts_dir="/dfs/lab/run/art",
         startup_timeout_s=5, run_timeout_s=5)("print(1)")
@@ -135,7 +139,7 @@ def test_no_remote_uses_local_fallback():
     def fake_local(code):
         calls["code"] = code
         return {"status": "ok", "stdout": "local", "returncode": 0}
-    ex = SlurmCodeExecutor(remote=None, container_image="/img.sif", local_fallback=fake_local)
+    ex = SlurmCodeExecutor(remote=None, container_image="/img.sif", scratch_dir=SCRATCH, local_fallback=fake_local)
     out = ex("print(1)")
     assert out["status"] == "ok" and out["stdout"] == "local"
     assert out["execution_mode"] == "local_fallback" and "no live HPC" in out["fallback_reason"]
@@ -152,7 +156,7 @@ def test_stop_cancels_the_runcode_job_without_fallback(monkeypatch):
     from aiscientist.gateway.slurm_job import JobCancelled
     called = {"fallback": False}
     ex = SlurmCodeExecutor(
-        remote=object(), container_image="/img.sif",
+        remote=object(), container_image="/img.sif", scratch_dir=SCRATCH,
         local_fallback=lambda code: called.__setitem__("fallback", True) or {"status": "ok"},
         should_cancel=lambda: True,
     )
@@ -210,7 +214,7 @@ def _executor_with_remote(listings):
             self.calls.append(cmd)
             return _Out(listings.pop(0) if listings else "")
 
-    ex = SlurmCodeExecutor(remote=_Remote(), container_image="x.sif",
+    ex = SlurmCodeExecutor(remote=_Remote(), container_image="x.sif", scratch_dir=SCRATCH,
                            artifacts_dir="/dfs/run/artifacts")
     return ex
 
@@ -241,7 +245,7 @@ def test_a_broken_find_reports_no_evidence_rather_than_failing_the_snippet():
     class _Remote:
         def exec(self, cmd): raise OSError("ssh died")
 
-    ex = SlurmCodeExecutor(remote=_Remote(), container_image="x.sif",
+    ex = SlurmCodeExecutor(remote=_Remote(), container_image="x.sif", scratch_dir=SCRATCH,
                            artifacts_dir="/dfs/run/artifacts")
     assert ex._artifact_snapshot() == {}
     assert ex._written_since({}) == []
@@ -279,7 +283,7 @@ def _sync_executor(tmp_path, remote_files, fetch_log):
             from pathlib import Path as _P
             _P(local).write_text("x")
 
-    return SlurmCodeExecutor(remote=_Remote(), container_image="x.sif",
+    return SlurmCodeExecutor(remote=_Remote(), container_image="x.sif", scratch_dir=SCRATCH,
                              artifacts_dir="/dfs/run/artifacts",
                              local_artifacts=str(tmp_path))
 
@@ -328,6 +332,6 @@ def test_sync_is_a_no_op_without_a_local_target(tmp_path):
     class _Remote:
         def exec(self, cmd): raise AssertionError("must not touch the cluster")
 
-    ex = SlurmCodeExecutor(remote=_Remote(), container_image="x.sif",
+    ex = SlurmCodeExecutor(remote=_Remote(), container_image="x.sif", scratch_dir=SCRATCH,
                            artifacts_dir="/dfs/run/artifacts", local_artifacts=None)
     ex._sync_artifacts_back(changed=["tables/a.csv"])      # no raise

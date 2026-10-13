@@ -14,13 +14,15 @@ lifecycle in :mod:`aiscientist.gateway.slurm_job` (submit → wait for a node wi
 for completion → collect output). Everything goes through the ``RemoteExecutor`` protocol, so the
 whole flow runs offline against a scripted fake in tests — no real Slurm, no SSH.
 
-Isolation & data safety come from the same Singularity contract the scGPT job already uses: the
+Isolation & data safety come from the same Apptainer contract the scGPT job already uses: the
 dataset is bind-mounted **read-only**, only work/artifacts are writable, and ``--containall`` hides
 every other host path. Network access follows :func:`~aiscientist.agents.sandbox.sandbox_network_enabled`
 — ON by default (Jin Li 2026-07-08: prioritize effectiveness), toggled off with
-``AISCIENTIST_SANDBOX_NETWORK=0`` (which restores ``--net --network none``). If no live remote is wired,
-the executor falls back to a local ``CodeSandbox`` so a run never hard-fails just because HPC is
-unavailable.
+``AISCIENTIST_SANDBOX_NETWORK=0`` (which restores ``--net --network none``).
+
+Whether a snippet may ever run on the gateway host instead is the gateway's decision, not this
+class's: it passes ``local_fallback`` only on a console without accounts (``app._host_code_allowed``).
+Without one, a snippet that cannot run on HPC3 is not run at all: the call returns the reason.
 
 Example sbatch request this produces (CPU analysis job, real memory cap; network on by default) —
 also documented in the ``run`` skill::
@@ -34,7 +36,7 @@ also documented in the ``run`` skill::
     #SBATCH --time=01:00:00
     #SBATCH --output=<scratch>/bioagent_runcode_3-%j.log
 
-    singularity exec --containall --writable-tmpfs \\
+    apptainer exec --containall --writable-tmpfs \\
       -B <dataset>:<dataset>:ro -B <work>:<work> -B <artifacts>:<artifacts> \\
       <image> bash -lc 'python <scratch>/snippet_3.py > out 2> err; echo $? > rc'
 """
@@ -50,7 +52,7 @@ from .executor import RemoteExecutor
 from .job_store import JobRecord, JobStore
 from .slurm_job import (
     AcquireConfig, JobCancelled, RunConfig, SlurmJobError, SlurmJobSpec, build_analysis_script,
-    run_batch_job, singularity_exec, slurm_time_to_seconds)
+    run_batch_job, container_exec, slurm_time_to_seconds)
 
 # A heredoc sentinel that will never collide with real Python source.
 _SNIPPET_EOF = "AISCIENTIST_SNIPPET_EOF_c0ffee"
@@ -65,7 +67,7 @@ class SlurmCodeExecutor:
     """A ``CodeExecutor`` that runs each snippet as a contained CPU batch job on HPC3.
 
     ``remote`` is the connected ``RemoteExecutor`` (SSH to HPC3). ``container_image`` is the same
-    Singularity image already used for the analysis stack. The dataset/work/artifacts paths are the
+    Apptainer image already used for the analysis stack. The dataset/work/artifacts paths are the
     **remote** (HPC3 DFS) locations the snippet reads/writes; they are exposed to the snippet as the
     usual ``AISCIENTIST_DATASET`` / ``AISCIENTIST_WORK`` / ``AISCIENTIST_ARTIFACTS`` env vars.
     """
@@ -73,7 +75,7 @@ class SlurmCodeExecutor:
     remote: RemoteExecutor | None
     container_image: str
     # These three are BIND-MOUNTED into the container on the COMPUTE NODE, so they must be paths the
-    # HPC3 node can see — i.e. dfs3b, NOT the eyeserver-local /data/BioAgent run dir (binding a local
+    # HPC3 node can see — i.e. dfs3b, NOT the eyeserver-local /data/aiscientist run dir (binding a local
     # path there fails container creation with exit 127; see app.py's run_code wiring). Mirror the
     # analysis/VEP lines, which pass dfs3b paths via _storage_base(conn) / decisions['hpc_primary'].
     dataset_path: str | None = None
@@ -86,19 +88,24 @@ class SlurmCodeExecutor:
     # Eyeserver-local dir to mirror the job's artifacts back into (the report bundler is still on the
     # host). NOT bind-mounted — only a get_file target — so a local path here is correct. None → no sync.
     local_artifacts: str | None = None
-    scratch_dir: str = "$HOME/.bioagent/runcode"
+    # Where each job's script, output files and logs go. Required, with no default: the gateway
+    # passes a directory under <shared_root>/Temp/<user>/scratch/, never the user's home.
+    scratch_dir: str = field(kw_only=True)
     mem_gb: int = 64
     cpus: int = 8
     partition: str = "standard"
     account: str = ""
     time_limit: str = "01:00:00"
     container_module: str = ""
-    container_bin: str = "singularity"
+    container_bin: str = "apptainer"
     max_output: int = 20_000
     startup_timeout_s: int = 600     # HPC queues can be long; keep the whole run patient
     run_timeout_s: int = 1800
-    # Fallback used when no live remote is wired (offline/mock, or HPC not enabled). Kept as a
-    # plain callable so this module has no hard dependency on CodeSandbox's shape.
+    # Runs the snippet on the GATEWAY HOST when HPC3 cannot (no live remote, or a failed job and
+    # ``fallback_on_error``). None = never: the call returns the reason instead. The gateway passes
+    # one only on a console without accounts; with accounts on, the local sandbox is a subprocess
+    # of a service that holds every account's keys. Kept as a plain callable so this module has no
+    # hard dependency on CodeSandbox's shape.
     local_fallback: object | None = None
     fallback_on_error: bool = True
     # Optional durable registry: when set, each submitted job is recorded the instant its
@@ -162,9 +169,12 @@ class SlurmCodeExecutor:
             return {"status": "cancelled", "error": "Run cancelled by the user.",
                     "returncode": None, "stdout": "", "stderr": ""}
         except SlurmJobError as exc:
-            if self.fallback_on_error:
+            if self.fallback_on_error and callable(self.local_fallback):
                 return self._fallback(code, f"Slurm job failed: {exc}")
-            return {"status": "error", "error": f"Slurm job failed: {exc}",
+            return {"status": "error", "execution_mode": "hpc_slurm",
+                    "error": (f"Slurm job failed: {exc}. The snippet was not run on the gateway "
+                              "host. Fix the cause and call run_code again: it is resubmitted to "
+                              "HPC3."),
                     "returncode": None, "stdout": "", "stderr": str(getattr(exc, "detail", "") or "")}
 
     def run_in_image(self, command: str, image: str, *, workdir: str, cpus: int = 0,
@@ -238,13 +248,14 @@ class SlurmCodeExecutor:
                 out["fallback_reason"] = reason
                 return out
         return {"status": "not_enabled",
-                "note": f"CodeAct HPC execution unavailable ({reason}) and no local fallback is set."}
+                "note": f"run_code could not run on HPC3 ({reason}), and it is not run on the "
+                        "gateway host."}
 
     def _resolved_scratch(self) -> str:
         """Expand shell vars (e.g. ``$HOME``) in ``scratch_dir`` to a concrete remote path ONCE.
 
         ``scratch`` is used **unquoted** in the SSH shell (``mkdir``/heredoc — ``$HOME`` expands) but
-        also lands in the ``singularity -B`` binds and the ``#SBATCH --output`` directive, and **Slurm
+        also lands in the ``apptainer -B`` binds and the ``#SBATCH --output`` directive, and **Slurm
         does NOT expand ``$HOME`` in ``#SBATCH`` lines** — so an unresolved ``$HOME`` makes the job's
         log path a literal ``$HOME/.bioagent/runcode/...``. Resolve up front (mirrors
         ``SlurmAnalysisExecutor._resolved_scratch``). If the remote can't expand it (offline/mock), keep
@@ -311,7 +322,7 @@ class SlurmCodeExecutor:
         binds_ro = tuple(p for p in (root, None if inside_root else self.dataset_path, *cache_binds)
                          if p)
         binds_rw = tuple(p for p in (self.work_dir, self.artifacts_dir, scratch) if p)
-        inner = singularity_exec(
+        inner = container_exec(
             image, inner_payload,
             binds_ro=binds_ro, binds_rw=binds_rw, nv=False, network=sandbox_network_enabled(),
             container_bin=self.container_bin,
@@ -451,6 +462,21 @@ class SlurmCodeExecutor:
                         f"{mem_gb or self.mem_gb}G or reduce the snippet's peak memory)")
             out["error"] = (_tail(stderr, 2000).strip() or f"exited with code {returncode}{hint}")
         return out
+
+
+@dataclass
+class UnavailableCodeExecutor:
+    """A ``CodeExecutor`` that runs nothing and says why.
+
+    What the gateway hands the lab when a run's snippets have nowhere they are allowed to run: HPC3
+    is not available to it, and the gateway host is not an option (``app._host_code_allowed``).
+    Every call fails with ``reason``, so the model reads why instead of retrying blind."""
+
+    reason: str
+
+    def __call__(self, code: str) -> dict[str, object]:
+        return {"status": "not_enabled", "note": self.reason, "error": self.reason,
+                "returncode": None, "stdout": "", "stderr": ""}
 
 
 #: Artifact subdirectories that are step SCAFFOLDING, never a step's evidence — the job's own

@@ -139,6 +139,9 @@
     "aliases": [
      "muller",
      "mueller"
+    ],
+    "defining": [
+     "RLBP1"
     ]
    },
    "Retinal astrocyte": {
@@ -153,6 +156,9 @@
     ],
     "aliases": [
      "astrocyte"
+    ],
+    "defining": [
+     "PAX2"
     ]
    },
    "Microglia": {
@@ -356,6 +362,9 @@
     "aliases": [
      "muller",
      "mueller"
+    ],
+    "defining": [
+     "Rlbp1"
     ]
    },
    "Retinal astrocyte": {
@@ -370,6 +379,9 @@
     ],
     "aliases": [
      "astrocyte"
+    ],
+    "defining": [
+     "Pax2"
     ]
    },
    "Microglia": {
@@ -451,5 +463,5 @@
    "RPE"
   ]
  },
- "notes": "Bipolar discriminators cover both classes: VSX2 (all bipolar cells), GRM6/TRPM1 (ON) and GRIK1 (OFF). Without GRIK1, OFF cone bipolar clusters (2026-10-02, human macula: 5 clusters, GRIK1 log2FC +3.1 to +5.2) failed the canonical check. also_marks lists lineages a discriminator canonically marks besides its own (RLBP1/CRALBP: RPE as well as Muller glia); the annotation ignores it, the report's marker-claim check accepts those attributions."
+ "notes": "Bipolar discriminators cover both classes: VSX2 (all bipolar cells), GRM6/TRPM1 (ON) and GRIK1 (OFF). Without GRIK1, OFF cone bipolar clusters (2026-10-02, human macula: 5 clusters, GRIK1 log2FC +3.1 to +5.2) failed the canonical check. also_marks lists lineages a discriminator canonically marks besides its own (RLBP1/CRALBP: RPE as well as Muller glia); the annotation ignores it, the report's marker-claim check accepts those attributions. defining lists the discriminators a label cannot stand without, for a lineage whose other discriminators are shared: GLUL (glutamine synthetase) and GFAP are also expressed by astrocytes, reactive glia and ocular epithelia, so a cluster enriched for GLUL but not RLBP1 is not called Muller glia (run f3b8268c4fd4: a 27-cell Best2/Ptgds/Trpm3 cluster with RLBP1 +0.28 in 44% of cells was), and GFAP without PAX2 is not an astrocyte. A lineage without defining needs any one of its discriminators."
 }

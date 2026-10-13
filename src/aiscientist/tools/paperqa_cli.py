@@ -1,5 +1,5 @@
-"""In-process CLI: run ONE deep-literature (PaperQA) query against the pre-built HPC3 index,
-emit result JSON. The literature-line counterpart of :mod:`aiscientist.tools.variant_cli`.
+"""In-process CLI: run ONE literature step on HPC3 — a deep-literature (PaperQA) query against
+the pre-built index, or the corpus-wide ``extract_haploinsufficient_genes`` scan — and emit result JSON. The literature-line counterpart of :mod:`aiscientist.tools.variant_cli`.
 
 Runs ON HPC3 (where the PubMedBERT index + PDF corpus live under ``/dfs3b`` and the served
 Qwen is reachable), driven by :class:`aiscientist.gateway.slurm_analysis.SlurmAnalysisExecutor`.
@@ -60,13 +60,21 @@ _ARG_TO_ENV = {
 }
 
 
+# The literature tools this entry point runs, all inside paperqa.sif with the same injected
+# deployment config (corpus paths + the served model's endpoint).
+LITERATURE_TOOLS = ("deep_literature", "extract_haploinsufficient_genes")
+# Injected by the executor, never a tool parameter: stripped before a tool sees its args.
+_DEPLOY_KEYS = frozenset({"model", "llm_base_url", "tunnel_port", *_ARG_TO_ENV})
+
+
 def run_tool(tool: str, workspace: str, args: dict[str, Any] | None) -> dict[str, Any]:
-    """Dispatch ONE literature step. Only ``deep_literature`` (PaperQA RAG) exists today."""
+    """Dispatch ONE literature step: ``deep_literature`` (PaperQA RAG, one question) or
+    ``extract_haploinsufficient_genes`` (every paper, two CSVs)."""
     args = args or {}
-    if tool != "deep_literature":
+    if tool not in LITERATURE_TOOLS:
         return {"status": "error", "error": f"unknown literature tool: {tool}"}
     question = str(args.get("question", "")).strip()
-    if not question:
+    if tool == "deep_literature" and not question:
         return {"status": "error", "error": "deep_literature needs a 'question'"}
 
     # Inject deploy config into the environment BEFORE importing paperqa_search (see module docstring).
@@ -112,6 +120,11 @@ def run_tool(tool: str, workspace: str, args: dict[str, Any] | None) -> dict[str
         tunnel_port=args.get("tunnel_port"),
         workspace=workspace,
     )
+    if tool == "extract_haploinsufficient_genes":
+        # Looked up at call time (module attribute), so a test can substitute the pipeline.
+        from .extract_haploinsufficient_genes import tool as hi_tool
+
+        return hi_tool.run_extract({k: v for k, v in args.items() if k not in _DEPLOY_KEYS}, ctx)
     return run_paperqa({"question": question}, ctx)
 
 
@@ -124,7 +137,7 @@ def _load_args(raw: str) -> dict[str, Any]:
 
 
 def main(argv: list[str] | None = None) -> int:
-    ap = argparse.ArgumentParser(description="Run one AiScientist deep-literature (PaperQA) query on HPC3.")
+    ap = argparse.ArgumentParser(description="Run one AiScientist literature step (PaperQA query or corpus scan) on HPC3.")
     ap.add_argument("--tool", required=True)
     ap.add_argument("--workspace", required=True)
     ap.add_argument("--dataset", default="")   # unused (literature needs no dataset); kept for executor uniformity

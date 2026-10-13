@@ -4,8 +4,8 @@ Runs an LLM-generated Python snippet in an **isolated subprocess** — never in 
 gateway process — in a throwaway temp working dir, with a wall-clock timeout and
 (on Linux) CPU + address-space rlimits. On the HPC nodes, pass ``container_image``
 to run the snippet INSIDE the container (``--containall`` + read-only data binds)
-for real filesystem isolation; the same Singularity image already used to serve
-vLLM works here too (RCIC HPC3 provides Singularity, not Apptainer).
+for real filesystem isolation; the same Apptainer runtime already used to serve
+vLLM works here too.
 
 **Network.** Contained code is allowed to reach the network by default
 (:func:`sandbox_network_enabled`; Jin Li 2026-07-08 — prioritize effectiveness, so
@@ -22,6 +22,10 @@ the network, as the serving user). For untrusted code on a shared node, set
 ``container_image`` so it runs contained. The lab only ever sends the snippet *the
 model wrote* — never raw private data — and the DataBoundaryGuard already gates
 what reaches the model.
+
+That is why the gateway builds this sandbox only on a console without accounts
+(``gateway.app._host_code_allowed``). Behind accounts the serving user holds every
+account's saved keys, so there ``run_code`` runs on HPC3 or not at all.
 """
 
 from __future__ import annotations
@@ -42,7 +46,7 @@ def sandbox_network_enabled() -> bool:
     Default ON — Jin Li 2026-07-08: prioritize effectiveness, so tools/skills that need to fetch
     reference data or hit REST APIs (VEP, Ensembl, Europe PMC, downloads) actually work. Set
     ``AISCIENTIST_SANDBOX_NETWORK`` to ``0``/``false``/``off`` to restore full network isolation
-    (``singularity ... --net --network none``)."""
+    (``apptainer ... --net --network none``)."""
     return os.environ.get("AISCIENTIST_SANDBOX_NETWORK", "1").strip().lower() not in {"0", "false", "off", "no", ""}
 
 try:
@@ -185,7 +189,7 @@ class CodeSandbox:
     mem_mb: int = 2048
     python_bin: str = sys.executable
     container_image: str | None = None     # set on HPC nodes for real isolation
-    container_bin: str = "singularity"     # RCIC HPC3 runtime (NOT apptainer)
+    container_bin: str = "apptainer"     # the HPC3 runtime (HPCSettings.container_bin)
     # Network access for contained code. Default from AISCIENTIST_SANDBOX_NETWORK (ON) — see
     # sandbox_network_enabled(); an explicit True/False still overrides per-instance.
     allow_network: bool = field(default_factory=sandbox_network_enabled)
@@ -308,7 +312,7 @@ class CodeSandbox:
         # (numpy/scipy/scanpy/anndata + BLAS/OpenMP) reserves huge *virtual* address
         # space that has little to do with resident memory, so an AS cap kills
         # `import scanpy` outright. Real memory isolation comes from the container
-        # path (Singularity --memory / cgroups), not from rlimits on this process.
+        # path (Apptainer --memory / cgroups), not from rlimits on this process.
 
     def _env(self) -> dict[str, str]:
         env = {
@@ -322,7 +326,7 @@ class CodeSandbox:
                 env[key] = os.environ[key]
         env.setdefault("MPLBACKEND", "Agg")  # never try to open a display
         # matplotlib needs a WRITABLE config/cache dir to build its font cache. The
-        # default ($HOME/.config + $HOME/.cache) is often read-only inside the Singularity
+        # default ($HOME/.config + $HOME/.cache) is often read-only inside the Apptainer
         # container — that surfaced as "Permission denied creating matplotlib cache
         # directories" and killed every plotting snippet. Pin both to a run-owned writable
         # dir so scanpy/matplotlib figures render. (XDG_CACHE_HOME also covers fontconfig.)

@@ -91,7 +91,7 @@ def test_image_file_names():
 def test_a_pull_publishes_atomically_and_keeps_the_layer_cache_off_dfs3b():
     cmd = pull_command("docker://quay.io/biocontainers/x:1", "/dfs/c/x_1.sif")
     assert "pull --name" in cmd and 'mv -n "/dfs/c/x_1.sif.partial.$SLURM_JOB_ID"' in cmd
-    assert "SINGULARITY_CACHEDIR=\"${TMPDIR:-/tmp}" in cmd and "test -s /dfs/c/x_1.sif" in cmd
+    assert "APPTAINER_CACHEDIR=\"${TMPDIR:-/tmp}" in cmd and "test -s /dfs/c/x_1.sif" in cmd
 
 
 def test_a_build_needs_no_root():

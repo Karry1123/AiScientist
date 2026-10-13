@@ -313,9 +313,9 @@ def rotate_key(owner: str, cred_id: str, api_key: str, *,
 def update(owner: str, cred_id: str, *, label: str | None = None, model: str | None = None,
            lab_model: str | None = None, base_url: str | None = None,
            provider: str | None = None) -> dict:
-    """Edit METADATA only — never the key. Changing ``model`` or ``base_url`` invalidates the
-    stored verification (the key was proven against the old pair, not this one), so the row is
-    marked unverified rather than carrying a stale green tick."""
+    """Edit METADATA only — never the key. Changing ``model``, ``lab_model`` or ``base_url``
+    invalidates the stored verification (the key was proven against the old endpoint and models,
+    not these), so the row is marked unverified rather than carrying a stale green tick."""
     rows = _load_index(owner)
     row = _find(rows, cred_id)
     if row is None:
@@ -332,8 +332,9 @@ def update(owner: str, cred_id: str, *, label: str | None = None, model: str | N
     if base_url is not None and base_url != row.get("base_url"):
         row["base_url"] = base_url
         endpoint_changed = True
-    if lab_model is not None:
+    if lab_model is not None and (lab_model or None) != row.get("lab_model"):
         row["lab_model"] = lab_model or None
+        endpoint_changed = True     # the PI/Critic model is tested at save too (see _verify_roles)
 
     if endpoint_changed:
         row["verified_at"] = None

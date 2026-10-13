@@ -117,7 +117,7 @@ def test_sandbox_network_enabled_defaults_on_and_env_toggles_off(monkeypatch):
 
 
 def test_container_command_network_follows_env(monkeypatch):
-    # With a container image, the singularity command isolates the network ONLY when disabled.
+    # With a container image, the apptainer command isolates the network ONLY when disabled.
     monkeypatch.delenv("AISCIENTIST_SANDBOX_NETWORK", raising=False)   # default ON
     cmd, _ = CodeSandbox(container_image="/img/analysis.sif")._command("/tmp/s.py", "/tmp/wd")
     assert "--network" not in cmd and "none" not in cmd            # network allowed → no isolation flags

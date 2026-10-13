@@ -118,30 +118,30 @@ Both extra packages are required:
 The BioContainers image `quay.io/biocontainers/cellqc:0.3.6--pyhdfd78af_1` has everything, but was
 solved with **Python 3.14.7** (checked 2026-10-02), so `nuclear_fraction` fails in it whenever a BAM
 is present. Build a pinned image from the same bioconda packages instead. This needs no root, so it
-works on HPC3, where `--fakeroot` is unavailable. Run it inside a Slurm job: RCIC bans downloads on
+works on HPC3. Run it inside a Slurm job: RCIC bans downloads on
 login nodes.
 
 ```bash
-module load singularity/3.11.3
+module load apptainer/1.4.5
 W=${TMPDIR:-/tmp}/cellqc-build; mkdir -p "$W/pkgs" "$W/tmp"
-export SINGULARITY_TMPDIR=$W/tmp SINGULARITY_CACHEDIR=$W/cache
-singularity build --sandbox "$W/box" docker://mambaorg/micromamba:2.9.0-debian12-slim
+export APPTAINER_TMPDIR=$W/tmp APPTAINER_CACHEDIR=$W/cache
+apptainer build --sandbox "$W/box" docker://mambaorg/micromamba:2.9.0-debian12-slim
 mkdir -p "$W/box/aisci-pkgs" "$W/box/data" "$W/box/dfs3b" "$W/box/pub"
 # --no-mount bind-paths: HPC3 binds /data etc. into every container, which a writable sandbox
 # cannot create mount points for.
-singularity exec --writable --containall --no-mount bind-paths -B "$W/pkgs:/aisci-pkgs" "$W/box" \
+apptainer exec --writable --containall --no-mount bind-paths -B "$W/pkgs:/aisci-pkgs" "$W/box" \
   bash -c 'export CONDA_PKGS_DIRS=/aisci-pkgs MAMBA_ROOT_PREFIX=/opt/conda;
            micromamba install -y -n base -c conda-forge -c bioconda \
              cellqc=0.3.6 r-doubletfinder "python>=3.12,<3.14" && micromamba clean -a -y'
 mkdir -p "$W/box/.singularity.d/env" "$W/box/etc/profile.d"
 echo 'export PATH=/opt/conda/bin:$PATH' > "$W/box/.singularity.d/env/90-conda.sh"
 echo 'export PATH=/opt/conda/bin:$PATH' > "$W/box/etc/profile.d/90-conda.sh"   # for bash -l
-singularity build cellqc_0.3.6_py312.sif "$W/box"
+apptainer build cellqc_0.3.6_py312.sif "$W/box"
 
-singularity exec cellqc_0.3.6_py312.sif python --version   # Python 3.12.x
+apptainer exec cellqc_0.3.6_py312.sif python --version   # Python 3.12.x
 ```
 
-Then put `singularity exec --containall -B <data> -B <outdir> cellqc_0.3.6_py312.sif` in front of
+Then put `apptainer exec --containall -B <data> -B <outdir> cellqc_0.3.6_py312.sif` in front of
 every `cellqc` command below. AiScientist's `run_cellqc` tool declares exactly this recipe
 (`image: "bioconda:cellqc=0.3.6 r-doubletfinder python=3.12"`) and the platform builds it once, on
 first use, into the shared containers directory.

@@ -66,12 +66,15 @@ AnnData and `.copy()`-s large subsets in a loop can exhaust host RAM and be OOM-
 (`returncode == -9`). So a script must keep peak memory modest: subset with a **view** (not
 `.copy()`), delete intermediates, and aggregate (pseudobulk) before heavy ops.
 
-Set `AISCIENTIST_RUN_CODE_ON_HPC=1` to instead submit each snippet as a **Singularity-contained CPU
+Set `AISCIENTIST_RUN_CODE_ON_HPC=1` to instead submit each snippet as a **Apptainer-contained CPU
 batch job on HPC3** (`SlurmCodeExecutor`), where CPU/RAM are effectively unlimited and
 `#SBATCH --mem` is a **real, cgroup-enforced cap** — an over-budget snippet fails cleanly as
 `OUT_OF_MEMORY` instead of taking down the shared server. The dataset is bind-mounted **read-only**;
 only the run's work/artifacts are writable; the network is off. If HPC is unavailable the executor
-falls back to the local sandbox. Example sbatch request it generates (CPU analysis job):
+falls back to the local sandbox **only on a console without accounts**. On a deployment with
+accounts a snippet never runs on the gateway host (the service user there can read every account's
+saved keys): `run_code` needs this switch, and a snippet that cannot run on HPC3 fails with the
+reason instead. Example sbatch request it generates (CPU analysis job):
 
 ```bash
 #!/bin/bash
@@ -81,15 +84,15 @@ falls back to the local sandbox. Example sbatch request it generates (CPU analys
 #SBATCH --cpus-per-task=8
 #SBATCH --mem=64G                        # <-- the real, cgroup-enforced memory cap
 #SBATCH --time=01:00:00
-#SBATCH --output=$HOME/.bioagent/runcode/bioagent_runcode_3-%j.log
+#SBATCH --output=/dfs3b/ruic20_lab/software/AiScientist/Temp/<user>/scratch/runcode/bioagent_runcode_3-%j.log
 
 set -euo pipefail
-module load singularity/3.11.3 2>/dev/null || true
-singularity exec --containall --writable-tmpfs --net --network none \
+module load apptainer/1.4.5 2>/dev/null || true
+apptainer exec --containall --writable-tmpfs --net --network none \
   -B "$AISCIENTIST_DATASET":"$AISCIENTIST_DATASET":ro \
   -B "$AISCIENTIST_WORK":"$AISCIENTIST_WORK" -B "$AISCIENTIST_ARTIFACTS":"$AISCIENTIST_ARTIFACTS" \
   /dfs3b/ruic20_lab/software/AiScientist/containers/analysis.sif \
-  bash -lc 'python $HOME/.bioagent/runcode/snippet_3.py > out 2> err; echo $? > rc'
+  bash -lc 'python <scratch>/snippet_3.py > out 2> err; echo $? > rc'   # <scratch> = the --output dir
 ```
 
 Tune with `AISCIENTIST_RUN_CODE_MEM_GB` (default 64), `AISCIENTIST_CPU_PARTITION`, `AISCIENTIST_CPU_ACCOUNT`,

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 import re
 
 from dataclasses import dataclass, field
@@ -24,6 +25,7 @@ class MockState:
     gpu_name: str = "NVIDIA L40S"
     tick: int = 0
     staged_files: list[tuple[str, str]] = field(default_factory=list)  # (local, remote) put_file calls
+    remote_sizes: dict[str, int] = field(default_factory=dict)          # what put_file "wrote"
 
 
 class MockExecutor:
@@ -119,6 +121,10 @@ class MockExecutor:
     def put_file(self, local_path: str, remote_path: str) -> None:
         # No real remote FS in mock mode; record the staging request, do nothing.
         self.state.staged_files.append((local_path, remote_path))
+        try:
+            self.state.remote_sizes[remote_path] = os.path.getsize(local_path)
+        except OSError:
+            pass
 
     def get_file(self, remote_path: str, local_path: str) -> None:
         # No real remote FS in mock mode; nothing to fetch.
@@ -130,7 +136,8 @@ class MockExecutor:
         return b""
 
     def remote_size(self, remote_path: str) -> int:
-        return 0
+        # The size of what put_file was handed, so a staged upload's size check passes in mock mode.
+        return self.state.remote_sizes.get(remote_path, 0)
 
     def open_tunnel(self, remote_host: str, remote_port: int, local_port: int = 0) -> int:
         # No real socket in mock mode; echo a fixed local_port if pinned, else a

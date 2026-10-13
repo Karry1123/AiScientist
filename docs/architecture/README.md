@@ -19,16 +19,16 @@ jobs on UCI HPC3), the Critic reviews every step, and the run ends in a cited ma
 
 The code namespace is `aiscientist` (package, `AISCIENTIST_*` env vars). A `bioagent` import alias and
 the legacy `BIOAGENT_*` env names still work, and a few runtime identifiers outside the repository keep
-the old name (`/data/BioAgent`, the `bioagent` systemd unit, Slurm job names). See `CLAUDE.md`.
+the old name (Slurm job names, `~/.bioagent` on HPC3, the Postgres role). See `CLAUDE.md`.
 
 ## Where it runs
 
 ```mermaid
 flowchart LR
     browser["Browser: console UI"] <-->|"HTTPS + WebSocket"| envoy["Envoy ingress<br/>AiScientist.eye.som.uci.edu"]
-    envoy -->|"proxies"| gw["AiScientist gateway on eyeserver :8800<br/>systemd unit bioagent · FastAPI + WebSocket"]
+    envoy -->|"proxies"| gw["AiScientist gateway on eyeserver :8800<br/>systemd unit aiscientist · FastAPI + WebSocket"]
     gw -->|"accounts, runs, chats"| pg[("Postgres")]
-    gw -->|"run files, uploads, keys"| data[("/data/BioAgent")]
+    gw -->|"run files, uploads, keys"| data[("/data/aiscientist")]
     gw -->|"sync code, stage data"| dfs[("dfs3b shared root")]
     gw <-->|"LLM calls via SSH tunnel"| vllm["HPC3 GPU job: vLLM"]
     gw -->|"shell tools via SSH"| worker["HPC3 held CPU worker"]
@@ -40,7 +40,7 @@ flowchart LR
 ```
 
 The gateway orchestrates and never does the heavy compute. On each connect it syncs its own code to
-`pysrc/<user>` on dfs3b; Slurm jobs bind-mount that code into purpose-built Singularity images, so a
+`pysrc/<user>` on dfs3b; Slurm jobs bind-mount that code into purpose-built Apptainer images, so a
 tool change never needs an image rebuild. All gateway-to-HPC3 traffic goes over one SSH session per
 user. Deploys use `scripts/sync_deploy.sh` (rsync; the server never git-pulls).
 

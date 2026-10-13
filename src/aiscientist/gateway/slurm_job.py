@@ -1,20 +1,22 @@
 """Submit and supervise a one-shot Slurm **batch** job on HPC3 with robust startup.
 
 Unlike the long-lived vLLM serve job (``gpu.ensure_serve_job``, which raises if the
-GPU queue is slow), an analysis job is a batch job: it runs a Singularity-contained
+GPU queue is slow), an analysis job is a batch job: it runs an Apptainer-contained
 step (scanpy / CodeAct), writes its outputs to shared DFS, and exits. The hard part on
 a shared cluster is the QUEUE — the job may sit PENDING a long time. This module
 implements the lifecycle the product needs:
 
-    submit   ->  wait PENDING -> RUNNING within ``startup_timeout_s``
-             ->  if it never starts in time: ``scancel`` it and RESUBMIT
-             ->  (bounded by ``max_attempts`` — a long queue is not a hard failure)
+    submit   ->  wait PENDING -> RUNNING, in ``max_attempts`` windows of ``startup_timeout_s``
+             ->  a job that is merely queued KEEPS ITS PLACE across windows (a resubmit
+                 would send it to the back of the queue)
+             ->  resubmit only a job Slurm holds or one that died on startup
+             ->  out of windows: ``scancel`` it and fail (a long queue, not a broken job)
     RUNNING  ->  wait for COMPLETE within ``run_timeout_s`` (else scancel + fail)
              ->  return the terminal Slurm state + the node it ran on
 
 Everything goes through the ``RemoteExecutor`` protocol, so the whole lifecycle runs
-offline against a scripted fake in tests — no real Slurm, no SSH. The Singularity
-command builder (``singularity_exec``) bind-mounts the dataset **read-only** so even
+offline against a scripted fake in tests — no real Slurm, no SSH. The container
+command builder (``container_exec``) bind-mounts the dataset **read-only** so even
 contained code can't modify or delete the raw data; only work/artifacts are writable,
 and ``--containall`` hides every other host path.
 """
@@ -24,6 +26,7 @@ from __future__ import annotations
 import shlex
 import time
 from dataclasses import dataclass
+from datetime import datetime
 from typing import Callable, Protocol
 
 from .errors import GatewayError
@@ -79,19 +82,24 @@ def _noop_emit(level: str, stage: str, message: str) -> None:  # pragma: no cove
 
 @dataclass
 class SlurmJobSpec:
-    """A complete ``#!/bin/bash`` sbatch script + a per-user job name."""
+    """A complete ``#!/bin/bash`` sbatch script + a per-user job name.
+
+    ``submit_dir`` is where the script file is written. It has no default on purpose: every job
+    line names a directory under the application's own storage (``<shared_root>/Temp/<user>/``),
+    so nothing lands in the user's home directory because a caller left it out."""
 
     script: str
     job_name: str
-    submit_dir: str = "$HOME/.bioagent/jobs"
+    submit_dir: str
 
 
 @dataclass
 class AcquireConfig:
-    """How patiently to wait for a node before cancelling and re-requesting."""
+    """How patiently to wait for a node. The total wait is ``startup_timeout_s * max_attempts``;
+    a queued job waits it out as ONE submission, and only a held or dead job is resubmitted."""
 
-    startup_timeout_s: int = 180     # PENDING->RUNNING budget per attempt
-    max_attempts: int = 3            # how many times to (re)submit if it won't start
+    startup_timeout_s: int = 180     # one waiting window (a progress line is emitted at each)
+    max_attempts: int = 3            # windows to wait = the most submissions a broken job gets
     poll_interval_s: float = 3.0
 
 
@@ -139,10 +147,10 @@ def slurm_time_to_seconds(hms: str, default: int = 7200) -> int:
         return default
 
 
-# --- Singularity command builder --------------------------------------------
+# --- Container command builder ----------------------------------------------
 
 
-def singularity_exec(
+def container_exec(
     image: str,
     command: str,
     *,
@@ -150,9 +158,9 @@ def singularity_exec(
     binds_rw: tuple[str, ...] = (),
     nv: bool = False,
     network: bool = False,
-    container_bin: str = "singularity",
+    container_bin: str = "apptainer",
 ) -> str:
-    """Build a ``singularity exec`` line that runs ``command`` fully contained.
+    """Build an ``apptainer exec`` line that runs ``command`` fully contained.
 
     - ``--containall`` hides every host path except the explicit binds (no $HOME, /tmp).
     - ``--writable-tmpfs`` gives an ephemeral writable overlay, discarded on exit.
@@ -173,6 +181,10 @@ def singularity_exec(
     return " ".join(parts)
 
 
+# The name before the 2026-10-09 move to Apptainer; the CLI is the same.
+singularity_exec = container_exec
+
+
 def build_analysis_script(
     job_name: str,
     inner_command: str,
@@ -189,7 +201,7 @@ def build_analysis_script(
 ) -> str:
     """A batch sbatch script that runs one contained analysis command and exits.
 
-    ``inner_command`` is typically a ``singularity_exec(...)`` string. Pass ``gres``
+    ``inner_command`` is typically a ``container_exec(...)`` string. Pass ``gres``
     (e.g. ``"gpu:1"``) to request a GPU — the default empty value yields a CPU-only job.
     The log path is relative to the submit dir (Slurm does not expand ``$HOME`` in
     ``#SBATCH``)."""
@@ -262,6 +274,32 @@ def _queue_state(executor: RemoteExecutor, job_id: str) -> tuple[str, str]:
     return fields[0].strip(), (fields[1].strip() if len(fields) > 1 else "")
 
 
+def _pending_info(executor: RemoteExecutor, job_id: str) -> tuple[str, "float | None", str]:
+    """Why a queued job has not started and when Slurm expects it to: ``(reason, seconds until the
+    expected start, that start as text)``. The reason is squeue's (``Priority``, ``Resources``,
+    ``JobHeldAdmin`` ...); the start is the backfill scheduler's estimate, ``None``/``""`` when it
+    has none. ``date`` runs in the same command, so the difference is taken on the cluster's clock."""
+    r = _query(executor, f"squeue -j {job_id} --noheader --format='%r|%S'; date +%Y-%m-%dT%H:%M:%S")
+    lines = [ln.strip() for ln in (r.out or "").splitlines() if ln.strip()]
+    if not lines:
+        return "", None, ""
+    reason, _, start = lines[0].partition("|")
+    reason, start = reason.strip(), start.strip()
+    try:
+        fmt = "%Y-%m-%dT%H:%M:%S"
+        wait_s = (datetime.strptime(start, fmt) - datetime.strptime(lines[-1], fmt)).total_seconds()
+    except ValueError:                      # "N/A", "Unknown", or a host with no usable clock line
+        return reason, None, ""
+    return reason, wait_s, start
+
+
+def _is_held(reason: str) -> bool:
+    """A hold is on the JOB (``JobHeldAdmin``, ``JobHeldUser``, ``launch failed requeued held``,
+    ``job requeued in held state``): it will not start however long it waits, and a new submission
+    does not carry the hold. Every other pending reason is the queue, where waiting is what works."""
+    return "held" in reason.lower()
+
+
 def _terminal_state(executor: RemoteExecutor, job_id: str) -> str:
     """The job's sacct State (COMPLETED|FAILED|RUNNING|...), or ``""`` if sacct has no
     record yet. Unlike before, this does NOT optimistically default to ``COMPLETED`` —
@@ -290,9 +328,16 @@ def acquire_allocation(
     on_submit: Callable[[str], None] | None = None,
     should_cancel: "Callable[[], bool] | None" = None,
 ) -> tuple[str, str, int]:
-    """Submit and wait for RUNNING. If startup exceeds ``startup_timeout_s`` (a long
-    queue), ``scancel`` the job and resubmit, up to ``max_attempts``. Returns
-    ``(job_id, node, attempt)``; raises ``SlurmJobError`` if no attempt ever starts.
+    """Submit and wait for RUNNING, for up to ``max_attempts`` windows of ``startup_timeout_s``.
+    Returns ``(job_id, node, submissions)``; raises ``SlurmJobError`` if the job never starts.
+
+    A job that is only QUEUED keeps its place from one window to the next. It used to be
+    ``scancel``-led and resubmitted at every window, and a new job joins the back of the queue with
+    no age: on a busy partition (2026-10-09, `standard`, ~40 min wait) three 10-minute attempts each
+    started from the back, so a job Slurm would have started was cancelled three times over. Only a
+    job Slurm HOLDS, or one that died on startup, is replaced by a new submission. When the windows
+    run out and Slurm expects the job to start within one more, it gets that one more window rather
+    than being cancelled minutes before its turn.
 
     ``on_submit`` (if given) is called with the ``job_id`` the instant ``sbatch`` accepts
     the job — before we wait for a node — so a caller can durably record it (see
@@ -300,42 +345,73 @@ def acquire_allocation(
     persisted id always points at the attempt currently in the queue."""
     config = config or AcquireConfig()
     emit = emit or _noop_emit
-    for attempt in range(1, config.max_attempts + 1):
-        job_id = _submit(executor, spec)
-        if on_submit is not None:
-            on_submit(job_id)
-        emit("step", "slurm",
-             f"Submitted {spec.job_name} as job {job_id} (attempt {attempt}/{config.max_attempts}); "
-             "waiting for a node ...")
+    windows_left = config.max_attempts
+    submissions = 0
+    waited_s = 0.0
+    extended = False
+    job_id = ""                     # the job currently in the queue; "" = submit a new one
+    reason = ""
+    while windows_left > 0:
+        if not job_id:
+            submissions += 1
+            job_id = _submit(executor, spec)
+            if on_submit is not None:
+                on_submit(job_id)
+            emit("step", "slurm",
+                 f"Submitted {spec.job_name} as job {job_id} (submission {submissions}); "
+                 "waiting for a node ...")
+        windows_left -= 1
         deadline = time.monotonic() + config.startup_timeout_s
-        timed_out = True
+        died = False
         while time.monotonic() < deadline:
             _check_cancel(executor, job_id, should_cancel, emit)   # Stop honoured while queued
             state, node = _queue_state(executor, job_id)
             if state == _RUNNING and node:
                 emit("success", "slurm", f"Job {job_id} is RUNNING on {node}.")
-                return job_id, node, attempt
+                return job_id, node, submissions
             if state == "":
                 # Already left the queue during startup — a fast batch job may have run
                 # and exited; let the caller's completion check sort out the exit state.
                 emit("info", "slurm", f"Job {job_id} already left the queue.")
-                return job_id, node, attempt
+                return job_id, node, submissions
             if state in _DEAD_STATES:
                 emit("warning", "slurm", f"Job {job_id} died on startup (state {state}); re-requesting ...")
-                timed_out = False
+                died = True
                 break
             if state == _PENDING:
                 emit("info", "slurm", f"Job {job_id} pending in the queue ...")
             time.sleep(config.poll_interval_s)
-        if timed_out:
-            # The user-specified behaviour: startup took too long -> kill it and re-request.
+        if died:
+            job_id = ""
+            continue
+        waited_s += config.startup_timeout_s
+        reason, eta_s, eta = _pending_info(executor, job_id)
+        why = f" ({reason})" if reason else ""
+        if _is_held(reason):
             emit("warning", "slurm",
-                 f"Job {job_id} did not start within {config.startup_timeout_s}s (queue too long); "
+                 f"Job {job_id} is held by Slurm{why} and will not start as it is; "
                  "cancelling and re-requesting.")
             executor.exec(f"scancel {job_id}")
+            job_id = ""
+            continue
+        expects = f"; Slurm expects it to start at {eta}" if eta else ""
+        if windows_left > 0:
+            emit("info", "slurm",
+                 f"Job {job_id} is still queued after {waited_s:.0f}s{why}{expects}. "
+                 "Keeping its place in the queue.")
+        elif not extended and eta_s is not None and eta_s <= config.startup_timeout_s:
+            extended = True
+            windows_left = 1
+            emit("info", "slurm",
+                 f"Job {job_id} is still queued after {waited_s:.0f}s{why}{expects}: "
+                 "waiting for that rather than giving up its place.")
+    if job_id:
+        executor.exec(f"scancel {job_id}")
+    total_s = config.startup_timeout_s * (config.max_attempts + (1 if extended else 0))
+    why = f"; Slurm's reason: {reason}" if reason else ""
     raise SlurmJobError(
-        f"{spec.job_name} could not get a node after {config.max_attempts} attempts "
-        "(the queue stayed too long).",
+        f"{spec.job_name} did not get a node within {total_s:.0f}s over {submissions} submission(s) "
+        f"(the cluster queue is too long right now, not a fault in the job{why}).",
     )
 
 

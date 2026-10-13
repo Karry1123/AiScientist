@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import asyncio
-import io
+import functools
 import json
 import mimetypes
 import os
@@ -20,8 +20,9 @@ from typing import Any, Callable, NamedTuple
 from uuid import uuid4
 
 from fastapi import FastAPI, File, Form, Request, UploadFile, WebSocket, WebSocketDisconnect
-from fastapi.responses import HTMLResponse, JSONResponse, Response
+from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, Response
 from pydantic import BaseModel
+from starlette.background import BackgroundTask
 
 from ..core.config import load_project_env
 from . import cluster_models, gpu, vllm_client
@@ -30,6 +31,8 @@ from ..tools import api as _tools_api   # the tools' public surface (see tools/a
 # and testable without the web stack). Aliased so every call site reads the same as before.
 from ..integrations.safety import endpoint_is_off_host as _endpoint_is_off_host
 from . import hpc_gc                      # shared-root bootstrap + the HPC3 Temp sweeper
+from . import staging                     # background copies of uploads to HPC3
+from . import upload_log                  # what happened to each upload, per user
 from .errors import GatewayError, VLLMNetworkError, error_detail
 from .executor import RemoteExecutor
 from .mock_host import MockExecutor
@@ -44,7 +47,7 @@ load_project_env(ROOT)
 
 # Where results live on the gateway host (eyeserver), partitioned per SSH user:
 # <results_dir>/<ucinetid>/<run_id>/artifacts/...
-# On eyeserver set AISCIENTIST_RESULTS_DIR=/data/BioAgent (the big /data disk, not
+# On eyeserver set AISCIENTIST_RESULTS_DIR=/data/aiscientist (the big /data disk, not
 # /home). Defaults to runs/console for local development.
 CONSOLE_RUNS_DIR = Path(os.environ.get("AISCIENTIST_RESULTS_DIR") or (ROOT / "runs" / "console")).resolve()
 
@@ -703,6 +706,7 @@ def _ssh_connect_blocking(conn: Connection, req: ConnectRequest) -> None:
         conn.push({"type": "duo_done"})
 
     _prepare_shared_storage(conn)
+    _resume_staging(conn)
 
     emit("success", "ssh_connect",
          f"SSH session to {settings.host} is ready — allocating the GPU and starting the model next.")
@@ -802,7 +806,7 @@ def _provision_gpu_blocking(conn: Connection) -> None:
     conn.llm_info = vllm_client.ensure_installed(conn.executor, settings, emit)
     conn.broadcast_status()
 
-    # 3. GPU allocation running the vLLM serve job (singularity + vllm serve)
+    # 3. GPU allocation running the vLLM serve job (apptainer + vllm serve)
     before = conn.alloc
     conn.alloc = gpu.ensure_serve_job(conn.executor, settings, emit,
                                       wait_seconds=int(getattr(settings, "gpu_wait_seconds", 300) or 300))
@@ -1115,6 +1119,12 @@ def _init_accounts() -> None:
             print("[auth] *** SECURITY: AISCIENTIST_PUBLIC_HTTPS is set but AISCIENTIST_SECRET_KEY is the "
                   "built-in dev secret — session cookies are FORGEABLE. Set a strong "
                   "AISCIENTIST_SECRET_KEY before exposing this publicly. ***")
+        # With accounts on, run_code never runs on this host (_host_code_allowed), so without the
+        # HPC3 route the tool answers "not available" to every call. Say so once, at startup.
+        if not HPCSettings.from_env().run_code_on_hpc:
+            print("[auth] accounts are on and AISCIENTIST_RUN_CODE_ON_HPC is off: run_code is "
+                  "unavailable (model-written code never runs on this host for an account). "
+                  "Set AISCIENTIST_RUN_CODE_ON_HPC=1 to run it as Slurm jobs on HPC3.")
     except Exception as exc:  # noqa: BLE001 - never block the console from starting
         print(f"[auth] account subsystem not initialized: {type(exc).__name__}: {exc}")
 
@@ -1156,8 +1166,88 @@ def _optional_user(request: Request):
         return None
 
 
+def _conn_owner_error(conn: "Connection", request: "Request | WebSocket") -> "JSONResponse | None":
+    """With accounts on, the response refusing a request on a connection the caller does not own
+    (401 logged out, 403 another account's), else None. Strict: a connection opened without a login
+    belongs to nobody, because its workspace is named after whatever ``ucinetid`` that request sent."""
+    if not _AUTH_ENABLED:
+        return None
+    user = _optional_user(request)
+    if user is None:
+        return JSONResponse({"error": "Not authenticated"}, status_code=401)
+    if conn.app_user_id is None or conn.app_user_id != user.id:
+        return JSONResponse({"error": "This connection belongs to another account."}, status_code=403)
+    return None
+
+
+class _Refused(Exception):
+    """A request turned away before its handler does anything; :func:`_refused` answers it with
+    ``response``. Lets one line at the top of a route both look up and guard what it acts on."""
+
+    def __init__(self, response: JSONResponse) -> None:
+        super().__init__(response.status_code)
+        self.response = response
+
+
+@app.exception_handler(_Refused)
+async def _refused(_request: Request, exc: _Refused) -> JSONResponse:
+    return exc.response
+
+
+def _owned_conn(connection_id: Any, request: Request, *,
+                missing: tuple[str, int] = ("Unknown connection id", 404)) -> "Connection":
+    """The connection a request names, only if the caller owns it (see :func:`_conn_owner_error`);
+    else raises :class:`_Refused`. Every route that acts on a connection goes through here: the id is
+    a uuid4 the browser keeps in localStorage, which is a bearer token, not proof of who is asking."""
+    conn = CONNECTIONS.get(str(connection_id or ""))
+    if conn is None:
+        raise _Refused(JSONResponse({"error": missing[0]}, status_code=missing[1]))
+    refused = _conn_owner_error(conn, request)
+    if refused is not None:
+        raise _Refused(refused)
+    return conn
+
+
+def _is_admin(user: Any) -> bool:
+    return getattr(user, "role", "") == "admin"
+
+
+def _owner_dir_error(owner: str, request: Request) -> "JSONResponse | None":
+    """With accounts on, the response refusing a read of ``<results>/<owner>/…`` by anyone but that
+    account (an admin may read any), else None. ``owner`` is a path segment the URL supplies."""
+    if not _AUTH_ENABLED:
+        return None
+    user = _optional_user(request)
+    if user is None:
+        return JSONResponse({"error": "Not authenticated"}, status_code=401)
+    if owner != safe_name(user.username) and not _is_admin(user):   # the exact segment the route reads
+        return JSONResponse({"error": "These results belong to another account."}, status_code=403)
+    return None
+
+
 @app.post("/api/connect")
 async def connect(req: ConnectRequest, request: Request) -> JSONResponse:
+    # Two-layer identity: the AiScientist account owns the workspace/history; req.ucinetid
+    # is only the HPC3 SSH login (used by the provisioning thread). With accounts on, a connect
+    # needs a login: the workspace (uploads, runs, results), the saved SSH and API keys and the
+    # connection itself are the account's, so a logged-out connect would have to take them from
+    # whatever ucinetid the request names. With accounts off (a single-user console) it still does.
+    app_user = _optional_user(request)
+    if _AUTH_ENABLED and app_user is None:
+        return JSONResponse({"error": "Log in to connect."}, status_code=401)
+    owner_name = app_user.username if app_user else req.ucinetid
+    if _AUTH_ENABLED and req.mock and not _is_admin(app_user):
+        # A mock session has no HPC3 behind it, so its run_code and analysis tools run on THIS host,
+        # as the service account that can read every user's stored keys.
+        return JSONResponse({"error": "Mock mode is for admins: it runs the agent's code on the "
+                                      "gateway server instead of HPC3."}, status_code=403)
+    if _AUTH_ENABLED and not req.mock and (req.key_path or "").strip():
+        from . import ssh_credentials
+        own = ssh_credentials.own_key_path(safe_name(owner_name), req.key_path)
+        if own is None:
+            return JSONResponse({"error": "That key file is not one of your saved SSH keys.",
+                                 "stage": "precheck"}, status_code=403)
+        req.key_path = own
     settings = HPCSettings.from_env()
     if req.host:
         settings.host = req.host
@@ -1183,11 +1273,6 @@ async def connect(req: ConnectRequest, request: Request) -> JSONResponse:
         )
 
     loop = asyncio.get_running_loop()
-    # Two-layer identity: the AiScientist account owns the workspace/history; req.ucinetid
-    # is only the HPC3 SSH login (used by the provisioning thread). When logged in, the
-    # app user is the workspace owner so datasets/runs bind to the right account.
-    app_user = _optional_user(request)
-    owner_name = app_user.username if app_user else req.ucinetid
     # The LLM choice is resolved BEFORE the connection is registered, because it decides whether
     # this connect allocates a GPU at all — and because a refused consent must not leave a
     # half-built session behind.
@@ -1207,6 +1292,7 @@ async def connect(req: ConnectRequest, request: Request) -> JSONResponse:
                     "needs_consent": True,
                     "endpoint": {"label": cred.get("label"), "base_url": cred.get("base_url"),
                                  "model": cred.get("model"), "lab_model": cred.get("lab_model")},
+                    **_EGRESS_DISCLOSURE,
                 }, status_code=409)
             llm_credentials.record_egress_consent(safe_name(owner_name), cred_id)
 
@@ -1240,11 +1326,14 @@ async def connect(req: ConnectRequest, request: Request) -> JSONResponse:
 
 
 def _cred_owner(request: Request, fallback: str = "") -> str:
-    """Whose SSH credentials to touch: the logged-in account when accounts are on (so a
-    caller can never read another account's keys), else the given UCInetID."""
+    """Whose SSH / API credentials to touch: the logged-in account when accounts are on (so a
+    caller can never read another account's keys), else the given UCInetID. With accounts on and
+    no login it raises :class:`_Refused` (401): the request's own ``user`` names nobody's keys."""
     user = _optional_user(request)
     if user is not None:
         return safe_name(user.username)
+    if _AUTH_ENABLED:
+        raise _Refused(JSONResponse({"error": "Not authenticated"}, status_code=401))
     return safe_name(fallback or "guest")
 
 
@@ -1300,12 +1389,52 @@ class LLMCredentialUpdate(BaseModel):
     user: str = ""
 
 
-def _verify_or_raise(base_url: str, api_key: str, model: str | None) -> None:
+#: What an off-host API endpoint receives, shown before the user consents. The credential's model
+#: runs the Scientist's tool loop as well as the planning roles, so the tool calls and their results
+#: go to the provider too — summaries, statistics and table PREVIEWS, never the data files.
+_EGRESS_DISCLOSURE = {
+    "sends": ["the research question and your mid-run notes",
+              "the dataset profile (shape, columns, QC summary — not the matrix)",
+              "the Scientist's tool calls and their results: summaries, statistics and short "
+              "previews of result tables",
+              "accepted findings, artifact digests, and the planning, critique and write-up prompts"],
+    "stays": ["your uploaded data files and full result tables: the tools run on HPC3 and only "
+              "their summaries and previews are sent"],
+}
+
+
+def _verify_roles(base_url: str, api_key: str, model: str | None, lab_model: str | None,
+                  provider: str | None):
+    """Verify the Scientist's model and, when a different one is set, the PI/Critic model too.
+
+    The dialog asks for the PI/Critic model FIRST (it is the one people mean by "which model"),
+    yet only ``model`` — the Scientist's — used to be tested: a mistyped PI/Critic id saved with a
+    green tick and failed at the first planning call of a run. One extra one-word ping, only when
+    the two differ. ``verified_model`` stays the Scientist's, which is what that column records.
+    """
+    from . import llm_providers
+    result = llm_providers.verify(base_url, api_key, model, provider=provider)
+    split = bool(model and lab_model and lab_model != model)
+    if not split:
+        return result
+    if not result.ok:
+        return llm_providers.VerifyResult(False, result.cause,
+                                          f"Scientist model {model}: {result.message}", result.models)
+    lab = llm_providers.verify(base_url, api_key, lab_model, provider=provider)
+    if lab.ok:
+        return result
+    return llm_providers.VerifyResult(False, lab.cause,
+                                      f"PI/Critic model {lab_model}: {lab.message}", lab.models)
+
+
+def _verify_or_raise(base_url: str, api_key: str, model: str | None, *,
+                     provider: str | None = None, lab_model: str | None = None) -> None:
     """The ``verify`` callable handed to the credential store. Raises :class:`GatewayError`
     carrying the provider's actual cause, so the UI can say *which* of the four problems it
-    is — a bad key, an empty account, a wrong model id, or an unreachable endpoint."""
-    from . import llm_providers
-    result = llm_providers.verify(base_url, api_key, model)
+    is — a bad key, an empty account, a wrong model id, or an unreachable endpoint.
+    ``provider`` picks the wire protocol (an Anthropic key is tested through its native API);
+    ``lab_model`` is the PI/Critic model, tested as well when it differs from ``model``."""
+    result = _verify_roles(base_url, api_key, model, lab_model, provider)
     if not result.ok:
         raise GatewayError(result.message, stage=f"llm_verify_{result.cause}")
 
@@ -1341,6 +1470,8 @@ async def list_cluster_models(request: Request, connection_id: str = "") -> JSON
     models = [m.public() for m in cluster_models.load()]
     disk: dict[str, float] | None = None
     conn = CONNECTIONS.get(connection_id) if connection_id else None
+    if conn is not None and _conn_owner_error(conn, request) is not None:
+        conn = None                    # someone else's session: list without scanning over its SSH
     if conn and not conn.mock and getattr(conn, "executor", None):
         try:
             disk = await asyncio.to_thread(cluster_models.scan_disk, conn.executor, conn.settings)
@@ -1420,6 +1551,7 @@ class LLMModelsProbe(BaseModel):
     base_url: str = ""
     api_key: str = ""
     credential_id: str = ""   # use the key already stored for this credential instead
+    provider: str = ""        # the preset key; "anthropic" lists models through the native API
     user: str = ""
 
 
@@ -1442,6 +1574,7 @@ async def probe_llm_models(req: LLMModelsProbe, request: Request) -> JSONRespons
     owner = _cred_owner(request, req.user)
     base_url = llm_providers.normalize_base_url(req.base_url)
     api_key = req.api_key.strip()
+    provider = req.provider or None
 
     if req.credential_id and not api_key:
         row = llm_credentials.get_credential(owner, req.credential_id)
@@ -1449,6 +1582,7 @@ async def probe_llm_models(req: LLMModelsProbe, request: Request) -> JSONRespons
             return JSONResponse({"error": "Credential not found.", "cause": "endpoint"},
                                 status_code=404)
         base_url = llm_providers.normalize_base_url(row.get("base_url", ""))
+        provider = row.get("provider") or None
         try:
             api_key = llm_credentials.resolve_secret(owner, req.credential_id) or ""
         except GatewayError as exc:
@@ -1457,7 +1591,8 @@ async def probe_llm_models(req: LLMModelsProbe, request: Request) -> JSONRespons
             return JSONResponse({"error": "This credential's key file is missing.",
                                  "cause": "auth"}, status_code=400)
 
-    result = await asyncio.to_thread(llm_providers.probe_models, base_url, api_key)
+    result = await asyncio.to_thread(llm_providers.probe_models, base_url, api_key,
+                                     provider=provider)
     if not result.ok:
         return JSONResponse({"error": result.message, "cause": result.cause, "models": []},
                             status_code=400)
@@ -1468,6 +1603,7 @@ async def probe_llm_models(req: LLMModelsProbe, request: Request) -> JSONRespons
 async def create_llm_credential(req: LLMCredentialRequest, request: Request) -> JSONResponse:
     from . import llm_credentials, llm_providers
 
+    owner = _cred_owner(request, req.user)       # 401 when accounts are on and nobody is logged in
     # No logged-in account and no UCInetID means there is nowhere to file this: it would land in
     # the anonymous "guest" bucket, where the session — which resolves its owner from the UCInetID
     # it logged in with — never looks. Refusing is the honest outcome, because a key that verifies,
@@ -1481,10 +1617,11 @@ async def create_llm_credential(req: LLMCredentialRequest, request: Request) -> 
     base_url = llm_providers.normalize_base_url(req.base_url or (preset.base_url if preset else ""))
     try:
         cred = await asyncio.to_thread(
-            llm_credentials.create, _cred_owner(request, req.user),
+            llm_credentials.create, owner,
             provider=req.provider, base_url=base_url, model=req.model.strip(),
             api_key=req.api_key, label=req.label, lab_model=(req.lab_model or None),
-            verify=_verify_or_raise,
+            verify=functools.partial(_verify_or_raise, provider=req.provider,
+                                     lab_model=(req.lab_model or None)),
         )
     except GatewayError as exc:
         return _llm_error(exc)
@@ -1524,12 +1661,16 @@ async def update_llm_credential(cred_id: str, req: LLMCredentialUpdate,
                                       provider=req.provider)
         if req.api_key.strip():
             cred = await asyncio.to_thread(llm_credentials.rotate_key, owner, cred_id,
-                                           req.api_key, verify=_verify_or_raise)
+                                           req.api_key,
+                                           verify=functools.partial(_verify_or_raise,
+                                                                    provider=cred.get("provider"),
+                                                                    lab_model=cred.get("lab_model")))
         elif cred.get("model") and not cred.get("verified_at"):
             secret = llm_credentials.resolve_secret(owner, cred_id)
             if secret:
-                result = await asyncio.to_thread(llm_providers.verify, cred.get("base_url") or "",
-                                                 secret, cred.get("model"))
+                result = await asyncio.to_thread(_verify_roles, cred.get("base_url") or "",
+                                                 secret, cred.get("model"), cred.get("lab_model"),
+                                                 cred.get("provider"))
                 # The edit is already saved either way — a model id that doesn't answer is
                 # reported (⚠ on the row, and in this response) rather than rolled back, because
                 # the user may be fixing the base URL and the model id in two steps.
@@ -1559,8 +1700,8 @@ async def verify_llm_credential(cred_id: str, request: Request, user: str = "") 
     if not secret:
         return JSONResponse({"error": "This credential's key file is missing."}, status_code=400)
 
-    result = await asyncio.to_thread(llm_providers.verify, row.get("base_url", ""), secret,
-                                     row.get("model"))
+    result = await asyncio.to_thread(_verify_roles, row.get("base_url", ""), secret,
+                                     row.get("model"), row.get("lab_model"), row.get("provider"))
     cred = llm_credentials.mark_verified(owner, cred_id, model=result.verified_model,
                                          error=None if result.ok else result.message)
     return JSONResponse({"credential": cred, "result": result.as_dict()})
@@ -1580,7 +1721,8 @@ async def list_llm_credential_models(cred_id: str, request: Request, user: str =
         secret = llm_credentials.resolve_secret(owner, cred_id)
     except GatewayError as exc:
         return _llm_error(exc)
-    models = await asyncio.to_thread(llm_providers.list_models, row.get("base_url", ""), secret or "")
+    models = await asyncio.to_thread(llm_providers.list_models, row.get("base_url", ""), secret or "",
+                                     provider=row.get("provider"))
     return JSONResponse({"models": models})
 
 
@@ -1593,17 +1735,18 @@ async def delete_llm_credential(cred_id: str, request: Request, user: str = "") 
 
 
 @app.get("/api/connections/{connection_id}")
-async def get_connection(connection_id: str) -> JSONResponse:
-    conn = CONNECTIONS.get(connection_id)
-    if not conn:
-        return JSONResponse({"error": "Unknown connection id"}, status_code=404)
+async def get_connection(connection_id: str, request: Request) -> JSONResponse:
+    conn = _owned_conn(connection_id, request)
     return JSONResponse(conn.summary())
 
 
 @app.get("/api/artifacts/{owner}/{run_id}/{name}")
-async def get_artifact(owner: str, run_id: str, name: str) -> Response:
+async def get_artifact(owner: str, run_id: str, name: str, request: Request) -> Response:
     # Served from disk (not from an active connection) so links keep working
     # after a reconnect/restart. Path is validated to stay under runs/console.
+    refused = _owner_dir_error(owner, request)
+    if refused is not None:
+        return refused
     if not all(part.replace("-", "").isalnum() for part in (owner, run_id)):
         return Response("Bad request", status_code=400)
     base = (CONSOLE_RUNS_DIR / owner / run_id / "artifacts").resolve()
@@ -1885,9 +2028,12 @@ def _run_artifacts_base(owner: str, run_id: str) -> Path | None:
 
 
 @app.get("/api/files/{owner}/{run_id}")
-async def list_files(owner: str, run_id: str) -> JSONResponse:
+async def list_files(owner: str, run_id: str, request: Request) -> JSONResponse:
     """List ALL files of a run (recursively, incl. nested figures/tables) so the UI
     can render a browsable tree + thumbnails + previews — not just the curated items."""
+    refused = _owner_dir_error(owner, request)
+    if refused is not None:
+        return refused
     base = _run_artifacts_base(owner, run_id)
     if base is None:
         return JSONResponse({"files": []})
@@ -1906,9 +2052,12 @@ async def list_files(owner: str, run_id: str) -> JSONResponse:
 
 
 @app.get("/api/file/{owner}/{run_id}/{path:path}")
-async def get_file(owner: str, run_id: str, path: str) -> Response:
+async def get_file(owner: str, run_id: str, path: str, request: Request) -> Response:
     """Serve a single (possibly nested) artifact file INLINE for preview (images,
     PDF, csv, markdown). Path-traversal guarded to stay under the run's artifacts."""
+    refused = _owner_dir_error(owner, request)
+    if refused is not None:
+        return refused
     base = _run_artifacts_base(owner, run_id)
     if base is None:
         return Response("Not found", status_code=404)
@@ -1916,7 +2065,9 @@ async def get_file(owner: str, run_id: str, path: str) -> Response:
     if base not in target.parents or not target.is_file():
         return Response("Not found", status_code=404)
     content_type = mimetypes.guess_type(target.name)[0] or "application/octet-stream"
-    return Response(target.read_bytes(), media_type=content_type)
+    # Streamed from disk, never read into memory: an artifact can be a table of several GB, and this
+    # process serves every user. "no-cache" keeps a regenerated report from being shown stale.
+    return FileResponse(target, media_type=content_type, headers={"Cache-Control": "no-cache"})
 
 
 @app.post("/api/results/delete")
@@ -1950,10 +2101,8 @@ async def delete_results(payload: dict, request: Request) -> JSONResponse:
 
 
 @app.post("/api/disconnect")
-async def disconnect(payload: dict) -> JSONResponse:
-    conn = CONNECTIONS.get(str(payload.get("connection_id", "")))
-    if not conn:
-        return JSONResponse({"error": "Unknown connection id"}, status_code=404)
+async def disconnect(payload: dict, request: Request) -> JSONResponse:
+    conn = _owned_conn(payload.get("connection_id", ""), request)
     conn.status = "disconnected"
     if conn.monitor_task:
         conn.monitor_task.cancel()
@@ -1973,10 +2122,8 @@ async def disconnect(payload: dict) -> JSONResponse:
 
 
 @app.post("/api/auth/duo")
-async def auth_duo(payload: dict) -> JSONResponse:
-    conn = CONNECTIONS.get(str(payload.get("connection_id", "")))
-    if not conn:
-        return JSONResponse({"error": "Unknown connection id"}, status_code=404)
+async def auth_duo(payload: dict, request: Request) -> JSONResponse:
+    conn = _owned_conn(payload.get("connection_id", ""), request)
     conn.duo_value = (str(payload.get("response", "")).strip() or "1")
     conn.pending_duo = None
     conn.duo_event.set()
@@ -2074,10 +2221,8 @@ def _release_session_jobs(conn: Connection) -> tuple[list[tuple[str, str, str]],
 
 
 @app.post("/api/stop-gpu")
-async def stop_gpu(payload: dict) -> JSONResponse:
-    conn = CONNECTIONS.get(str(payload.get("connection_id", "")))
-    if not conn:
-        return JSONResponse({"error": "Unknown connection id"}, status_code=404)
+async def stop_gpu(payload: dict, request: Request) -> JSONResponse:
+    conn = _owned_conn(payload.get("connection_id", ""), request)
     if not conn.executor:
         return JSONResponse({"error": "No live HPC3 connection to run scancel on. "
                                       "Reconnect, or run `scancel --me` on HPC3."}, status_code=409)
@@ -2159,6 +2304,15 @@ def _temp_base(conn: Connection) -> str:
     return _shared_dir(conn, "Temp")
 
 
+def _scratch_dir(conn: Connection, kind: str) -> str:
+    """Where one HPC3 job line (``analysis``, ``runcode``, ``report``, ``worker`` ...) writes its
+    per-job files: the sbatch script, the args/result JSON, the Slurm log and the tool's stderr
+    log — ``<shared_root>/Temp/<user>/scratch/<kind>``. Every job line takes its directory from
+    here, so none of it lands in the user's home directory; the path is absolute because Slurm
+    does not expand ``$HOME`` in ``#SBATCH --output``."""
+    return f"{_temp_base(conn)}/scratch/{kind}"
+
+
 # --- uploads on HPC3 dfs3b (Phase 2 of the offload; opt-in via uploads_on_hpc) ---
 
 def _hpc_uploads_dir(conn: Connection) -> str:
@@ -2200,6 +2354,554 @@ def _stage_upload_to_hpc(conn: Connection, local_path: Path, rel: str) -> str:
     except OSError:
         pass
     return remote_path
+
+
+# --- background staging of uploads (see staging.py) ---------------------------------------------
+# An upload request only hands the file over; the copy to HPC3 runs in a per-USER queue, so it can
+# outlive Envoy's 15 s request limit, resume after a drop or a restart, and be verified before the
+# dataset is recorded. A request still waits a few seconds, so a small file answers "uploaded" in
+# one round trip exactly as before; a big one answers "staging" and the browser polls the job.
+
+_STAGE_WAIT_S = float(os.environ.get("AISCIENTIST_UPLOAD_STAGE_WAIT_S", "5") or 5)
+_STAGING: "dict[str, staging.StagingQueue]" = {}
+_STAGING_LOCK = threading.Lock()
+
+
+def _owner_connections(owner: str) -> list[Connection]:
+    return [c for c in list(CONNECTIONS.values()) if c.owner == owner]
+
+
+def _staging_conn(owner: str, hpc_user: str = "") -> Connection:
+    """A live connection of this account's that can push a copy for ``hpc_user``. An account may be
+    connected as more than one HPC3 user, and a copy bound for one user's uploads dir must not be
+    written by another's session, so the HPC3 user has to match (when the job names one). None
+    (all tabs closed, or the gateway restarted) waits for the next login."""
+    live = [c for c in _owner_connections(owner) if c.executor is not None
+            and (not hpc_user or _hpc_user(c) == hpc_user)]
+    for c in live:
+        if not c.mock:
+            return c
+    if live:
+        return live[0]
+    raise staging.NoSession("No HPC3 session — the copy continues when you next connect.")
+
+
+def _staging_executor(owner: str, hpc_user: str = "") -> "RemoteExecutor":
+    return _staging_conn(owner, hpc_user).executor
+
+
+def _env_int(name: str, default: int) -> int:
+    try:
+        return int(os.environ.get(name, "") or default)
+    except ValueError:
+        return default
+
+
+# Parallel copies: per user, and for the whole gateway (several users uploading at once must not
+# take every connection the transfer node gives us). OpenSSH copies scale — 4 measured at 763 MB/s
+# from the eyeserver; paramiko copies only contend for the GIL (4 threads: 75 MB/s against 101 for
+# one), so a session that cannot use OpenSSH copies one file at a time.
+_TRANSFER_STREAMS = max(1, _env_int("AISCIENTIST_TRANSFER_STREAMS", 4))
+_TRANSFER_SLOTS = threading.BoundedSemaphore(max(1, _env_int("AISCIENTIST_TRANSFER_STREAMS_TOTAL", 8)))
+_PARAMIKO_COPY: "dict[str, threading.Lock]" = {}
+
+
+def _paramiko_copy_lock(owner: str) -> threading.Lock:
+    """One paramiko copy at a time PER USER: serialising them all would let one person's 20 GB
+    hold up everyone else's small file."""
+    with _STAGING_LOCK:
+        return _PARAMIKO_COPY.setdefault(owner, threading.Lock())
+
+
+def _staging_queue(conn: Connection) -> "staging.StagingQueue":
+    with _STAGING_LOCK:
+        q = _STAGING.get(conn.owner)
+        if q is None:
+            owner = conn.owner
+            q = staging.StagingQueue(
+                staging.StagingStore(conn.workspace / "uploads" / ".staging"),
+                push=lambda job, progress: _push_staged(owner, job, progress),
+                verify=lambda job: _verify_staged(owner, job),
+                on_change=lambda job: _on_staging_change(owner, job),
+                unpack=lambda job: _unpack_staged(owner, job),
+                streams=_TRANSFER_STREAMS,
+            )
+            _STAGING[owner] = q
+        return q
+
+
+def _push_staged(owner: str, job: "staging.StagingJob", progress) -> None:
+    ex = _staging_executor(owner, job.hpc_user)
+    put = getattr(ex, "put_file_resumable", None)
+    if put is None:                       # simple executors (mock): one plain copy
+        parent = job.remote_path.rsplit("/", 1)[0]
+        ex.exec(f"mkdir -p {shlex.quote(parent)}")
+        ex.put_file(job.local_path, job.remote_path)
+        progress(job.size, job.size)
+        return
+    native = getattr(ex, "native_transfer_available", None)
+    parallel = callable(native) and native()
+    with _TRANSFER_SLOTS:
+        if parallel:
+            put(job.local_path, job.remote_path, progress=progress)
+        else:
+            with _paramiko_copy_lock(owner):
+                put(job.local_path, job.remote_path, progress=progress)
+
+
+# --- unpacking an uploaded archive on HPC3 (the script is hpc/unpack_archive.py) -----------------
+# The archive is copied and verified like any file, then a Slurm step unpacks it on a compute node
+# (unpacking is work, and RCIC keeps work off the login node). The script is standard library only
+# and is run as a file from the synced source tree, inside the analysis image.
+
+_ARCHIVE_SUFFIXES = (".tar.gz", ".tar.bz2", ".tar.xz", ".tgz", ".tbz2", ".txz", ".tar", ".zip")
+_UNPACK_MARK = "AISCIENTIST_UNPACK_JSON"
+_UNPACK_TIME = "06:00:00"
+
+
+def _archive_stem(name: str) -> str | None:
+    """``run1`` for ``run1.tar.gz``; None when the name is not an archive's."""
+    low = name.lower()
+    for suffix in _ARCHIVE_SUFFIXES:
+        if low.endswith(suffix) and len(name) > len(suffix):
+            return name[:-len(suffix)]
+    return None
+
+
+def _unpack_command(conn: Connection, pysrc: str, archive: str, dest: str) -> str:
+    st = conn.settings
+    q = shlex.quote
+    uploads = _hpc_uploads_dir(conn)
+    args = (f"--archive {q(archive)} --dest {q(dest)} "
+            f"--max-bytes {_env_int('AISCIENTIST_UNPACK_MAX_BYTES', 500 * 1024 ** 3)} "
+            f"--max-files {_env_int('AISCIENTIST_UNPACK_MAX_FILES', 200_000)} "
+            f"--max-ratio {_env_int('AISCIENTIST_UNPACK_MAX_RATIO', 200)}")
+    if os.environ.get("AISCIENTIST_UNPACK_KEEP_ARCHIVE", "").strip().lower() in ("1", "true", "yes", "on"):
+        args += " --keep-archive"
+    module = f"module load {q(st.container_module)} >/dev/null 2>&1 || true; " if st.container_module else ""
+    inner = (f"{module}{q(st.container_bin)} exec -B {q(uploads)}:{q(uploads)} -B {q(pysrc)}:{q(pysrc)}:ro "
+             f"{q(st.analysis_image)} python3 {q(pysrc + '/aiscientist/hpc/unpack_archive.py')} {args}")
+    account = f"-A {q(st.cpu_account)} " if st.cpu_account else ""
+    return (f"srun -p {q(st.cpu_partition)} {account}-c 2 --mem=4G -t {_UNPACK_TIME} --quiet "
+            f"-J aiscientist-unpack-{conn.owner} bash -lc {q(inner)}")
+
+
+def _unpack_result(stdout: str) -> dict | None:
+    for line in reversed((stdout or "").splitlines()):
+        if line.startswith(_UNPACK_MARK + " "):
+            try:
+                return json.loads(line.split(" ", 1)[1])
+            except ValueError:
+                return None
+    return None
+
+
+def _unpack_staged(owner: str, job: "staging.StagingJob") -> dict:
+    """Unpack a verified archive on HPC3. Returns ``{"path", "files", "bytes", …}``; raises
+    ``staging.Permanent`` when the archive itself is refused, anything else when the step failed."""
+    conn = _staging_conn(owner, job.hpc_user)
+    if not job.unpack_dest:
+        # A free folder name, chosen once and kept on the job: a retry must land in the SAME place,
+        # because the script treats an existing destination as "already unpacked".
+        stem = _archive_stem(job.name) or f"{job.name}.unpacked"
+        name = _unique_upload_name(conn, conn.workspace / "uploads", stem)
+        job.unpack_dest = f"{_hpc_uploads_dir(conn)}/{name}"
+        _staging_queue(conn).store.save(job)
+    if conn.mock:
+        return {"path": job.unpack_dest, "files": 0, "bytes": job.size, "mock": True}
+    pysrc = _sync_aiscientist_source_to_hpc(conn)
+    res = conn.executor.exec(_unpack_command(conn, pysrc, job.remote_path, job.unpack_dest),
+                             timeout=6 * 3600 + 600.0)
+    result = _unpack_result(res.stdout)
+    if result is None:
+        tail = " ".join(((res.stderr or "") + " " + (res.stdout or "")).split())[-300:]
+        raise RuntimeError(f"Unpacking {job.name} on HPC3 gave no result (exit {res.exit_status}): {tail}")
+    if result.get("status") == "refused":
+        raise staging.Permanent(str(result.get("reason") or "the archive was refused"))
+    if result.get("status") != "ok":
+        raise RuntimeError(f"Unpacking {job.name} on HPC3 failed: {result.get('reason')}")
+    return {k: result.get(k) for k in ("path", "files", "bytes", "skipped_links", "skipped_junk",
+                                       "flattened", "archive_removed", "resumed") if k in result}
+
+
+# Files at least this big are checked by SHA-256 on a compute node; smaller ones by size. SSH
+# already guards every byte in transit; what a hash catches is a resumed copy gone wrong, and only
+# big files are ever resumed.
+_VERIFY_MIN_BYTES = int(os.environ.get("AISCIENTIST_UPLOAD_VERIFY_MIN_BYTES", str(256 * 1024 ** 2)) or 0)
+
+
+def _verify_staged(owner: str, job: "staging.StagingJob") -> str:
+    conn = _staging_conn(owner, job.hpc_user)
+    ex = conn.executor
+    remote = ex.remote_size(job.remote_path)
+    if remote != job.size:
+        raise staging.VerifyError(f"{job.name} is {remote} bytes on HPC3, expected {job.size}.")
+    if job.size < _VERIFY_MIN_BYTES or not job.sha256 or conn.mock:
+        return "size"
+    remote_sha = _remote_sha256(conn, job.remote_path)
+    if not remote_sha:
+        return "size"                    # the check itself could not run; the size matched
+    if remote_sha != job.sha256:
+        try:                             # a fresh copy on retry, not a resume of the bad one
+            ex.exec(f"rm -f {shlex.quote(job.remote_path)}")
+        except Exception:  # noqa: BLE001
+            pass
+        raise staging.VerifyError(f"{job.name} on HPC3 does not match the upload (SHA-256 differs).")
+    return "sha256"
+
+
+def _remote_sha256(conn: Connection, path: str) -> str:
+    """SHA-256 of a dfs3b file, computed on a compute node: hashing 20 GB is work, and RCIC keeps
+    work off the login node, which may only submit it. "" when the check could not run."""
+    st = conn.settings
+    account = f"-A {shlex.quote(st.cpu_account)} " if st.cpu_account else ""
+    cmd = (f"srun -p {shlex.quote(st.cpu_partition)} {account}-c 1 --mem=1G -t 00:30:00 --quiet "
+           f"-J aiscientist-verify-{conn.owner} sha256sum -- {shlex.quote(path)}")
+    try:
+        res = conn.executor.exec(cmd, timeout=1800.0)
+    except Exception as exc:  # noqa: BLE001
+        conn.emit("warning", "upload", f"Could not checksum {path} on HPC3 ({exc}); its size matched.")
+        return ""
+    words = (res.stdout or "").split()
+    if res.exit_status != 0 or not words or len(words[0]) != 64:
+        conn.emit("warning", "upload", f"Could not checksum {path} on HPC3; its size matched.")
+        return ""
+    return words[0].lower()
+
+
+def _upload_workspace(owner: str) -> Path:
+    """Where an owner's uploads (and their log) are kept, whether or not a session is open."""
+    q = _STAGING.get(owner)
+    return q.store.root.parent.parent if q is not None else CONSOLE_RUNS_DIR / owner
+
+
+def _on_staging_change(owner: str, job: "staging.StagingJob") -> None:
+    upload_log.record_staging(_upload_workspace(owner), job)
+    conns = _owner_connections(owner)
+    payload = {"type": "upload_staging", "job": job.public()}
+    for c in conns:
+        c._publish(payload)               # untagged: an upload belongs to no conversation
+    if job.state == "done":
+        try:
+            Path(job.local_path).unlink()   # verified on HPC3: raw data must not linger here
+        except OSError:
+            pass
+        if job.folder:
+            _finish_staged_folder(owner, job.folder)
+            return
+        how = "checksum verified" if job.verified == "sha256" else "size checked"
+        if job.unpacked:
+            out = job.unpacked
+            folder = str(out.get("path") or job.unpack_dest).rstrip("/").rsplit("/", 1)[-1]
+            left_out = int(out.get("skipped_links") or 0)
+            note = f" {left_out} link(s) or device file(s) in it were left out." if left_out else ""
+            for c in conns:
+                c.emit("success", "upload",
+                       f"Uploaded {job.name} ({how}) and unpacked it on your HPC3 storage to {folder}/ "
+                       f"({int(out.get('files') or 0)} files, {int(out.get('bytes') or 0) / 1e6:.1f} MB).{note}")
+            name, path, size, kind, sha = folder, str(out.get("path") or job.unpack_dest), \
+                int(out.get("bytes") or 0), "folder", None
+        else:
+            gist = (job.peek or {}).get("gist") or ""
+            for c in conns:
+                c.emit("success", "upload", f"Uploaded {job.name} ({job.size / 1e6:.1f} MB) to your HPC3 "
+                       f"storage ({how})." + (f" Skim: {gist}" if gist else ""))
+                if job.unpack_error:
+                    c.emit("warning", "upload", f"{job.name} was not unpacked: {job.unpack_error}. "
+                           "It is kept as a file.")
+            if job.unpack_error and job.unpack_dest:
+                _remove_unpack_leftover(owner, job)      # a step that died mid-way leaves its work folder
+            name, path, size, kind, sha = job.name, job.remote_path, job.size, job.kind, job.sha256 or None
+        if _AUTH_ENABLED and job.user_id:
+            try:
+                auth_routes.record_dataset(job.user_id, name, path, size, kind, sha256=sha)
+            except Exception as exc:  # noqa: BLE001 - history is best-effort
+                print(f"[auth] record_dataset failed: {exc}")
+    elif job.state == "failed":
+        kept = ("It is still on the server; retry it from the Uploads panel."
+                if os.path.exists(job.local_path) else "")
+        for c in conns:
+            c.emit("error", "upload", f"Copying {job.name} to HPC3 failed: {job.error} {kept}".rstrip())
+    elif job.state == "cancelled":
+        try:
+            Path(job.local_path).unlink()
+        except OSError:
+            pass
+        try:   # and whatever reached HPC3 (a .part, or a copy cancelled while being verified)
+            q = shlex.quote(job.remote_path)
+            _staging_executor(owner, job.hpc_user).exec(f"rm -f {q} {shlex.quote(job.remote_path + '.part')}")
+        except Exception:  # noqa: BLE001 - best effort; the user can delete it from Storage
+            pass
+
+
+# --- what a copy that will never finish leaves behind ---------------------------------------------
+# A failed copy keeps its local file and its remote ``.part`` so a retry can resume. Once the job is
+# dismissed, or has sat settled for AISCIENTIST_UPLOAD_KEEP_SETTLED_DAYS, nothing can retry it, and
+# both would stay for ever with nothing pointing at them (a 20 GB upload: 20 GB on the gateway host
+# and up to 20 GB on dfs3b). Only paths this job created are touched, and never one that a running
+# copy now uses: a later upload may have taken the same name.
+
+def _remove_unpack_leftover(owner: str, job: "staging.StagingJob") -> None:
+    """Remove ``<unpack_dest>.unpacking`` if an unpack step died and left it. Looking is one ``test``
+    on the login node; deleting a tree is work, so it runs as a Slurm step, in the background."""
+    work = f"{job.unpack_dest}.unpacking"
+    try:
+        conn = _staging_conn(owner, job.hpc_user)
+        if conn.mock or work in {f"{d}.unpacking" for d in _staging_queue(conn).active_names()}:
+            return
+        if not conn.executor.exec(f"test -d {shlex.quote(work)}").ok:
+            return
+        st = conn.settings
+        account = f"-A {shlex.quote(st.cpu_account)} " if st.cpu_account else ""
+        cmd = (f"srun -p {shlex.quote(st.cpu_partition)} {account}-c 1 --mem=1G -t 00:30:00 --quiet "
+               f"-J aiscientist-clean-{conn.owner} rm -rf -- {shlex.quote(work)}")
+        threading.Thread(target=lambda: conn.executor.exec(cmd, timeout=1800.0),
+                         name=f"unpack-clean-{job.id}", daemon=True).start()
+    except Exception:  # noqa: BLE001 - best effort; the folder is visible in Storage
+        pass
+
+
+def _discard_leftovers(owner: str, job: "staging.StagingJob") -> None:
+    """Settle what a failed job kept for a retry that can no longer happen. Call it only for a job
+    already out of the queue.
+
+    The local file goes. A copy that never completed loses its remote ``.part``. A copy that was
+    verified (only the unpack kept failing) is a whole file on HPC3: it stays and is recorded as the
+    file that was uploaded, as a refused archive is, because deleting 20 GB that arrived intact is
+    not what dismissing a card should do."""
+    try:
+        Path(job.local_path).unlink()
+    except OSError:
+        pass
+    if job.verified:
+        for c in _owner_connections(owner):
+            c.emit("warning", "upload", f"{job.name} was not unpacked ({job.error or 'the unpack step failed'}). "
+                                        "It is kept as a file on your HPC3 storage.")
+        if _AUTH_ENABLED and job.user_id:
+            try:
+                auth_routes.record_dataset(job.user_id, job.name, job.remote_path, job.size, job.kind,
+                                           sha256=job.sha256 or None)
+            except Exception as exc:  # noqa: BLE001 - history is best-effort
+                print(f"[auth] record_dataset failed: {exc}")
+    else:
+        try:
+            part = job.remote_path + ".part"
+            queue = _STAGING.get(owner)
+            if queue is None or part not in {f"{p}.part" for p in queue.active_names()}:
+                _staging_executor(owner, job.hpc_user).exec(f"rm -f {shlex.quote(part)}")
+            # else: a newer upload of the same name is writing there now
+        except Exception:  # noqa: BLE001 - no session of that HPC3 account, or it dropped: best effort
+            pass
+    if job.unpack_dest:
+        _remove_unpack_leftover(owner, job)
+
+
+def _settled_keep_seconds() -> float:
+    try:
+        days = float(os.environ.get("AISCIENTIST_UPLOAD_KEEP_SETTLED_DAYS", "") or 7)
+    except ValueError:
+        days = 7.0
+    return max(0.0, days) * 86400
+
+
+def _expire_settled(conn: Connection) -> list[str]:
+    """Drop this user's settled copies older than the keep time, and what the failed ones left.
+    Returns the names of the failed ones (the only ones that held anything). 0 days = keep all."""
+    keep = _settled_keep_seconds()
+    if not keep:
+        return []
+    queue = _staging_queue(conn)
+    cutoff = time.time() - keep
+    dropped: list[str] = []
+    folders: set[str] = set()
+    for job in queue.jobs():
+        if job.state not in staging.TERMINAL or job.updated_at > cutoff:
+            continue
+        if job.state == "done" and job.folder and not queue.store.folder(job.folder).get("recorded"):
+            continue                     # its folder is still open: the count of done files matters
+        if queue.forget(job.id) is None:
+            continue
+        if job.folder:
+            folders.add(job.folder)
+        if job.state == "failed":
+            _discard_leftovers(conn.owner, job)
+            dropped.append(job.name)
+    for folder in folders:
+        if not queue.jobs(folder) and queue.store.folder(folder).get("recorded"):
+            queue.store.delete_folder(folder)
+    return dropped
+
+
+def _finish_staged_folder(owner: str, folder: str) -> dict | None:
+    """Record a folder as ONE dataset once it is registered and every file of it is verified.
+    Returns the dataset summary when this call recorded it, else None."""
+    q = _STAGING.get(owner)
+    if q is None:
+        return None
+    with q.folder_lock:
+        meta = q.store.folder(folder)
+        if not meta.get("registered") or meta.get("recorded"):
+            return None
+        jobs = q.jobs(folder)
+        if not jobs or any(j.state in staging.ACTIVE for j in jobs):
+            return None
+        if len(jobs) < int(meta.get("count") or 0):
+            return None                  # registered early: some files have not been handed over yet
+        conns = _owner_connections(owner)
+        bad = [j for j in jobs if j.state != "done"]
+        if bad:
+            if not meta.get("reported"):
+                q.store.update_folder(folder, reported=True)
+                upload_log.record(_upload_workspace(owner), "folder_incomplete", folder=folder,
+                                  count=len(jobs), failed=len(bad),
+                                  error="; ".join(sorted({j.error for j in bad if j.error}))[:400])
+                for c in conns:
+                    c.emit("error", "upload", f"{len(bad)} of {len(jobs)} files of {folder}/ did not reach "
+                           "HPC3; retry them from the Uploads panel.")
+            return None
+        size, count = sum(j.size for j in jobs), len(jobs)
+        q.store.update_folder(folder, recorded=True, size=size, count=count)
+        upload_log.record(_upload_workspace(owner), "folder_recorded", folder=folder, count=count,
+                          size=size, remote_path=meta.get("remote_root"))
+    for c in conns:
+        c.emit("success", "upload", f"Uploaded folder {folder}/ ({count} files, {size / 1e6:.1f} MB) "
+               "to your HPC3 storage.")
+    if conns:
+        shutil.rmtree(conns[0].workspace / "uploads" / folder, ignore_errors=True)
+    user_id = meta.get("user_id")
+    if _AUTH_ENABLED and user_id:
+        try:
+            auth_routes.record_dataset(user_id, folder, meta["remote_root"], size, "folder")
+        except Exception as exc:  # noqa: BLE001 - history is best-effort
+            print(f"[auth] record_dataset (folder) failed: {exc}")
+    return {"name": folder, "path": meta["remote_root"], "size": size, "count": count}
+
+
+def _submit_staging(conn: Connection, local: Path, rel: str, *, name: str, kind: str = "other",
+                    folder: str = "", peek: dict | None = None, upload_id: str = "",
+                    client_sha256: str = "", unpack: bool = False) -> "staging.StagingJob":
+    """Hand a COMPLETE local upload to the background queue. This is the one seam between the upload
+    layer (browser -> gateway) and the transfer layer (gateway -> HPC3).
+
+    The caller guarantees: ``local`` is complete and closed, lies under ``<workspace>/uploads/``, and
+    its name is already free (:func:`_unique_upload_name`); ``rel`` is its path under ``uploads/``; a
+    file of a folder upload carries ``folder`` (the top-level folder name). The queue then owns the
+    copy, its check, the dataset row, the local file's deletion and every event about it.
+
+    ``upload_id`` is the upload layer's own id, so ``GET /api/upload/staging?upload_id=`` finds the
+    job. ``client_sha256`` is the browser's SHA-256 of the file: a mismatch fails the job before
+    anything is copied. ``unpack`` marks an archive to unpack on HPC3 once verified.
+
+    One upload is one copy: handing over an ``upload_id`` whose copy of this same file is still
+    running returns that job. An upload layer that finishes one upload twice (a completion request
+    answered late, and the browser's retry of it) must not start a second copy to the same path. A
+    settled job never stands in for a new hand-over: the old chunk protocol's ids are a hash of the
+    file's name, size and date, so the same id legitimately comes back with a new file."""
+    queue = _staging_queue(conn)
+    held = queue.find_upload(upload_id) if upload_id else None
+    if held is not None and held.state in staging.ACTIVE and held.local_path == str(local):
+        return held
+    job = staging.new_job(owner=conn.owner, local_path=str(local), remote_path=f"{_hpc_uploads_dir(conn)}/{rel}",
+                          name=name, size=local.stat().st_size, kind=kind, folder=folder,
+                          user_id=conn.app_user_id, peek=peek, hpc_user=_hpc_user(conn),
+                          upload_id=upload_id, client_sha256=(client_sha256 or "").strip().lower(),
+                          unpack=bool(unpack) and not folder)
+    queue.submit(job)
+    return job
+
+
+async def _await_staging(conn: Connection, job: "staging.StagingJob") -> "staging.StagingJob | None":
+    """The settled job if it finished within ``_STAGE_WAIT_S``, else None (still copying)."""
+    return await asyncio.to_thread(_staging_queue(conn).wait, job.id, _STAGE_WAIT_S)
+
+
+def _staging_response(job: "staging.StagingJob", **extra) -> JSONResponse:
+    """What an upload request answers once its file is handed to the queue."""
+    if job.state == "done" and job.unpacked:
+        path = str(job.unpacked.get("path") or job.unpack_dest)
+        return JSONResponse({"status": "uploaded", "name": path.rstrip("/").rsplit("/", 1)[-1], "path": path,
+                             "size": int(job.unpacked.get("bytes") or 0), "kind": "folder",
+                             "count": int(job.unpacked.get("files") or 0), "job_id": job.id, **extra})
+    if job.state == "done":
+        return JSONResponse({"status": "uploaded", "name": job.name, "path": job.remote_path,
+                             "size": job.size, "job_id": job.id,
+                             **({"unpack_error": job.unpack_error} if job.unpack_error else {}), **extra})
+    if job.state in ("failed", "cancelled"):
+        # 200, not 5xx: an error status makes the browser re-send the last chunk.
+        return JSONResponse({"status": job.state, "error": job.error, "name": job.name,
+                             "job_id": job.id, **extra})
+    return JSONResponse({"status": "staging", "name": job.name, "path": job.remote_path, "size": job.size,
+                         "job_id": job.id, "state": job.state, **extra})
+
+
+def _remote_name_taken(conn: Connection, rel: str) -> bool:
+    """An upload name already used on HPC3 or by a copy still in flight. The local check alone
+    misses both: a staged upload's local copy is deleted, so its name looks free here."""
+    remote = f"{_hpc_uploads_dir(conn)}/{rel}"
+    if remote in _staging_queue(conn).active_names():
+        return True
+    try:
+        res = conn.executor.exec(f"test -e {shlex.quote(remote)} && echo taken")
+    except Exception:  # noqa: BLE001 - when in doubt, do not block the upload on a stat
+        return False
+    return "taken" in (res.stdout or "")
+
+
+def _unique_upload_name(conn: Connection, dest_dir: Path, name: str) -> str:
+    """:func:`_unique_child`, but with uploads on HPC3 a name is also taken when dfs3b has it."""
+    if not _uploads_on_hpc(conn):
+        return _unique_child(dest_dir, name)
+
+    def taken(n: str) -> bool:
+        return (dest_dir / n).exists() or _remote_name_taken(conn, n)
+
+    if not taken(name):
+        return name
+    p = Path(name)
+    stem, suffix = p.stem, "".join(p.suffixes)
+    for k in range(1, 1000):
+        alt = f"{stem} ({k}){suffix}"
+        if not taken(alt):
+            return alt
+    return f"{stem} ({uuid4().hex[:6]}){suffix}"
+
+
+def _unique_folder_name(conn: Connection, uploads: Path, name: str) -> str:
+    """A top-level folder name that no upload of this user has yet: ``data``, ``data_2``, ``data_3``.
+    The suffix uses only characters :func:`safe_relpath` keeps, because the browser sends the name
+    back in every file's path and it is cleaned again there. ``data (1)`` came back as ``data1``, a
+    folder nobody had reserved, and every file of a second ``data`` folder was refused."""
+    def taken(n: str) -> bool:
+        return (uploads / n).exists() or (_uploads_on_hpc(conn) and _remote_name_taken(conn, n))
+
+    if not taken(name):
+        return name
+    for k in range(2, 1000):
+        alt = f"{name}_{k}"
+        if not taken(alt):
+            return alt
+    return f"{name}_{uuid4().hex[:6]}"
+
+
+def _resume_staging(conn: Connection) -> None:
+    """After a login: pick up this user's unfinished copies (a restart, or a closed tab)."""
+    if not _uploads_on_hpc(conn):
+        return
+    try:
+        resumed = _staging_queue(conn).resume()
+    except Exception as exc:  # noqa: BLE001 - never fail a login over this
+        conn.emit("warning", "upload", f"Could not resume unfinished uploads: {exc}")
+        return
+    if resumed:
+        conn.emit("info", "upload", f"Resuming {len(resumed)} unfinished upload copy(ies) to HPC3.")
+    try:
+        dropped = _expire_settled(conn)
+    except Exception:  # noqa: BLE001 - housekeeping never fails a login
+        dropped = []
+    if dropped:
+        days = _settled_keep_seconds() / 86400
+        conn.emit("info", "upload", f"Removed {len(dropped)} failed upload(s) left for more than "
+                                    f"{days:g} days: {', '.join(dropped[:5])}{'…' if len(dropped) > 5 else ''}.")
 
 
 # --- datasets already on the gateway host, bound by path (see server_data.py) -------------------
@@ -2433,6 +3135,30 @@ def _peek_dataset_any(conn: Connection, path: str, name: str) -> dict:
         peek["remote"] = True
         return peek
     return peek_dataset(path, max_bytes=_INGEST_PEEK_MAX_BYTES, name=name)
+
+
+def _describable_path(conn: Connection, path: str) -> "str | None":
+    """The path ``/api/dataset/describe`` may peek for this session, or None to refuse it.
+
+    The peek returns a file's head (text lines or a hexdump), so a path from the browser must not
+    reach a file this user does not own: another user's uploads, the prod ``.env``, or the stored
+    API and SSH keys under the state dir. Admitted, as for a run's bound paths
+    (:func:`_admit_bound_paths`): a dfs3b path, read over this user's own HPC3 login; a file in this
+    user's own uploads on the gateway host; a file inside an allowlisted server folder. A local path
+    is resolved first, so a symlink or ``..`` cannot lead out, and the resolved path is returned for
+    the peek to read. Unlike a run, this holds with accounts off too: nothing else needs it."""
+    from . import server_data as sd
+    if conn.executor is not None and _is_remote_dataset(conn, path):
+        # _is_remote_dataset is a prefix test, so a `..` would walk back out of the lab storage.
+        return None if ".." in path.split("/") else path
+    try:
+        resolved = Path(path).resolve()
+        uploads = (conn.workspace / "uploads").resolve()
+    except (OSError, RuntimeError, ValueError):   # ValueError: a NUL byte in the path
+        return None
+    if resolved.is_relative_to(uploads) or sd.root_of(resolved, sd.server_data_roots()) is not None:
+        return str(resolved)
+    return None
 
 
 # The compact slice of a feature-① description we keep per bound file (drops the verbose key_facts).
@@ -2746,12 +3472,12 @@ def _build_hpc_shell(conn: "Connection", run: "RunState | None") -> Any:
         from .package_cache import SharedPackageCache, ensure_sitecustomize
         pkg_root = f"{shared}/pkgs"
         # container_module is load-bearing, not cosmetic: the cache probes the image through
-        # `HpcShell._worker` (a bare `srun ... bash -lc`), where `singularity` is NOT on PATH
+        # `HpcShell._worker` (a bare `srun ... bash -lc`), where `apptainer` is NOT on PATH
         # until the module is loaded. Without it every probe exits 127, preflight fails open,
         # and the snippet dies on the ModuleNotFoundError this whole path exists to prevent.
         cache = SharedPackageCache(root=pkg_root, image=st.analysis_image,
                                    container_module=st.container_module,
-                                   singularity_bin=st.container_bin)
+                                   container_bin=st.container_bin)
         # Must exist BEFORE any sandbox launch: the in-container preamble points PYTHONPATH at
         # this directory, and without the file there the cache silently does nothing — measured
         # exactly that way (package installed, import still failed). One cheap idempotent
@@ -2790,7 +3516,8 @@ def _ensure_session_worker(conn: "Connection"):
             return alloc
         if alloc is not None:
             conn.emit("info", "worker", "The worker node's allocation ended; requesting another.")
-        alloc = worker_mod.ensure_worker(conn.executor, conn.settings, conn.emit_fn())
+        alloc = worker_mod.ensure_worker(conn.executor, conn.settings, conn.emit_fn(),
+                                         scratch_dir=_scratch_dir(conn, "worker"))
         conn.worker_alloc = alloc
         return alloc
 
@@ -2813,8 +3540,12 @@ def _live_llm_args(conn: "Connection") -> dict[str, Any]:
     return {"llm_base_url": f"http://{alloc.node}:{alloc.port}/v1", "model": conn.selected_model}
 
 
-def _build_literature_executor(conn: "Connection") -> Any:
-    """Offload deep_literature (PaperQA) to HPC3 (paperqa.sif), or None to keep it disabled.
+def _build_literature_executor(conn: "Connection", run_id: str | None = None) -> Any:
+    """Offload the literature tools (deep_literature, extract_haploinsufficient_genes) to HPC3
+    (paperqa.sif), or None to keep them disabled. With ``run_id`` the job gets that run's own
+    workspace (``Temp/<user>/corpus/<run_id>`` on dfs3b, ``<workspace>/<run_id>`` locally), so its
+    artifacts are synced back under the run and show up in the run's files; without it (the chat
+    path) the shared ``Temp/<user>/paperqa`` dir is used as before.
 
     PaperQA cannot run in-process on the eyeserver: the PubMedBERT index lives on /dfs3b, which the
     gateway can't read in place. When AISCIENTIST_PAPERQA_ON_HPC is set (and there is a live SSH session
@@ -2870,15 +3601,15 @@ def _build_literature_executor(conn: "Connection") -> Any:
         retigene, papers, (os.path.dirname(manifest) if manifest else "")) if p))
     return SlurmAnalysisExecutor(
         remote=conn.executor, container_image=image,
-        remote_workspace=f"{_temp_base(conn)}/paperqa",
-        local_workspace=conn.workspace, source_dir=pysrc,
+        remote_workspace=(f"{_temp_base(conn)}/corpus/{run_id}" if run_id else f"{_temp_base(conn)}/paperqa"),
+        local_workspace=(conn.workspace / run_id if run_id else conn.workspace), source_dir=pysrc,
         entrypoint=(
             f"export HF_HOME={retigene}/hf_cache HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1; "
             f"python3 -m {_tools_api.LITERATURE_ENTRYPOINT}"
             if retigene else f"python3 -m {_tools_api.LITERATURE_ENTRYPOINT}"
         ),
         job_prefix="bioagent_paperqa",
-        scratch_dir=f"{_temp_base(conn)}/scratch/paperqa",
+        scratch_dir=_scratch_dir(conn, "paperqa"),
         extra_ro_binds=ro_binds,
         extra_rw_binds=(index_dir,) if index_dir else (),
         # Deploy config the model never sends — merged into the tool-call args before the job runs, so
@@ -2902,7 +3633,7 @@ def _active_conn_for_user(user) -> Connection | None:
     a per-connection request). None if the user has no connected session right now."""
     owner = safe_name(getattr(user, "username", "") or "")
     for c in CONNECTIONS.values():
-        if c.owner == owner and c.executor is not None:
+        if c.owner == owner and c.executor is not None and c.app_user_id == getattr(user, "id", None):
             return c
     return None
 
@@ -2971,9 +3702,9 @@ def _list_storage(conn: Connection) -> dict:
 
 
 @app.get("/api/storage/{connection_id}")
-async def get_storage(connection_id: str) -> JSONResponse:
-    conn = CONNECTIONS.get(connection_id)
-    if not conn or not conn.executor:
+async def get_storage(connection_id: str, request: Request) -> JSONResponse:
+    conn = _owned_conn(connection_id, request, missing=("Not connected", 409))
+    if not conn.executor:
         return JSONResponse({"error": "Not connected"}, status_code=409)
     try:
         data = await asyncio.to_thread(_list_storage, conn)
@@ -2985,17 +3716,9 @@ async def get_storage(connection_id: str) -> JSONResponse:
 
 @app.post("/api/storage/delete")
 async def delete_storage(payload: dict, request: Request) -> JSONResponse:
-    conn = CONNECTIONS.get(str(payload.get("connection_id", "")))
-    if not conn or not conn.executor:
+    conn = _owned_conn(payload.get("connection_id", ""), request, missing=("Not connected", 409))
+    if not conn.executor:
         return JSONResponse({"error": "Not connected"}, status_code=409)
-    # The connection must belong to the calling account (no driving someone else's
-    # session). When accounts are enabled, require login + matching ownership.
-    if _AUTH_ENABLED:
-        user = _optional_user(request)
-        if user is None:
-            return JSONResponse({"error": "Not authenticated"}, status_code=401)
-        if conn.app_user_id is not None and conn.app_user_id != user.id:
-            return JSONResponse({"error": "This connection belongs to another account."}, status_code=403)
     path = str(payload.get("path", "")).strip()
     # Hard guard: only ever delete inside one of THIS user's own HPC3 dirs. Each area is
     # per-user (…/<ucinetid>), so the shared project root does not widen what a member can
@@ -3020,10 +3743,8 @@ async def delete_storage(payload: dict, request: Request) -> JSONResponse:
 
 
 @app.post("/api/model")
-async def select_model(payload: dict) -> JSONResponse:
-    conn = CONNECTIONS.get(str(payload.get("connection_id", "")))
-    if not conn:
-        return JSONResponse({"error": "Unknown connection id"}, status_code=404)
+async def select_model(payload: dict, request: Request) -> JSONResponse:
+    conn = _owned_conn(payload.get("connection_id", ""), request)
     model = str(payload.get("model", "")).strip()
     if not model:
         return JSONResponse({"error": "model is required"}, status_code=400)
@@ -3084,7 +3805,7 @@ async def _reprovision_gpu(conn: Connection, reason: str) -> None:
 
 
 @app.post("/api/llm-endpoint")
-async def select_llm_endpoint(req: LLMEndpointRequest) -> JSONResponse:
+async def select_llm_endpoint(req: LLMEndpointRequest, request: Request) -> JSONResponse:
     """Choose which LLM answers for this session: the cluster's vLLM, or the user's own API key.
 
     Unlike ``/api/model`` this is NOT constrained by what vLLM loaded at serve-launch — an API
@@ -3092,9 +3813,7 @@ async def select_llm_endpoint(req: LLMEndpointRequest) -> JSONResponse:
     reconnect. It takes effect on the NEXT run: a run already executing keeps the endpoint and
     key it started with (see :func:`_lab_llm`), so switching never corrupts work in flight.
     """
-    conn = CONNECTIONS.get(req.connection_id)
-    if not conn:
-        return JSONResponse({"error": "Unknown connection id"}, status_code=404)
+    conn = _owned_conn(req.connection_id, request)
 
     cred_id = (req.credential_id or "").strip()
     if not cred_id:
@@ -3145,12 +3864,7 @@ async def select_llm_endpoint(req: LLMEndpointRequest) -> JSONResponse:
                 "needs_consent": True,
                 "endpoint": {"label": cred.get("label"), "base_url": cred.get("base_url"),
                              "model": cred.get("model"), "lab_model": cred.get("lab_model")},
-                "sends": ["the research question and your mid-run notes",
-                          "the dataset profile (shape, columns, QC summary — not the matrix)",
-                          "accepted findings and artifact digests",
-                          "planning, critique and write-up prompts"],
-                "stays": ["your uploaded data files and the analysis itself, which run on HPC3",
-                          "raw expression tables and variant records"],
+                **_EGRESS_DISCLOSURE,
             }, status_code=409)
         llm_credentials.record_egress_consent(conn.owner, cred_id)
 
@@ -3159,8 +3873,10 @@ async def select_llm_endpoint(req: LLMEndpointRequest) -> JSONResponse:
     # Named out loud in the session log because it is a DATA-EGRESS change, not a preference:
     # from here on the prompts leave the cluster for a third party on the user's own account.
     conn.emit("info", "llm_model",
-              f"LLM switched to your API endpoint “{label}” (model {cred['model']}"
-              + (f", {cred['lab_model']} for PI/Critic" if cred.get("lab_model") else "")
+              f"LLM switched to your API endpoint “{label}” ("
+              + (f"PI/Critic {cred['lab_model']}, Scientist {cred['model']}"
+                 if cred.get("lab_model") and cred["lab_model"] != cred["model"]
+                 else f"model {cred['model']}")
               + "). Prompts for this session now leave UCI for that provider.")
     conn.broadcast_status()
     return JSONResponse({"status": "ok", "endpoint": "credential",
@@ -3174,12 +3890,10 @@ class StopRequest(BaseModel):
 
 
 @app.post("/api/chat/stop")
-async def chat_stop(req: StopRequest) -> JSONResponse:
+async def chat_stop(req: StopRequest, request: Request) -> JSONResponse:
     """Cancel the connection's in-flight chat/pipeline run so GPU + compute are
     released — used by the Stop button and by deleting the chat that owns the run."""
-    conn = CONNECTIONS.get(req.connection_id)
-    if not conn:
-        return JSONResponse({"error": "Unknown connection id"}, status_code=404)
+    conn = _owned_conn(req.connection_id, request)
     if not conn.chat_running:
         return JSONResponse({"status": "idle"})
     # Target the run named by this request (its own chat/run) — not just "whatever run is live". A
@@ -3229,13 +3943,11 @@ class InjectRequest(BaseModel):
 
 
 @app.post("/api/chat/inject")
-async def chat_inject(req: InjectRequest) -> JSONResponse:
+async def chat_inject(req: InjectRequest, request: Request) -> JSONResponse:
     """Steer an EXECUTING run without stopping it: queue a note the lab loop folds into
     the remaining steps' guidance. Distinct from plan-review feedback (that re-plans
     before anything runs) — this applies mid-execution."""
-    conn = CONNECTIONS.get(req.connection_id)
-    if not conn:
-        return JSONResponse({"error": "Unknown connection id"}, status_code=404)
+    conn = _owned_conn(req.connection_id, request)
     text = (req.text or "").strip()
     if not text:
         return JSONResponse({"error": "Empty note."}, status_code=400)
@@ -3244,10 +3956,10 @@ async def chat_inject(req: InjectRequest) -> JSONResponse:
     # Only the lab drains injections (between steps). A chat turn has no steps, so accepting one
     # here would queue a note nothing consumes — and it would then be picked up by the NEXT research
     # run, silently steering a study with a sentence the user aimed at a chat message.
-    if conn.active_run is not None and conn.active_run.kind == "chat":
+    if conn.active_run is not None and conn.active_run.kind in ("chat", "corpus"):
         return JSONResponse(
-            {"error": "Chat answers can't be steered mid-reply — wait for it to finish, then ask "
-                      "a follow-up."}, status_code=409)
+            {"error": "Chat answers and corpus scans can't be steered mid-run — wait for it to "
+                      "finish, then ask a follow-up."}, status_code=409)
     conn.add_injection(text)
     conn.emit("step", "lab", f"Your note is queued for the next step: {text[:80]}")
     return JSONResponse({"status": "queued"})
@@ -3260,7 +3972,7 @@ class CompactRequest(BaseModel):
 
 
 @app.post("/api/lab/compact")
-async def lab_compact(req: CompactRequest) -> JSONResponse:
+async def lab_compact(req: CompactRequest, request: Request) -> JSONResponse:
     """The compact command: ask an EXECUTING run to fold its accumulated findings into a summary
     at the next step boundary.
 
@@ -3270,9 +3982,7 @@ async def lab_compact(req: CompactRequest) -> JSONResponse:
     through the same channel as steering notes would make a deterministic operation depend on the
     model noticing a sentence.
     """
-    conn = CONNECTIONS.get(req.connection_id)
-    if not conn:
-        return JSONResponse({"error": "Unknown connection id"}, status_code=404)
+    conn = _owned_conn(req.connection_id, request)
     if not conn.chat_running:
         return JSONResponse({"error": "No run in progress to compact."}, status_code=409)
     target = conn.resolve_run(req.run_id, req.conversation_id) or conn.active_run
@@ -3330,6 +4040,10 @@ class LabRequest(BaseModel):
     # misrouted into a 4-turn chat loop would return a fluent answer with no analysis behind it,
     # and nothing downstream would flag it. Unknown values fall back to "research" — the safe side.
     route: str = "research"
+    # Save what the run hands on (the processed dataset, CellQC's result directory) to the user's
+    # data when it completes, as "Save to my data" would: the next analysis can start from it
+    # without a click, a download or an upload. Off = it is kept beside the run for a few days.
+    save_results: bool = False
     # Prior turns of THIS conversation, [{"role": "user"|"assistant", "content": str}, ...].
     # Only the fast path reads it: a chat is a conversation, so "what about the other one?" has to
     # resolve against what was already said. The research path deliberately ignores it — a study is
@@ -3365,9 +4079,11 @@ class PlanReviewRequest(BaseModel):
 
 @app.post("/api/upload")
 async def upload_dataset(
+    request: Request,
     connection_id: str = Form(...),
     file: UploadFile = File(...),
     rel_path: str = Form(""),
+    unpack: bool = Form(False),
 ) -> JSONResponse:
     """Receive a dataset file from the browser and save it under THIS connection's
     per-user workspace on the gateway host (multi-user safe). Returns the server-side
@@ -3378,9 +4094,7 @@ async def upload_dataset(
     under uploads/<rel_path> so a whole multi-level folder round-trips intact. Folder
     files are NOT recorded as individual datasets — the folder is registered once via
     /api/upload/register-folder after all its files land."""
-    conn = CONNECTIONS.get(connection_id)
-    if not conn:
-        return JSONResponse({"error": "Unknown connection id"}, status_code=404)
+    conn = _owned_conn(connection_id, request)
     dest_dir = conn.workspace / "uploads"
     dest_dir.mkdir(parents=True, exist_ok=True)
     safe_rel = safe_relpath(rel_path) if rel_path else ""
@@ -3390,7 +4104,7 @@ async def upload_dataset(
         name = dest.name
     else:
         # Never overwrite an existing upload of the same name — uniquify instead.
-        name = _unique_child(dest_dir, safe_filename(file.filename or "dataset"))
+        name = await asyncio.to_thread(_unique_upload_name, conn, dest_dir, safe_filename(file.filename or "dataset"))
         dest = dest_dir / name
     try:
         with open(dest, "wb") as out:
@@ -3400,19 +4114,22 @@ async def upload_dataset(
     size = dest.stat().st_size
     recorded_path = str(dest)
     peek: "dict | None" = None
-    if safe_rel:  # a folder file: push to HPC3 too (preserving nesting); registered by register-folder
+    if safe_rel:  # a folder file: copied to HPC3 too (preserving nesting); registered by register-folder
         if _uploads_on_hpc(conn):
-            recorded_path = await asyncio.to_thread(_stage_upload_to_hpc, conn, dest, safe_rel)
-    else:  # single-file upload: (optionally push to HPC3) log + record as a dataset
+            job = _submit_staging(conn, dest, safe_rel, name=safe_rel, folder=safe_rel.split("/")[0])
+            job = await _await_staging(conn, job) or job
+            return _staging_response(job, rel_path=safe_rel)
+    else:  # single-file upload: (optionally copy to HPC3) log + record as a dataset
         # Skim the file CONTENT (deterministic, no GPU) while it is still local — before staging
         # to dfs3b deletes the local copy. The LLM description is deferred to /api/dataset/describe.
         peek = await asyncio.to_thread(_peek_local_upload, dest)
-        where = "the server"
         if _uploads_on_hpc(conn):
-            recorded_path = await asyncio.to_thread(_stage_upload_to_hpc, conn, dest, name)
-            where = "your HPC3 storage"
+            # The queue records the dataset and announces it once the copy is verified.
+            job = _submit_staging(conn, dest, name, name=name, kind=_file_kind(name), peek=peek, unpack=unpack)
+            job = await _await_staging(conn, job) or job
+            return _staging_response(job, rel_path="", peek=peek)
         gist = (peek or {}).get("gist") or ""
-        msg = f"Uploaded {name} ({size / 1e6:.1f} MB) to {where}."
+        msg = f"Uploaded {name} ({size / 1e6:.1f} MB) to the server."
         conn.emit("success", "upload", msg + (f" Skim: {gist}" if gist else ""))
         if _AUTH_ENABLED and conn.app_user_id:
             try:
@@ -3424,32 +4141,30 @@ async def upload_dataset(
 
 
 @app.post("/api/upload/reserve-folder")
-async def reserve_folder(payload: dict) -> JSONResponse:
+async def reserve_folder(payload: dict, request: Request) -> JSONResponse:
     """Reserve a NON-COLLIDING top-level folder name before a folder upload starts, and
     create it as a placeholder. The browser then prefixes every file's relative path with
     the returned name, so uploading a second folder of the same name lands in
-    ``data (1)/`` instead of merging into / overwriting the first ``data/``."""
-    conn = CONNECTIONS.get(payload.get("connection_id"))
-    if not conn:
-        return JSONResponse({"error": "Unknown connection id"}, status_code=404)
+    ``data_2/`` instead of merging into / overwriting the first ``data/``."""
+    conn = _owned_conn(payload.get("connection_id"), request)
     raw = safe_relpath(payload.get("name", "")).split("/")[0]
     if not raw:
         return JSONResponse({"error": "bad folder name"}, status_code=400)
     uploads = conn.workspace / "uploads"
     uploads.mkdir(parents=True, exist_ok=True)
-    folder = _unique_child(uploads, raw)
+    folder = await asyncio.to_thread(_unique_folder_name, conn, uploads, raw)
     (uploads / folder).mkdir(parents=True, exist_ok=True)   # placeholder reserves the name
+    upload_log.record(conn.workspace, "folder_reserved", folder=folder,
+                      asked=raw if raw != folder else "")
     return JSONResponse({"status": "reserved", "folder": folder})
 
 
 @app.post("/api/upload/register-folder")
-async def register_folder(payload: dict) -> JSONResponse:
+async def register_folder(payload: dict, request: Request) -> JSONResponse:
     """Record ONE dataset row for a just-uploaded folder (after its files landed via
     /api/upload with rel_path). Sums the tree's size + file count so the Datasets view
     shows the folder as a single entry (kind=folder); the lab reads the folder root."""
-    conn = CONNECTIONS.get(payload.get("connection_id"))
-    if not conn:
-        return JSONResponse({"error": "Unknown connection id"}, status_code=404)
+    conn = _owned_conn(payload.get("connection_id"), request)
     folder = safe_relpath(payload.get("folder", "")).split("/")[0]
     if not folder:
         return JSONResponse({"error": "bad folder name"}, status_code=400)
@@ -3457,6 +4172,26 @@ async def register_folder(payload: dict) -> JSONResponse:
     uploads_root = (conn.workspace / "uploads").resolve()
     if not str(root).startswith(str(uploads_root)) or not root.is_dir():
         return JSONResponse({"error": "folder not found"}, status_code=404)
+    if _uploads_on_hpc(conn) and _staging_queue(conn).jobs(folder):
+        # Its files are being copied in the background: the folder becomes one dataset when the
+        # last copy is verified, whether that is now or later (see _finish_staged_folder).
+        q = _staging_queue(conn)
+        remote_root = f"{_hpc_uploads_dir(conn)}/{folder}"
+        try:
+            expected = max(0, int(payload.get("count") or 0))
+        except (TypeError, ValueError):
+            expected = 0
+        q.store.register_folder(folder, remote_root=remote_root, user_id=conn.app_user_id, count=expected)
+        upload_log.record(conn.workspace, "folder_registered", folder=folder, count=expected,
+                          handed_over=len(q.jobs(folder)))
+        done = await asyncio.to_thread(_finish_staged_folder, conn.owner, folder)
+        if done:
+            return JSONResponse({"status": "registered", "kind": "folder", **done})
+        jobs = q.jobs(folder)
+        return JSONResponse({"status": "staging", "name": folder, "path": remote_root, "kind": "folder",
+                             "count": len(jobs), "size": sum(j.size for j in jobs),
+                             "pending": sum(1 for j in jobs if j.state in staging.ACTIVE),
+                             "failed": sum(1 for j in jobs if j.state in ("failed", "cancelled"))})
     if _uploads_on_hpc(conn):
         # Files were streamed to dfs3b (local copies removed); size/count come from the remote tree,
         # and the folder root recorded is the dfs3b path. Drop the now-empty local placeholder.
@@ -3470,6 +4205,8 @@ async def register_folder(payload: dict) -> JSONResponse:
         count, size, recorded_path, where = len(files), sum(p.stat().st_size for p in files), str(root), "the server"
     conn.emit("success", "upload",
               f"Uploaded folder {folder}/ ({count} files, {size / 1e6:.1f} MB) to {where}.")
+    upload_log.record(conn.workspace, "folder_recorded", folder=folder, count=count, size=size,
+                      remote_path=recorded_path)
     if _AUTH_ENABLED and conn.app_user_id:
         try:
             auth_routes.record_dataset(conn.app_user_id, folder, recorded_path, size, "folder")
@@ -3537,11 +4274,9 @@ async def server_data_roots_endpoint(request: Request) -> JSONResponse:
 
 
 @app.post("/api/server-data/check")
-async def server_data_check(payload: dict) -> JSONResponse:
+async def server_data_check(payload: dict, request: Request) -> JSONResponse:
     """What binding this server path would mean (size, layout, what a run copies), without binding."""
-    conn = CONNECTIONS.get(payload.get("connection_id"))
-    if not conn:
-        return JSONResponse({"error": "Unknown connection id"}, status_code=404)
+    conn = _owned_conn(payload.get("connection_id"), request)
     from . import server_data as sd
     try:
         info = await asyncio.to_thread(_server_path_info, conn, str(payload.get("path") or ""))
@@ -3551,13 +4286,11 @@ async def server_data_check(payload: dict) -> JSONResponse:
 
 
 @app.post("/api/server-data/bind")
-async def server_data_bind(payload: dict) -> JSONResponse:
+async def server_data_bind(payload: dict, request: Request) -> JSONResponse:
     """Bind a server path as one of the user's datasets (one history row; nothing is copied yet:
     the run copies what it needs to HPC3 when it starts). Re-checks the path: the browser's earlier
     /check result is never trusted."""
-    conn = CONNECTIONS.get(payload.get("connection_id"))
-    if not conn:
-        return JSONResponse({"error": "Unknown connection id"}, status_code=404)
+    conn = _owned_conn(payload.get("connection_id"), request)
     from . import server_data as sd
     try:
         info = await asyncio.to_thread(_server_path_info, conn, str(payload.get("path") or ""))
@@ -3596,36 +4329,82 @@ def _upload_part_path(conn: Connection, upload_id: str) -> Path:
     return parts / f"{_safe_token(upload_id)}.part"
 
 
+# A finalized chunked upload leaves ``.parts/<id>.done`` behind for a while. Without it a re-sent last
+# chunk (the browser retries anything that did not answer) found no ``.part``, was told "0 bytes
+# received", and the browser started the whole upload again — forever, for files whose last request
+# outlived Envoy's 15 s limit.
+_FINALIZED_TTL_S = 6 * 3600
+
+
+def _finalized_marker(conn: Connection, upload_id: str) -> Path:
+    return _upload_part_path(conn, upload_id).with_suffix(".done")
+
+
+def _read_finalized(conn: Connection, upload_id: str) -> dict | None:
+    marker = _finalized_marker(conn, upload_id)
+    try:
+        if time.time() - marker.stat().st_mtime > _FINALIZED_TTL_S:
+            marker.unlink(missing_ok=True)
+            return None
+        return json.loads(marker.read_text())
+    except (OSError, ValueError):
+        return None
+
+
+def _write_finalized(conn: Connection, upload_id: str, info: dict) -> None:
+    try:
+        _finalized_marker(conn, upload_id).write_text(json.dumps(info))
+    except (OSError, TypeError, ValueError):
+        pass
+
+
+def _finalized_response(conn: Connection, info: dict) -> JSONResponse:
+    """The answer a finalized upload gave, again — with the copy's CURRENT state if it is staging."""
+    job = _staging_queue(conn).get(info.get("job_id") or "") if info.get("job_id") else None
+    if job is not None:
+        return _staging_response(job, peek=info.get("peek"))
+    return JSONResponse({"status": "uploaded", "name": info.get("name"), "path": info.get("path"),
+                         "size": info.get("size"), "peek": info.get("peek")})
+
+
 @app.get("/api/upload/status")
-async def upload_status(connection_id: str, upload_id: str) -> JSONResponse:
+async def upload_status(connection_id: str, upload_id: str, request: Request) -> JSONResponse:
     """How many bytes of a chunked upload are already on the server, so the browser
     can resume from there after an interruption."""
-    conn = CONNECTIONS.get(connection_id)
-    if not conn:
-        return JSONResponse({"error": "Unknown connection id"}, status_code=404)
+    conn = _owned_conn(connection_id, request)
     part = _upload_part_path(conn, upload_id)
+    if not part.exists():
+        info = _read_finalized(conn, upload_id)
+        if info is not None:   # already complete: nothing to send, only the outcome to collect
+            return JSONResponse({"upload_id": _safe_token(upload_id), "received": info.get("size", 0),
+                                 "finalized": True, "job_id": info.get("job_id", "")})
     received = part.stat().st_size if part.exists() else 0
     return JSONResponse({"upload_id": _safe_token(upload_id), "received": received})
 
 
 @app.post("/api/upload/chunk")
 async def upload_chunk(
+    request: Request,
     connection_id: str = Form(...),
     upload_id: str = Form(...),
     name: str = Form(...),
     offset: int = Form(...),
     done: bool = Form(False),
     chunk: UploadFile = File(...),
+    unpack: bool = Form(False),
 ) -> JSONResponse:
     """Append one chunk of a resumable dataset upload to a .part file. ``offset`` is
     where this chunk belongs; if it doesn't match what's on disk (a duplicate/old
     chunk) we return 409 + the true ``received`` so the client re-syncs and resumes.
     On ``done`` the .part file is finalized into the per-user uploads dir (same
     destination + dataset-history recording as /api/upload)."""
-    conn = CONNECTIONS.get(connection_id)
-    if not conn:
-        return JSONResponse({"error": "Unknown connection id"}, status_code=404)
+    conn = _owned_conn(connection_id, request)
     part = _upload_part_path(conn, upload_id)
+    if done and not part.exists():
+        info = _read_finalized(conn, upload_id)
+        if info is not None:
+            await chunk.close()
+            return _finalized_response(conn, info)      # a re-sent last chunk: the same outcome again
     current = part.stat().st_size if part.exists() else 0
     if offset != current:
         # out-of-order / duplicate chunk — tell the client where we actually are
@@ -3641,17 +4420,26 @@ async def upload_chunk(
     received = current + len(data)
     if not done:
         return JSONResponse({"status": "partial", "received": received})
-    # finalize: atomic rename of the .part into the uploads dir
-    safe = safe_filename(name or "dataset")
-    dest = conn.workspace / "uploads" / safe
+    # finalize: atomic rename of the .part into the uploads dir — under a free name, never over an
+    # earlier upload (which, with staging, may be a file still being copied)
+    uploads_dir = conn.workspace / "uploads"
+    safe = await asyncio.to_thread(_unique_upload_name, conn, uploads_dir, safe_filename(name or "dataset"))
+    dest = uploads_dir / safe
     part.replace(dest)
     size = dest.stat().st_size
     recorded_path = str(dest)
     peek = await asyncio.to_thread(_peek_local_upload, dest)   # skim locally before any staging
-    where = "the server (resumable)"
     if _uploads_on_hpc(conn):
-        recorded_path = await asyncio.to_thread(_stage_upload_to_hpc, conn, dest, safe)
-        where = "your HPC3 storage (resumable)"
+        # The queue records the dataset and announces it once the copy is verified. The browser
+        # gets an answer in seconds either way — never a request that outlives Envoy's 15 s.
+        job = _submit_staging(conn, dest, safe, name=safe, kind=_file_kind(safe), peek=peek,
+                              upload_id=_safe_token(upload_id), unpack=unpack)
+        _write_finalized(conn, upload_id, {"job_id": job.id, "name": safe, "size": size,
+                                           "path": job.remote_path, "peek": peek})
+        job = await _await_staging(conn, job) or job
+        return _staging_response(job, peek=peek)
+    _write_finalized(conn, upload_id, {"name": safe, "size": size, "path": recorded_path, "peek": peek})
+    where = "the server (resumable)"
     gist = (peek or {}).get("gist") or ""
     conn.emit("success", "upload",
               f"Uploaded {safe} ({size / 1e6:.1f} MB) to {where}." + (f" Skim: {gist}" if gist else ""))
@@ -3664,41 +4452,163 @@ async def upload_chunk(
                          "peek": peek})
 
 
+@app.get("/api/upload/staging")
+async def upload_staging(connection_id: str, request: Request, job_id: str = "", upload_id: str = "",
+                         folder: str = "", summary: int = 0) -> JSONResponse:
+    """Where this user's background copies to HPC3 stand: one job (by its id, or by the upload
+    layer's ``upload_id``), one folder, or the whole list (unfinished and failed ones, plus copies
+    that finished in the last 10 minutes). With ``summary=1`` the list holds single files only and
+    every folder is one entry of ``folders``: a folder of 5,000 files is 5,000 jobs, and the page
+    that restores its cards after a reload needs one line for it, not all of them."""
+    conn = _owned_conn(connection_id, request)
+    q = _staging_queue(conn)
+    if job_id or upload_id:
+        job = q.get(job_id) if job_id else q.find_upload(upload_id)
+        return JSONResponse({"job": job.public() if job else None})
+    if folder:
+        name = safe_relpath(folder).split("/")[0]
+        jobs = q.jobs(name)
+        return JSONResponse({"folder": _staged_folder_summary(q, name, jobs),
+                             "jobs": [j.public() for j in jobs if j.state != "done"][:50]})
+    recent = time.time() - 600
+    jobs = [j for j in q.jobs() if j.state != "done" or j.updated_at >= recent]
+    if not summary:
+        return JSONResponse({"jobs": [j.public() for j in jobs]})
+    by_folder: dict[str, list] = {}
+    for j in q.jobs():
+        if j.folder:
+            by_folder.setdefault(j.folder, []).append(j)
+    folders = [_staged_folder_summary(q, name, js) for name, js in sorted(by_folder.items())]
+    return JSONResponse({"jobs": [j.public() for j in jobs if not j.folder],
+                         "folders": [f for f in folders if not f.get("recorded")]})
+
+
+def _staged_folder_summary(q: "staging.StagingQueue", name: str, jobs: list) -> dict:
+    meta = {k: v for k, v in q.store.folder(name).items() if k != "user_id"}
+    return {**meta, "name": name, "count": len(jobs), "size": sum(j.size for j in jobs),
+            "sent": sum(j.sent if j.state != "done" else j.size for j in jobs),
+            "done": sum(1 for j in jobs if j.state == "done"),
+            "pending": sum(1 for j in jobs if j.state in staging.ACTIVE),
+            "failed": sum(1 for j in jobs if j.state in ("failed", "cancelled"))}
+
+
+@app.post("/api/upload/staging/retry")
+async def upload_staging_retry(payload: dict, request: Request) -> JSONResponse:
+    """Retry a failed copy — one job, or every failed file of a folder."""
+    conn = _owned_conn(payload.get("connection_id"), request)
+    if not _uploads_on_hpc(conn):
+        return JSONResponse({"error": "Uploads are not copied to HPC3 in this session."}, status_code=400)
+    q = _staging_queue(conn)
+    folder = safe_relpath(str(payload.get("folder") or "")).split("/")[0]
+    ids = [str(payload.get("job_id") or "")] if not folder else \
+        [j.id for j in q.jobs(folder) if j.state in ("failed", "queued")]
+    if folder:
+        q.store.update_folder(folder, reported=False)
+    retried = [i for i in ids if i and q.retry(i)]
+    upload_log.record(conn.workspace, "retry_asked", folder=folder, job_ids=",".join(ids),
+                      retried=len(retried))
+    return JSONResponse({"status": "retrying" if retried else "nothing_to_retry", "job_ids": retried})
+
+
+@app.post("/api/upload/staging/cancel")
+async def upload_staging_cancel(payload: dict, request: Request) -> JSONResponse:
+    """Stop a copy — one job, or every copy of a folder that is still running. The local file is
+    deleted; nothing is recorded. Files of the folder that already reached HPC3 stay there."""
+    conn = _owned_conn(payload.get("connection_id"), request)
+    q = _staging_queue(conn)
+    folder = safe_relpath(str(payload.get("folder") or "")).split("/")[0]
+    ids = [str(payload.get("job_id") or "")] if not folder else \
+        [j.id for j in q.jobs(folder) if j.state in staging.ACTIVE]
+    stopped = [i for i in ids if i and q.cancel(i)]
+    upload_log.record(conn.workspace, "cancel_asked", folder=folder, job_ids=",".join(ids),
+                      stopped=len(stopped))
+    return JSONResponse({"status": "cancelled" if stopped else "not_running", "job_ids": stopped})
+
+
+@app.post("/api/upload/staging/dismiss")
+async def upload_staging_dismiss(payload: dict, request: Request) -> JSONResponse:
+    """Drop a settled copy from the list — one job, or every failed or cancelled file of a folder.
+    A failed one can then never be retried, so the local file and the remote ``.part`` it kept for
+    that go too."""
+    conn = _owned_conn(payload.get("connection_id"), request)
+    q = _staging_queue(conn)
+    folder = safe_relpath(str(payload.get("folder") or "")).split("/")[0]
+    ids = [str(payload.get("job_id") or "")] if not folder else \
+        [j.id for j in q.jobs(folder) if j.state in ("failed", "cancelled")]
+    dropped = [job for job in (q.forget(i) for i in ids if i) if job is not None]
+    for job in dropped:
+        if job.state == "failed":
+            await asyncio.to_thread(_discard_leftovers, conn.owner, job)
+    upload_log.record(conn.workspace, "dismissed", folder=folder,
+                      job_ids=",".join(job.id for job in dropped))
+    return JSONResponse({"status": "dismissed", "job_ids": [job.id for job in dropped]})
+
+
+@app.post("/api/upload/report")
+async def upload_report(payload: dict, request: Request) -> JSONResponse:
+    """The browser says an upload ended in an error. Most of those never reach the server by
+    themselves (the connection dropped, the page could not read the file), so without this the
+    server's record of the upload simply stops."""
+    conn = _owned_conn(payload.get("connection_id"), request)
+
+    def number(value: Any) -> "int | None":
+        try:
+            return int(value)
+        except (TypeError, ValueError):
+            return None
+
+    upload_log.record(conn.workspace, "browser_error", name=str(payload.get("name") or "")[:300],
+                      kind=str(payload.get("kind") or "")[:20], size=number(payload.get("size")),
+                      sent=number(payload.get("sent")), error=str(payload.get("error") or "")[:500])
+    return JSONResponse({"status": "logged"})
+
+
+@app.get("/api/upload/log")
+async def upload_log_tail(connection_id: str, request: Request, limit: int = 200) -> JSONResponse:
+    """The caller's newest upload events (see upload_log), oldest first."""
+    conn = _owned_conn(connection_id, request)
+    events = await asyncio.to_thread(upload_log.tail, conn.workspace, max(1, min(int(limit), 2000)))
+    return JSONResponse({"events": events})
+
+
 @app.post("/api/upload/discard")
-async def upload_discard(payload: dict) -> JSONResponse:
+async def upload_discard(payload: dict, request: Request) -> JSONResponse:
     """Discard an in-progress chunked upload — delete its ``.part`` file so a **cancelled** upload
     leaves nothing half-written on the server. Idempotent (no error if there is nothing to remove)."""
-    conn = CONNECTIONS.get(payload.get("connection_id"))
-    if not conn:
-        return JSONResponse({"error": "Unknown connection id"}, status_code=404)
+    conn = _owned_conn(payload.get("connection_id"), request)
     upload_id = str(payload.get("upload_id") or "")
     if not upload_id:
         return JSONResponse({"error": "upload_id required"}, status_code=400)
     part = _upload_part_path(conn, upload_id)
     existed = part.exists()
     part.unlink(missing_ok=True)
+    _finalized_marker(conn, upload_id).unlink(missing_ok=True)
     return JSONResponse({"status": "discarded", "existed": existed})
 
 
 @app.post("/api/dataset/describe")
-async def describe_dataset_endpoint(payload: dict) -> JSONResponse:
+async def describe_dataset_endpoint(payload: dict, request: Request) -> JSONResponse:
     """On-demand content triage of an uploaded dataset: deterministic peek + LLM description.
 
     This is the "skim any file and get the gist" surface for when a model IS available. The LLM step
     runs ONLY if this session already has a reachable served model; it never provisions a GPU (upload
     and triage must not trigger the ~10-min A100 spin-up). With no model up, the deterministic peek
     plus a note is returned so the caller still gets the gist. Reads only a bounded head — a remote
-    dfs3b file is never pulled back in full."""
-    conn = CONNECTIONS.get(payload.get("connection_id"))
-    if not conn:
-        return JSONResponse({"error": "Unknown connection id"}, status_code=404)
+    dfs3b file is never pulled back in full. Only the caller's own connection, and only a path
+    :func:`_describable_path` admits: anything else is a 403, never read."""
+    conn = _owned_conn(payload.get("connection_id"), request)
     path = str(payload.get("path") or "").strip()
     if not path:
         return JSONResponse({"error": "path required"}, status_code=400)
     name = str(payload.get("name") or path.rsplit("/", 1)[-1])
+    readable = _describable_path(conn, path)
+    if readable is None:
+        return JSONResponse({"error": f"Refusing to read {path}: only your own uploads, your HPC3 "
+                                      "storage, or a server folder that can be bound can be "
+                                      "described."}, status_code=403)
 
     try:
-        peek = await asyncio.to_thread(_peek_dataset_any, conn, path, name)
+        peek = await asyncio.to_thread(_peek_dataset_any, conn, readable, name)
     except Exception as exc:  # noqa: BLE001 - peek is meant to be total; be defensive at the boundary
         return JSONResponse({"error": f"peek failed: {type(exc).__name__}: {exc}"}, status_code=500)
 
@@ -4096,6 +5006,9 @@ async def _dispatch_lab(conn: Connection, req: LabRequest) -> None:
     if _fast_path(req):
         await _run_quick_chat(conn, req)
         return
+    if _corpus_path(req):
+        await _run_corpus_scan(conn, req)
+        return
     target = _followup_target(conn, req)
     if target is None:
         # Nothing to attach a follow-up to, so this message would mint a FRESH study. Refuse to do
@@ -4166,7 +5079,161 @@ def _fast_path(req: LabRequest) -> bool:
     return str(getattr(req, "route", "") or "").strip().lower() == "chat"
 
 
-def _quickchat_stream_fn(conn: Connection, model: str, base_url: str | None, api_key: str | None):
+def _corpus_path(req: LabRequest) -> bool:
+    """True when the user picked the corpus-scan line (``route == "corpus"``): one literature
+    tool over the whole indexed corpus, no PI, no plan, no report — the tables are the result."""
+    return str(getattr(req, "route", "") or "").strip().lower() == "corpus"
+
+
+CORPUS_TOOL = "extract_haploinsufficient_genes"
+CORPUS_MAX_ATTEMPTS = 3      # submissions of the job per run: the first plus two resumes after a lost model
+
+
+async def _run_corpus_scan(conn: Connection, req: LabRequest) -> None:
+    """The third line next to Research and Chat: run ``extract_haploinsufficient_genes`` over the
+    indexed corpus as one HPC3 literature job and hand back its two CSVs.
+
+    Shares the run lifecycle with the other two (``chat_running``, per-run ``chat_stop``, the
+    ``chat_start`` → ``chat_token`` → ``chat_done`` WS protocol, the ``artifacts`` event for the
+    downloads panel) and touches neither engine: no planner, no Scientist/Critic, no report
+    bundle, no ``run_state.json`` — so a later research message cannot mistake this run for a
+    study to amend. The run does get an id and a ``<workspace>/<run_id>/artifacts`` dir, which is
+    what makes ``genes.csv`` / ``hits.csv`` downloadable."""
+    run = conn.active_run or conn.begin_run(req.conversation_id)
+    if req.conversation_id and not run.conversation_id:
+        run.conversation_id = req.conversation_id
+    run.kind = "corpus"
+    run_id = run.run_id or uuid4().hex[:12]
+    conn.bind_run_id(run, run_id)
+    run.chat_stop.clear()
+    run.hard_stop.clear()
+    conn.pull_injections()
+    conn.chat_running = True
+    conn.push({"type": "chat_start"})
+    emit = conn.emit_fn()
+
+    def say(text: str, level: str = "info") -> None:
+        conn.push({"type": "lab_progress", "text": text, "level": level})
+
+    art = conn.workspace / run_id / "artifacts"
+    try:
+        if _AUTH_ENABLED and conn.app_user_id:
+            try:
+                auth_routes.record_run_start(conn.app_user_id, run_id, req.question, False,
+                                             conversation_id=run.conversation_id)
+            except Exception as exc:  # noqa: BLE001 - history is best-effort
+                print(f"[auth] record_run_start failed: {exc}")
+        executor = _build_literature_executor(conn, run_id=run_id)
+        if executor is None:
+            raise GatewayError(
+                "The corpus scan needs the literature line on HPC3 (AISCIENTIST_PAPERQA_ON_HPC, "
+                "paperqa.sif, and this session's served model). None of that is available on this "
+                "session, so nothing was started.", stage="corpus")
+        executor.notify = lambda level, message: emit(level, "corpus", message)
+        from ..agents.research_harness import HarnessContext
+        ctx = HarnessContext(decisions={}, workspace=conn.workspace / run_id,
+                             model=conn.selected_model, tunnel_port=conn.tunnel_port,
+                             llm_is_remote=False)
+        emit("step", "corpus", f"Corpus scan: {CORPUS_TOOL} (model: {conn.selected_model}).")
+        say("📚 Scanning the whole indexed corpus for explicitly reported haploinsufficient genes — "
+            "one HPC3 job (text → candidate sentences → the model judges each one → verified "
+            "quotes). This takes about an hour; the tables appear below when it finishes.")
+        # The scan outlives most serve jobs' luck: a free-partition card gets preempted, a paid one
+        # hits its --time. The tool gives the model up for dead after a short streak of refused
+        # connections and returns model_unreachable with what it judged so far; the session's own
+        # recovery (reattach, or resubmit and wait for a card) brings a model back, and the job is
+        # resubmitted — it resumes from the kept judgments, so nothing is paid for twice.
+        result: dict[str, Any] = {}
+        for attempt in range(1, CORPUS_MAX_ATTEMPTS + 1):
+            result = await asyncio.to_thread(executor.run_tool, CORPUS_TOOL, {}, ctx)
+            if run.chat_stop.is_set() or str(result.get("status") or "") == "cancelled":
+                conn.push({"type": "chat_stopped"})
+                return
+            if not result.get("model_unreachable") or attempt == CORPUS_MAX_ATTEMPTS:
+                break
+            say(f"⚠ The served model went away mid-scan ({result.get('n_judged', 0)} of "
+                f"{result.get('n_candidates', '?')} sentences judged so far). Bringing a model back, "
+                f"then resuming — attempt {attempt + 1} of {CORPUS_MAX_ATTEMPTS}.", "warning")
+            await asyncio.to_thread(_heal_vllm_session, conn)      # raises GatewayError if it cannot
+            if run.chat_stop.is_set():
+                conn.push({"type": "chat_stopped"})
+                return
+        status = str(result.get("status") or "")
+        if status != "ok":
+            msg = str(result.get("error") or result.get("note") or f"status {status}")
+            raise GatewayError(f"The corpus scan did not finish: {msg}", stage="corpus",
+                               detail=json.dumps(result, default=str)[:2000])
+        conn.push({"type": "chat_token", "token": _corpus_summary_md(result)})
+        items = [
+            {"name": p.name, "kind": _file_kind(p.name), "summary": _file_kind(p.name),
+             "url": f"/api/file/{conn.owner}/{run_id}/{p.relative_to(art).as_posix()}"}
+            for p in sorted(art.rglob("*")) if p.is_file()
+        ]
+        if items:
+            conn.push({"type": "artifacts", "items": items, "bundle_url": f"/api/bundle/{conn.owner}/{run_id}"})
+        else:
+            say("⚠ The job reported success but no files were synced back from HPC3.", "warning")
+        emit("success", "corpus",
+             f"Corpus scan done: {result.get('n_genes')} genes from {result.get('n_hits_eligible')} "
+             f"verified sentences ({result.get('n_candidates')} judged, {result.get('n_papers')} papers).")
+        _finish_run_record(conn, run_id, "done", str(art),
+                           f"{result.get('n_genes')} haploinsufficient genes (corpus scan)")
+        conn.push({"type": "chat_done"})
+    except GatewayError as exc:
+        print(f"[corpus] scan failed ({exc.stage or 'corpus'}): {exc.message}")
+        traceback.print_exc()
+        conn.emit("error", exc.stage or "corpus", exc.message, detail=error_detail(exc))
+        conn.push({"type": "chat_error", "message": exc.message})
+        _finish_run_record(conn, run_id, "failed", str(art), exc.message)
+    except Exception as exc:  # noqa: BLE001 - reported, never fatal
+        print(f"[corpus] scan failed (unhandled): {type(exc).__name__}: {exc}")
+        traceback.print_exc()
+        conn.emit("error", "corpus", f"Corpus scan failed: {exc}", detail=error_detail(exc))
+        conn.push({"type": "chat_error", "message": str(exc)})
+        _finish_run_record(conn, run_id, "failed", str(art), str(exc))
+    finally:
+        conn.chat_running = False
+        conn.end_run(run)
+
+
+def _corpus_summary_md(result: dict[str, Any]) -> str:
+    """The chat bubble for a finished corpus scan: the counts, the gene list with its review
+    flags, and the warnings — written from the tool's result, nothing generated."""
+    lines = [
+        "**Corpus scan finished** — explicitly reported haploinsufficient genes in retinal disease.",
+        "",
+        f"- Papers read: **{result.get('n_papers')}**, sentences: {result.get('n_sentences')}, "
+        f"candidate sentences judged: {result.get('n_candidates')}",
+        f"- Verified mechanism statements: **{result.get('n_hits_eligible')}** → "
+        f"genes: **{result.get('n_genes')}**",
+        "",
+        "`genes.csv` (one row per gene: HGNC symbol, phenotype and mechanism as written, up to 3 PMIDs "
+        "with verbatim quotes, review flags) and `hits.csv` (every judged sentence, all mechanism "
+        "classes) are in the downloads below.",
+        "",
+    ]
+    genes = list(result.get("genes") or [])
+    if genes:
+        lines.append("| gene | papers | phenotype (as written) | review flags |")
+        lines.append("|---|---|---|---|")
+        for g in genes:
+            flags = ", ".join(g.get("flags") or []) or "—"
+            lines.append(f"| {g.get('gene')} | {g.get('n_papers')} | {g.get('phenotype') or ''} | {flags} |")
+        lines.append("")
+    flagged = list(result.get("genes_flagged_for_review") or [])
+    if flagged:
+        lines.append(f"Read these first (a flag is a question for the curator, not an exclusion): "
+                     f"{', '.join(flagged)}.")
+        lines.append("")
+    for w in result.get("warnings") or []:
+        lines.append(f"⚠ {w}")
+    lines.append("")
+    lines.append(f"_Definition used: {result.get('definition', '')}_")
+    return "\n".join(lines)
+
+
+def _quickchat_stream_fn(conn: Connection, model: str, base_url: str | None, api_key: str | None,
+                         native_anthropic: bool = False):
     """Bind ``vllm_client.chat_tools_stream`` to this session's tunnel.
 
     Deliberately NOT routed through ``_lab_llm``'s ``_with_recovery``: that helper retries a whole
@@ -4176,6 +5243,11 @@ def _quickchat_stream_fn(conn: Connection, model: str, base_url: str | None, api
     as a chat error instead; the user retypes, which costs seconds here (the whole premise of this
     path) rather than the minutes a lab re-run would."""
     def _stream(messages: list[dict], schemas: list[dict]):
+        if native_anthropic:
+            from . import anthropic_client
+            return anthropic_client.chat_tools_stream(model, messages, schemas, api_key=api_key or "",
+                                                      base_url=base_url,
+                                                      effort=anthropic_client.role_effort("chat"))
         port = 0 if base_url else (conn.tunnel_port or 0)
         # Bump the output cap from the 2048 default: a long enumeration answer plus its
         # reference list was truncating mid-references (and then the citation-check footer
@@ -4186,7 +5258,8 @@ def _quickchat_stream_fn(conn: Connection, model: str, base_url: str | None, api
     return _stream
 
 
-def _quickchat_context_fns(conn: Connection, model: str, base_url: str | None, api_key: str | None):
+def _quickchat_context_fns(conn: Connection, model: str, base_url: str | None, api_key: str | None,
+                           native_anthropic: bool = False):
     """The two functions ``run_quick_chat`` needs for context management, bound to this
     session's tunnel — ``(count_tokens_fn, summarize_fn)``.
 
@@ -4202,6 +5275,8 @@ def _quickchat_context_fns(conn: Connection, model: str, base_url: str | None, a
         # EXACT prompt tokens from vLLM /tokenize — the SAME tokenizer + chat template the
         # server enforces --max-model-len with. Returns None for a remote base_url or any
         # transport error, and never raises (see vllm_client.count_tokens).
+        if native_anthropic:
+            return None
         port = 0 if base_url else (conn.tunnel_port or 0)
         return vllm_client.count_tokens(port, model, messages, tools,
                                         base_url=base_url, api_key=api_key)
@@ -4212,6 +5287,12 @@ def _quickchat_context_fns(conn: Connection, model: str, base_url: str | None, a
         # return EMPTY content (the map_phenotype_to_hpo failure mode). The timeout is short —
         # this runs before the user's first token, so a hung summarizer must fail fast and let
         # the compactor degrade to dropping the oldest turns.
+        if native_anthropic:
+            from . import anthropic_client
+            text, _ = anthropic_client.complete_ex(model, messages, api_key=api_key or "",
+                                                   base_url=base_url, timeout=90.0,
+                                                   max_tokens=max(4096, 4 * max_tokens), effort="low")
+            return text
         port = 0 if base_url else (conn.tunnel_port or 0)
         return vllm_client.complete(port, model, messages, timeout=90.0, max_tokens=max_tokens,
                                     base_url=base_url, api_key=api_key, think=False)
@@ -4251,6 +5332,20 @@ async def _run_quick_chat(conn: Connection, req: LabRequest) -> None:
         api_key = os.environ.get("AISCIENTIST_LLM_API_KEY") or None
         model = (os.environ.get("AISCIENTIST_LLM_MODEL") or "qwen/qwen3.6-35b-a3b") if base_url \
             else conn.selected_model
+        native_anthropic = False
+        # The session's own API key wins, exactly as in _lab_llm. A key-only session has no GPU
+        # tunnel, so before this the fast chat had nothing to talk to.
+        cred = _session_credential(conn)
+        if cred is not None:
+            from . import llm_credentials, llm_providers
+            api_key = llm_credentials.resolve_secret(conn.owner, cred["id"])
+            if not api_key:
+                raise GatewayError(
+                    f"The API key for “{cred.get('label') or 'this endpoint'}” could not be read. "
+                    "Re-enter it under API endpoints.", stage="llm_credential")
+            base_url = cred.get("base_url") or None
+            model = cred.get("model") or model
+            native_anthropic = llm_providers.transport_for(cred.get("provider"), base_url) == "anthropic"
         emit("step", "chat", f"Fast chat turn (model: {model}).")
 
         tools = build_quickchat_catalog(literature_executor=_build_literature_executor(conn))
@@ -4296,10 +5391,11 @@ async def _run_quick_chat(conn: Connection, req: LabRequest) -> None:
                                "compacted": bool(ev.get("compacted"))})
 
         memory = conn.chat_memory.get(req.conversation_id or "", {})
-        count_tokens_fn, summarize_fn = _quickchat_context_fns(conn, model, base_url, api_key)
+        count_tokens_fn, summarize_fn = _quickchat_context_fns(conn, model, base_url, api_key,
+                                                               native_anthropic)
         result = await asyncio.to_thread(
             run_quick_chat,
-            stream_fn=_quickchat_stream_fn(conn, model, base_url, api_key),
+            stream_fn=_quickchat_stream_fn(conn, model, base_url, api_key, native_anthropic),
             tools=tools, question=req.question, history=list(req.history or []), context=ctx,
             on_event=on_event, config=QuickChatConfig(verify_citations=True),
             should_cancel=run.chat_stop.is_set,
@@ -4357,14 +5453,12 @@ def _default_rerun_index(state: dict) -> int:
 
 
 @app.post("/api/lab")
-async def lab(req: LabRequest) -> JSONResponse:
+async def lab(req: LabRequest, request: Request) -> JSONResponse:
     """Run the role-based research lab (PI -> Scientist -> Critic -> converge) over
     this session's vLLM, streaming each role's progress to the log + the final report
     to the chat. A typed follow-up after a completed run is routed by _dispatch_lab (edit /
     re-run-step / new study) instead of always minting a fresh study."""
-    conn = CONNECTIONS.get(req.connection_id)
-    if not conn:
-        return JSONResponse({"error": "Unknown connection id"}, status_code=404)
+    conn = _owned_conn(req.connection_id, request)
     # A run needs the whole stack (SSH + GPU + a served model), and /api/connect brings those up
     # together — so "ready" is the only state a run may start from. Anything else (still
     # connecting/provisioning, errored, disconnected) is rejected rather than silently waiting.
@@ -4396,15 +5490,13 @@ def _default_run_id(conn: Connection, explicit: str | None, conversation_id: str
 
 
 @app.post("/api/lab/continue")
-async def lab_continue(req: ContinueRunRequest) -> JSONResponse:
+async def lab_continue(req: ContinueRunRequest, request: Request) -> JSONResponse:
     """A2 continuation: re-run ONE changed analysis step (and everything downstream of it) from a
     prior run, reusing the earlier steps' checkpoints — instead of re-planning + re-running the whole
     pipeline. Loads the run's persisted run_state.json, builds a ResumeState, and re-enters _run_lab
     with the SAME run_id so the report is rebuilt in place. Needs a live session (the redone step +
     synthesis call the model)."""
-    conn = CONNECTIONS.get(req.connection_id)
-    if not conn:
-        return JSONResponse({"error": "Unknown connection id"}, status_code=404)
+    conn = _owned_conn(req.connection_id, request)
     if conn.status != "ready" or conn.executor is None:
         return JSONResponse({"error": f"Connection is not ready (status={conn.status})."}, status_code=409)
     if conn.chat_running:
@@ -4523,14 +5615,12 @@ def _prepare_continue(connection_id: str, conn: Connection, run_id: str, art: Pa
 
 
 @app.post("/api/lab/plan")
-async def lab_plan_review(req: PlanReviewRequest) -> JSONResponse:
+async def lab_plan_review(req: PlanReviewRequest, request: Request) -> JSONResponse:
     """Receive the user's decision on the PI's proposed plan and unblock the lab worker
     waiting on ``conn.plan_event``. The user no longer text-edits the agenda; they
     APPROVE it, CANCEL, or REVISE it with natural-language ``feedback`` that goes back to
     the PI for a re-draft (also how a clarify question is answered)."""
-    conn = CONNECTIONS.get(req.connection_id)
-    if not conn:
-        return JSONResponse({"error": "Unknown connection id"}, status_code=404)
+    conn = _owned_conn(req.connection_id, request)
     action = (req.action or "approve").strip().lower()
     if req.approved is False:                       # back-compat: {approved:false} == cancel
         action = "cancel"
@@ -4557,16 +5647,14 @@ class ConfirmRequestBody(BaseModel):
 
 
 @app.post("/api/confirm")
-async def confirm_agent_action(req: ConfirmRequestBody) -> JSONResponse:
+async def confirm_agent_action(req: ConfirmRequestBody, request: Request) -> JSONResponse:
     """Answer the agent's HITL prompt for an out-of-bounds action.
 
     Resolved to the OWNING run, exactly like plan review: on a shared SSH session an approval
     clicked in one window must never satisfy a different window's prompt — that is the whole
     reason these events live on ``RunState`` rather than the connection.
     """
-    conn = CONNECTIONS.get(req.connection_id)
-    if not conn:
-        return JSONResponse({"error": "Unknown connection id"}, status_code=404)
+    conn = _owned_conn(req.connection_id, request)
     target = conn.resolve_run(req.run_id, req.conversation_id)
     if target is None:
         return JSONResponse({"status": "stale", "approved": False})
@@ -4714,6 +5802,13 @@ def _lab_llm(conn: Connection) -> "LabLLM":
         model = conn.selected_model
         label = "vLLM"
 
+    # Wire protocol. Every provider but one speaks OpenAI's /chat/completions (vllm_client); an
+    # Anthropic key speaks /v1/messages (anthropic_client, the official SDK) — for the reasoning
+    # roles AND the Scientist's tool loop, since a key-only session has no GPU to fall back on.
+    from . import anthropic_client, llm_providers
+    native_anthropic = (cred is not None
+                        and llm_providers.transport_for(cred.get("provider"), base_url) == "anthropic")
+
     def _port() -> int:
         # Read the LIVE tunnel port on every call: a mid-run recovery (_heal_vllm_session)
         # rebinds conn.tunnel_port to a fresh local port, and the retry must use the new one.
@@ -4767,10 +5862,20 @@ def _lab_llm(conn: Connection) -> "LabLLM":
         # ``max_tokens`` at all — the lab computes one, but the injected ``(messages) -> str``
         # contract had nowhere to put it — which left a reasoning model free to think without bound.
         cap = vllm_client.lab_max_tokens(role) if lab_base_url else None
+        if cap and native_anthropic:
+            cap = anthropic_client.lab_max_tokens(role, cap)   # thinking counts against it
+
+        def _remote(cap_: int | None):
+            if native_anthropic:
+                return anthropic_client.complete_ex(lab_model, messages, api_key=lab_key,
+                                                    base_url=lab_base_url, max_tokens=cap_,
+                                                    effort=anthropic_client.role_effort(role))
+            return vllm_client.complete_ex(0, lab_model, messages, base_url=lab_base_url,
+                                           api_key=lab_key, max_tokens=cap_)
+
         started = time.monotonic()
         if lab_base_url:
-            text, usage = vllm_client.complete_ex(0, lab_model, messages, base_url=lab_base_url,
-                                                  api_key=lab_key, max_tokens=cap)
+            text, usage = _remote(cap)
             # A reply cut off at the ceiling is not a short reply — it is BROKEN. A truncated
             # agenda is unparseable JSON, and the PI then silently falls back to an agenda made of
             # the user's own question. The ceiling was measured against one model; a more verbose
@@ -4788,8 +5893,7 @@ def _lab_llm(conn: Connection) -> "LabLLM":
                                   duration_ms=int((time.monotonic() - started) * 1000))
                 started = time.monotonic()
                 cap = cap * 2
-                text, usage = vllm_client.complete_ex(0, lab_model, messages, base_url=lab_base_url,
-                                                      api_key=lab_key, max_tokens=cap)
+                text, usage = _remote(cap)
         else:
             # No wall-clock limit on the cluster's own GPU: a planning or write-up call may think
             # for as long as it needs (Yijun, 2026-09-28). Only SILENCE ends it (a dead node or a
@@ -4804,6 +5908,18 @@ def _lab_llm(conn: Connection) -> "LabLLM":
         return text
 
     def scientist_chat(messages, tools):
+        if native_anthropic:
+            # Claude runs the tool loop itself. Each turn is metered, so it is recorded like a lab
+            # call; the raw content blocks ride back on the turn (provider_blocks) for replay.
+            started = time.monotonic()
+            out = anthropic_client.chat_tools(model, messages, tools, api_key=api_key,
+                                              base_url=base_url,
+                                              effort=anthropic_client.role_effort("scientist"))
+            _record_lab_usage(conn, role="scientist", model=model, endpoint=f"{model} @ {label}",
+                              remote=True, usage=out.get("usage") or {},
+                              max_tokens=anthropic_client.scientist_max_tokens(),
+                              duration_ms=int((time.monotonic() - started) * 1000))
+            return out
         # The Scientist's tool turns get a role effort like every lab call
         # (AISCIENTIST_VLLM_REASONING_EFFORT_SCIENTIST, else the global one). Without it Qwen3.8 thought
         # at its default xhigh and ran out of its output reservation before acting.
@@ -4823,9 +5939,13 @@ def _lab_llm(conn: Connection) -> "LabLLM":
 
     def count_tokens(messages, tools):
         # EXACT prompt token count via vLLM /tokenize — server-side, inside the GPU
-        # node's Singularity container. Returns None for a remote base_url (no /tokenize)
+        # node's Apptainer container. Returns None for a remote base_url (no /tokenize)
         # so the harness falls back to its char estimate. Best-effort: not worth a heal +
         # retry (the harness already degrades to a char estimate if this can't answer).
+        # Anthropic has a count endpoint, but it is one more round trip per turn and the
+        # harness's window (262k) sits far inside Claude's (1M): the estimate is enough.
+        if native_anthropic:
+            return None
         return vllm_client.count_tokens(_port(), model, messages, tools,
                                         base_url=base_url, api_key=api_key)
 
@@ -4999,7 +6119,9 @@ def _lab_event_to_chat(ev: dict[str, Any]) -> list[dict[str, Any]]:
         # Never rendered before, so a 7-minute wait and a 1-minute wait on the same question
         # looked like random slowness. Say which and why.
         why = {"dataset_design": "the dataset has an experimental contrast (comparative study)",
-               "question": "the PI's read of the question"}.get(str(ev.get("reason")), "")
+               "question": "the PI's read of the question",
+               "scope": "your request names the only analyses it wants"}.get(
+                   str(ev.get("reason")), "")
         if ev.get("mode") == "team":
             progress(f"👥 Team mode — the PI will form an expert team and hold a design meeting "
                      f"before drafting the plan (adds a few minutes){' — ' + why if why else ''}.")
@@ -5095,9 +6217,24 @@ def _lab_event_to_chat(ev: dict[str, Any]) -> list[dict[str, Any]]:
         if after:
             progress(f"🔬 Plan revised by the Critic ({len(list(ev.get('before') or []))} → "
                      f"{len(after)} steps): {str(ev.get('reason', ''))[:200]}")
+    elif t == "scope":
+        # What the request itself limited the run to, read before planning (agents/scope.py). Said
+        # up front, because the plan that follows is shorter than this dataset would otherwise get.
+        if ev.get("keep") or ev.get("exclude"):
+            progress(f"🎯 Scope from your request — {ev.get('text', '')}. Steps outside it are "
+                     "left out of the plan; say so in chat if you want one back.")
+        elif ev.get("brief_report"):
+            progress("🎯 Brief report requested — the run ends with a short summary, not the full "
+                     "manuscript.")
+    elif t == "scope_unmatched":
+        progress(f"🎯 Your limit ({ev.get('text', '')}) matched no step of this plan, so the plan is "
+                 "shown whole — remove what you do not want in chat.", level="warning")
     elif t == "steps_pruned":
         dropped = list(ev.get("dropped") or [])
-        if ev.get("reason") == "no_experimental_contrast":
+        if ev.get("reason") == "user_scope":
+            progress(f"✂️ Left out {len(dropped)} step(s) your request ruled out: "
+                     + "; ".join(str(s).split(" — ")[0].replace("**", "")[:60] for s in dropped[:6]))
+        elif ev.get("reason") == "no_experimental_contrast":
             progress(f"✂️ Dropped {len(dropped)} pathway-enrichment step(s): the dataset is already "
                      f"annotated with no experimental contrast, so enrichment on identity markers "
                      f"would be circular.")
@@ -5339,23 +6476,189 @@ def _lab_event_to_chat(ev: dict[str, Any]) -> list[dict[str, Any]]:
     return out
 
 
+def _host_code_allowed() -> bool:
+    """Whether code the model wrote may run on THIS host.
+
+    Only on a console without accounts, where whoever uses it started the gateway themselves and
+    the code runs as them. With accounts on the gateway is a shared service, and the local
+    ``CodeSandbox`` is a plain subprocess of it: a snippet runs as the service user, which reads
+    every account's saved HPC3 keys and API keys (``AISCIENTIST_STATE_DIR``), the deployment's
+    ``.env`` and every other account's runs, and can rewrite the application itself. A signed-in
+    account's ``run_code`` therefore runs on HPC3, as that account's own cluster user, or not at
+    all: no local sandbox and no local fallback (``_build_code_executor``)."""
+    return not _AUTH_ENABLED
+
+
+async def _build_code_executor(conn: Connection, run: "RunState | None", run_id: str,
+                               decisions: dict[str, Any], art: Path,
+                               emit: Callable[..., Any]) -> Any:
+    """``run_code``'s executor for this run: Slurm jobs on HPC3, the local sandbox, or a refusal.
+
+    The ONE place the gateway builds a local ``CodeSandbox`` (a test fails if another appears), and
+    it does so only where ``_host_code_allowed``. Otherwise every way a snippet used to reach the
+    gateway host ends in an ``UnavailableCodeExecutor`` or a failed call instead: run_code-on-HPC3
+    switched off, a mock session, no live SSH session, a workspace that could not be set up, and a
+    failed Slurm job (``SlurmCodeExecutor`` gets no ``local_fallback``)."""
+    from .slurm_sandbox import UnavailableCodeExecutor
+
+    # The CodeAct sandbox can read this run's dataset + checkpoints and write new artifacts
+    # (exposed as AISCIENTIST_DATASET / AISCIENTIST_WORK / AISCIENTIST_ARTIFACTS).
+    sandbox = None
+    if _host_code_allowed():
+        from ..agents.sandbox import CodeSandbox
+        sandbox = CodeSandbox(
+            should_cancel=conn.chat_stop.is_set,   # Stop kills the in-flight run_code subprocess
+            dataset_path=decisions.get("dataset_path"),
+            work_dir=str(conn.workspace / run_id / "work"),
+            artifacts_dir=str(art),
+            # Expose the WHOLE per-user uploads tree so run_code can reach every uploaded
+            # file/folder — incl. folders added after the primary dataset was chosen.
+            uploads_dir=str(conn.workspace / "uploads"),
+            dataset_root=decisions.get("dataset_root"),
+        )
+
+    def _unavailable(why: str) -> Any:
+        reason = (f"run_code is not available in this run: {why}. With accounts on it runs only as "
+                  "a Slurm job on HPC3 under your own cluster account, never on the AiScientist "
+                  "server. Use the other tools for this step.")
+        emit("warning", "lab", reason)
+        return UnavailableCodeExecutor(reason)
+
+    # Opt-in: run CodeAct snippets as CPU Slurm batch jobs on HPC3 so `#SBATCH --mem` gives a
+    # REAL, cgroup-enforced memory cap (the durable fix for the OOM/-9 kills) on effectively
+    # unlimited CPU/RAM. Off by default → run_code stays on the local sandbox above, where the
+    # host allows one.
+    if not (conn.settings.run_code_on_hpc and conn.executor is not None and not conn.mock):
+        if sandbox is not None:
+            return sandbox
+        return _unavailable(
+            "a mock session has no HPC3 behind it" if conn.mock
+            else "this session has no live HPC3 connection" if conn.executor is None
+            else "AISCIENTIST_RUN_CODE_ON_HPC is off on this deployment")
+
+    from .job_store import JobStore
+    from .slurm_job import resume_incomplete
+    from .slurm_sandbox import SlurmCodeExecutor
+    st = conn.settings
+    # Durable, per-user Slurm-job registry on the (persistent) workspace, so a gateway
+    # restart mid-analysis leaves a reattachable record rather than an orphaned job.
+    owner = getattr(conn.executor, "username", "")
+    job_store = JobStore(conn.workspace / ".bioagent" / "slurm_jobs.json")
+    # This session just (re)connected a live SSH executor — sweep any CodeAct jobs a
+    # previous gateway process left in-flight and refresh their state (non-blocking).
+    try:
+        recovered = resume_incomplete(
+            conn.executor, job_store, owner=owner, kind="runcode", emit=emit
+        )
+        for r in recovered:
+            emit("info", "lab",
+                 f"Recovered Slurm job {r.job_id}: {r.state}"
+                 + (" (finished)" if r.completed else " (still in flight)"))
+    except Exception as exc:  # noqa: BLE001 - reattach is best-effort, never blocks a run
+        emit("warning", "lab", f"Slurm job reattach sweep skipped: {type(exc).__name__}: {exc}")
+    # run_code's Slurm jobs run on a COMPUTE NODE, which CANNOT see the eyeserver-local
+    # /data/aiscientist run dir — bind-mounting it fails container creation with exit 127 (the
+    # bug this replaces). So the dataset + work + artifacts must live on dfs3b, exactly like
+    # the analysis/VEP lines. Use the SAME dfs3b workspace the analysis line uses, so a
+    # run_code snippet and the scanpy steps share one work dir (a snippet routinely reads the
+    # adata checkpoints the analysis line wrote). mkdir is idempotent — the analysis block
+    # in _run_lab ensures the same dir.
+    rc_remote_ws = f"{_temp_base(conn)}/analysis/{run_id}"
+    rc_remote_ds = None
+    try:
+        conn.executor.exec(
+            f"mkdir -p {shlex.quote(rc_remote_ws)}/work {shlex.quote(rc_remote_ws)}/artifacts")
+        # Dataset: the dfs3b copy in place (uploads_on_hpc) if present, else stage the local
+        # dataset up once. The local staged copy (decisions['dataset_path']) is unusable — under
+        # uploads_on_hpc it is removed after the push to dfs3b, and it is a /data/aiscientist path
+        # the node can't see regardless.
+        if decisions.get("hpc_primary"):
+            rc_remote_ds = decisions["hpc_primary"]
+        elif decisions.get("dataset_path") and Path(decisions["dataset_path"]).exists():
+            rc_remote_ds = f"{rc_remote_ws}/{Path(decisions['dataset_path']).name}"
+            await asyncio.to_thread(conn.executor.put_file, decisions["dataset_path"], rc_remote_ds)
+    except Exception as exc:  # noqa: BLE001 - never submit broken jobs
+        if sandbox is None:
+            return _unavailable(f"its HPC3 workspace could not be set up ({exc})")
+        emit("warning", "lab", f"run_code-on-HPC3 workspace setup failed ({exc}); "
+                               "run_code uses the local sandbox this run.")
+        return sandbox
+    code_executor: Any = SlurmCodeExecutor(
+        remote=conn.executor,
+        container_image=st.analysis_image,
+        # dfs3b paths the compute node CAN bind (env overrides still win for a genuinely
+        # shared-mounted deployment).
+        dataset_path=os.environ.get("AISCIENTIST_HPC_DATASET") or rc_remote_ds,
+        dataset_root=decisions.get("hpc_dataset_root"),
+        work_dir=os.environ.get("AISCIENTIST_HPC_WORK") or f"{rc_remote_ws}/work",
+        artifacts_dir=os.environ.get("AISCIENTIST_HPC_ARTIFACTS") or f"{rc_remote_ws}/artifacts",
+        local_artifacts=str(art),   # mirror artifacts back for the still-local report bundler
+        # dfs3b scratch, OFF $HOME — Slurm does not expand $HOME in #SBATCH --output, which
+        # would misdirect the job log (matches the variant line's scratch).
+        scratch_dir=_scratch_dir(conn, "runcode"),
+        mem_gb=st.run_code_mem_gb, cpus=st.run_code_cpus, partition=st.cpu_partition,
+        account=st.cpu_account or "", time_limit=st.run_code_time_limit,
+        container_module=st.container_module, container_bin=st.container_bin,
+        # None with accounts on: a failed job is then a failed call, never a run on this host.
+        local_fallback=sandbox, job_store=job_store, owner=owner,
+        should_cancel=conn.chat_stop.is_set,   # Stop scancels the in-flight run_code job
+        # The lab-SHARED package cache: a snippet can import anything a member has
+        # installed via install_package, so the image no longer has to be rebuilt for
+        # every missing library and nobody downloads the same package twice.
+        package_cache_root=f"{st.shared_root.rstrip('/')}/pkgs",
+        # Environments skills declare (SKILL.md ``image:``) for run_in_environment: built
+        # once into the shared containers dir, from the lab's shared conda downloads.
+        images_dir=f"{st.shared_root.rstrip('/')}/containers",
+        pkgs_cache_dir=f"{st.shared_root.rstrip('/')}/conda-pkgs",
+        notify=lambda level, message: emit(level, "lab", message),
+    )
+    emit("info", "lab", f"CodeAct runs on HPC3 (CPU Slurm, --mem={st.run_code_mem_gb}G).")
+    # Resolve a snippet's missing imports BEFORE it runs, in one confirmation, rather
+    # than letting it die on ModuleNotFoundError mid-step. Transparent when nothing is
+    # missing; skipped entirely when the shell/cache aren't available.
+    _shell = _build_hpc_shell(conn, run)
+    if _shell is not None and getattr(_shell, "package_cache", None) is not None:
+        from .code_preflight import PreflightingExecutor
+        code_executor = PreflightingExecutor(
+            inner=code_executor, shell=_shell, cache=_shell.package_cache, emit=emit)
+    return code_executor
+
+
+def _host_tex_allowed() -> bool:
+    """Whether a TeX engine may typeset a report on THIS host.
+
+    Only on a console without accounts, where whoever uses it started the gateway themselves. With
+    accounts on the gateway is a shared service whose user reads every account's saved HPC3 keys
+    and API keys (``AISCIENTIST_STATE_DIR``) and the deployment's ``.env``. The report text is
+    model-written and is rendered as data (``reporting/report.py``), but TeX is a programming
+    language that opens files, and those checks would be all that stands between the two. So a
+    signed-in account's PDF is typeset on HPC3, as that account's own cluster user, or not at all;
+    the DOCX, which pandoc writes without TeX, may still be made here."""
+    return not _AUTH_ENABLED
+
+
 def _build_report_render_fn(conn: "Connection"):
     """The pandoc/xelatex renderer for this connection: a ``SlurmReportRenderer`` (renders on an
     HPC3 CPU Slurm job, keeping texlive off the eyeserver) when report-on-HPC is enabled AND a live
-    SSH session exists, else ``None`` (``build_pdf_report`` then shells out to local pandoc). Shared
-    by every path that renders a report, so they all render the same way."""
+    SSH session exists, else the local runner. Shared by EVERY path that renders a report (a test
+    fails if one calls ``build_pdf_report`` without it), so they all render the same way.
+
+    The local runner, and the renderer's fallback when the Slurm job fails, is plain local pandoc
+    only where ``_host_tex_allowed``; otherwise it is the one that refuses to start TeX."""
+    from ..reporting.report import _run_pandoc, run_pandoc_without_tex
+    local = _run_pandoc if _host_tex_allowed() else run_pandoc_without_tex
     if conn.settings.report_on_hpc and conn.executor is not None and not conn.mock:
         from .slurm_report import SlurmReportRenderer
-        from ..reporting.report import _run_pandoc
         st = conn.settings
         return SlurmReportRenderer(
             remote=conn.executor, container_image=st.report_image,
             remote_base=f"{_temp_base(conn)}/reports",
+            scratch_dir=_scratch_dir(conn, "report"),
             partition=st.cpu_partition, account=st.cpu_account or "",
             container_module=st.container_module, container_bin=st.container_bin,
-            local_fallback=_run_pandoc,
+            local_fallback=local,
         )
-    return None
+    return local
 
 
 # Decisions that run-start staging sets and a resume skips, so they must ride in run_state.json or a
@@ -5439,8 +6742,16 @@ async def _export_result_dataset(conn: "Connection", run_id: str, decisions: dic
     try:
         if on_hpc:
             ctx = SimpleNamespace(workspace=conn.workspace / run_id, decisions=dict(decisions))
-            out = await asyncio.to_thread(analysis_executor.run_tool, EXPORT_RESULT_DATASET,
-                                          {"name": name, "meta": meta}, ctx)
+            # The executor carries the run's Stop flag, and the write-up after a Stop is exactly when
+            # the dataset still has to be handed on (run 7f2955e8e: "Run cancelled by the user"). The
+            # export is data, not narrative, so it runs to completion whatever was pressed.
+            saved_cancel = getattr(analysis_executor, "should_cancel", None)
+            analysis_executor.should_cancel = None
+            try:
+                out = await asyncio.to_thread(analysis_executor.run_tool, EXPORT_RESULT_DATASET,
+                                              {"name": name, "meta": meta}, ctx)
+            finally:
+                analysis_executor.should_cancel = saved_cancel
         else:
             out = await asyncio.to_thread(export_result_dataset, conn.workspace / run_id, name, meta)
     except Exception as exc:  # noqa: BLE001 - the analysis and report are done; never fail the run
@@ -5637,11 +6948,10 @@ async def _run_lab(conn: Connection, req: LabRequest, *,
         from ..agents.registry import build_scientist_catalog
         from ..agents.research_harness import HarnessContext, ResearchHarness
         from ..agents.research_lab import LabConfig, ResearchLab
-        from ..agents.sandbox import CodeSandbox
         from ..tools.api import run_dataset_smoke_analysis
         from ..reporting.report import build_pdf_report
         from ..reporting.research_bundle import write_process_artifacts
-        from ..tools.api import render_dot, workflow_schematic_dot
+        from ..tools.api import render_workflow_schematic
 
         art = conn.workspace / run_id / "artifacts"
         art.mkdir(parents=True, exist_ok=True)
@@ -5829,107 +7139,9 @@ async def _run_lab(conn: Connection, req: LabRequest, *,
         # line (scanpy QC/cluster/DE + gseapy enrichment, emitting figures/tables) +
         # the CodeAct escape hatch. The analysis tools degrade gracefully if the
         # `analysis` extra isn't installed, so this is safe on any host.
-        # The CodeAct sandbox can read this run's dataset + checkpoints and write new
-        # artifacts (exposed as AISCIENTIST_DATASET / AISCIENTIST_WORK / AISCIENTIST_ARTIFACTS).
-        sandbox = CodeSandbox(
-            should_cancel=conn.chat_stop.is_set,   # Stop kills the in-flight run_code subprocess
-            dataset_path=decisions.get("dataset_path"),
-            work_dir=str(conn.workspace / run_id / "work"),
-            artifacts_dir=str(art),
-            # Expose the WHOLE per-user uploads tree so run_code can reach every uploaded
-            # file/folder — incl. folders added after the primary dataset was chosen.
-            uploads_dir=str(conn.workspace / "uploads"),
-            dataset_root=decisions.get("dataset_root"),
-        )
-        # Opt-in: run CodeAct snippets as CPU Slurm batch jobs on HPC3 so `#SBATCH --mem` gives a
-        # REAL, cgroup-enforced memory cap (the durable fix for the OOM/-9 kills) on effectively
-        # unlimited CPU/RAM. Off by default → run_code stays on the local sandbox above. When on,
-        # the local sandbox becomes the graceful fallback if HPC submission fails.
-        code_executor: Any = sandbox
-        if conn.settings.run_code_on_hpc and conn.executor is not None and not conn.mock:
-            from .job_store import JobStore
-            from .slurm_job import resume_incomplete
-            from .slurm_sandbox import SlurmCodeExecutor
-            st = conn.settings
-            # Durable, per-user Slurm-job registry on the (persistent) workspace, so a gateway
-            # restart mid-analysis leaves a reattachable record rather than an orphaned job.
-            owner = getattr(conn.executor, "username", "")
-            job_store = JobStore(conn.workspace / ".bioagent" / "slurm_jobs.json")
-            # This session just (re)connected a live SSH executor — sweep any CodeAct jobs a
-            # previous gateway process left in-flight and refresh their state (non-blocking).
-            try:
-                recovered = resume_incomplete(
-                    conn.executor, job_store, owner=owner, kind="runcode", emit=emit
-                )
-                for r in recovered:
-                    emit("info", "lab",
-                         f"Recovered Slurm job {r.job_id}: {r.state}"
-                         + (" (finished)" if r.completed else " (still in flight)"))
-            except Exception as exc:  # noqa: BLE001 - reattach is best-effort, never blocks a run
-                emit("warning", "lab", f"Slurm job reattach sweep skipped: {type(exc).__name__}: {exc}")
-            # run_code's Slurm jobs run on a COMPUTE NODE, which CANNOT see the eyeserver-local
-            # /data/BioAgent run dir — bind-mounting it fails container creation with exit 127 (the
-            # bug this replaces). So the dataset + work + artifacts must live on dfs3b, exactly like
-            # the analysis/VEP lines. Use the SAME dfs3b workspace the analysis line uses, so a
-            # run_code snippet and the scanpy steps share one work dir (a snippet routinely reads the
-            # adata checkpoints the analysis line wrote). mkdir is idempotent — the analysis block
-            # below ensures the same dir. A setup failure leaves the local-sandbox fallback in place.
-            rc_remote_ws = f"{_temp_base(conn)}/analysis/{run_id}"
-            rc_remote_ds = None
-            try:
-                conn.executor.exec(
-                    f"mkdir -p {shlex.quote(rc_remote_ws)}/work {shlex.quote(rc_remote_ws)}/artifacts")
-                # Dataset: the dfs3b copy in place (uploads_on_hpc) if present, else stage the local
-                # dataset up once. The local staged copy (decisions['dataset_path']) is unusable — under
-                # uploads_on_hpc it is removed after the push to dfs3b, and it is a /data/BioAgent path
-                # the node can't see regardless.
-                if decisions.get("hpc_primary"):
-                    rc_remote_ds = decisions["hpc_primary"]
-                elif decisions.get("dataset_path") and Path(decisions["dataset_path"]).exists():
-                    rc_remote_ds = f"{rc_remote_ws}/{Path(decisions['dataset_path']).name}"
-                    await asyncio.to_thread(conn.executor.put_file, decisions["dataset_path"], rc_remote_ds)
-            except Exception as exc:  # noqa: BLE001 - stay on the local sandbox rather than submit broken jobs
-                emit("warning", "lab", f"run_code-on-HPC3 workspace setup failed ({exc}); "
-                                       "run_code uses the local sandbox this run.")
-                rc_remote_ws = None
-            if rc_remote_ws:
-                code_executor = SlurmCodeExecutor(
-                    remote=conn.executor,
-                    container_image=st.analysis_image,
-                    # dfs3b paths the compute node CAN bind (env overrides still win for a genuinely
-                    # shared-mounted deployment).
-                    dataset_path=os.environ.get("AISCIENTIST_HPC_DATASET") or rc_remote_ds,
-                    dataset_root=decisions.get("hpc_dataset_root"),
-                    work_dir=os.environ.get("AISCIENTIST_HPC_WORK") or f"{rc_remote_ws}/work",
-                    artifacts_dir=os.environ.get("AISCIENTIST_HPC_ARTIFACTS") or f"{rc_remote_ws}/artifacts",
-                    local_artifacts=str(art),   # mirror artifacts back for the still-local report bundler
-                    # dfs3b scratch, OFF $HOME — Slurm does not expand $HOME in #SBATCH --output, which
-                    # would misdirect the job log (matches the variant line's scratch).
-                    scratch_dir=f"{_temp_base(conn)}/scratch/runcode",
-                    mem_gb=st.run_code_mem_gb, cpus=st.run_code_cpus, partition=st.cpu_partition,
-                    account=st.cpu_account or "", time_limit=st.run_code_time_limit,
-                    container_module=st.container_module, container_bin=st.container_bin,
-                    local_fallback=sandbox, job_store=job_store, owner=owner,
-                    should_cancel=conn.chat_stop.is_set,   # Stop scancels the in-flight run_code job
-                    # The lab-SHARED package cache: a snippet can import anything a member has
-                    # installed via install_package, so the image no longer has to be rebuilt for
-                    # every missing library and nobody downloads the same package twice.
-                    package_cache_root=f"{st.shared_root.rstrip('/')}/pkgs",
-                    # Environments skills declare (SKILL.md ``image:``) for run_in_environment: built
-                    # once into the shared containers dir, from the lab's shared conda downloads.
-                    images_dir=f"{st.shared_root.rstrip('/')}/containers",
-                    pkgs_cache_dir=f"{st.shared_root.rstrip('/')}/conda-pkgs",
-                    notify=lambda level, message: emit(level, "lab", message),
-                )
-                emit("info", "lab", f"CodeAct runs on HPC3 (CPU Slurm, --mem={st.run_code_mem_gb}G).")
-                # Resolve a snippet's missing imports BEFORE it runs, in one confirmation, rather
-                # than letting it die on ModuleNotFoundError mid-step. Transparent when nothing is
-                # missing; skipped entirely when the shell/cache aren't available.
-                _shell = _build_hpc_shell(conn, run)
-                if _shell is not None and getattr(_shell, "package_cache", None) is not None:
-                    from .code_preflight import PreflightingExecutor
-                    code_executor = PreflightingExecutor(
-                        inner=code_executor, shell=_shell, cache=_shell.package_cache, emit=emit)
+        # Where run_code runs (HPC3 Slurm jobs, the local sandbox, or nowhere) is decided in one
+        # place: with accounts on it is never this host.
+        code_executor = await _build_code_executor(conn, run, run_id, decisions, art, emit)
         # scGPT per-cell annotation runs as a GPU batch job on HPC3 (Route C). Wire its
         # runner only for a LIVE session (a real SSH executor) — in mock/offline mode the
         # tool stays present but reports not-enabled (the mock host has no batch lifecycle).
@@ -5978,6 +7190,9 @@ async def _run_lab(conn: Connection, req: LabRequest, *,
                     remote=conn.executor, container_image=st.analysis_image,
                     remote_workspace=remote_ws, remote_dataset=remote_ds,
                     local_workspace=conn.workspace / run_id, source_dir=pysrc,
+                    # Job scripts, args/result JSON and logs: the application's Temp area, not the
+                    # user's home directory (where this line wrote them until 2026-10-12).
+                    scratch_dir=_scratch_dir(conn, "analysis"),
                     # Shared dfs3b dir with pure-Python deps the analysis image lacks (pydeseq2).
                     # Unset -> run_pseudobulk_de degrades loudly to its Welch fallback.
                     deps_dir=os.environ.get("AISCIENTIST_HPC_PYDEPS") or None,
@@ -6241,12 +7456,12 @@ async def _run_lab(conn: Connection, req: LabRequest, *,
                     # Scratch (args/result/log + its rw bind target) MUST live on dfs3b, NOT $HOME:
                     # vep.sif ships /data as a symlink to /opt/vep/.vep (VEP's read-only cache mount),
                     # so bind-mounting a $HOME (=/data/homezvol*/...) scratch resolves through that
-                    # symlink into the RO cache and singularity dies at container creation with
+                    # symlink into the RO cache and the runtime dies at container creation with
                     # "destination ... doesn't exist in container" (exit 127, ~1s) — which is exactly
                     # what silently killed every offline annotate_variants job. A /dfs3b path has no
                     # such symlink so the tmpfs overlay creates it cleanly (same as the workspace bind).
                     job_prefix="bioagent_variant",
-                    scratch_dir=f"{_temp_base(conn)}/scratch/variant",
+                    scratch_dir=_scratch_dir(conn, "variant"),
                     # Bind the ClinVar .tbi index alongside its .vcf.gz: VEP's --custom does a Tabix
                     # lookup that needs the index right next to the bgzip, and --containall hides every
                     # host path that isn't an explicit bind — without this VEP dies with "Couldn't find
@@ -6366,7 +7581,7 @@ async def _run_lab(conn: Connection, req: LabRequest, *,
                         local_workspace=conn.workspace / run_id, source_dir=p_pysrc,
                         entrypoint=f"python3 -m {_tools_api.PHENOTYPE_ENTRYPOINT}",   # lirical.sif has python3
                         job_prefix="bioagent_phenotype",
-                        scratch_dir=f"{_temp_base(conn)}/scratch/phenotype",
+                        scratch_dir=_scratch_dir(conn, "phenotype"),
                         # Bind the LIRICAL data dir + the Exomiser data dir(s) read-only (--containall hides
                         # everything not bound); a dir bind exposes the .mv.db / .ser files inside.
                         extra_ro_binds=tuple(dict.fromkeys((st.lirical_data_dir, *_exo_binds))),
@@ -6390,9 +7605,10 @@ async def _run_lab(conn: Connection, req: LabRequest, *,
                         emit("info", "lab", f"Phenotype differential runs on HPC3 (LIRICAL, {_mode}).")
 
         # Opt-in: render the report (pandoc/xelatex) as an HPC3 CPU job so texlive stays off the
-        # eyeserver. Passed to build_pdf_report as render_fn; falls back to local pandoc on failure.
+        # eyeserver. Passed to build_pdf_report as render_fn; its local fallback starts TeX only
+        # where _host_tex_allowed.
         report_render_fn = _build_report_render_fn(conn)
-        if report_render_fn is not None:
+        if getattr(report_render_fn, "remote", None) is not None:
             emit("info", "lab", "Report rendering runs on HPC3 (CPU Slurm, pandoc/xelatex).")
         scientist = ResearchHarness(
             catalog=build_scientist_catalog(code_executor=code_executor, scgpt_runner=scgpt_runner,
@@ -6579,7 +7795,7 @@ async def _run_lab(conn: Connection, req: LabRequest, *,
                      f"Lab done: converged={ev['converged']} accepted={ev['accepted_steps']}/{ev['agenda']}")
             elif t in ("context_measured", "context_trimmed", "context_overflow_retry"):
                 # Persist budgeting decisions to STDOUT → systemd journal, so a
-                # `journalctl -u bioagent` pull shows exactly where the prompt tokens go
+                # `journalctl -u aiscientist` pull shows exactly where the prompt tokens go
                 # (the WS feed alone is in-memory and lost on restart). One line per call.
                 print(f"[budget] {ev}")
 
@@ -6735,16 +7951,22 @@ async def _run_lab(conn: Connection, req: LabRequest, *,
         # per-conversation so ONLY this chat's next message treats it as the run to amend.
         _remember_run(conn, run)
         # Always draw a deterministic methods/workflow schematic from the PI agenda
-        # (zero AI — the steps are rendered byte-for-byte by graphviz). Graceful: writes
-        # only the .dot source if graphviz isn't installed on the host.
+        # (zero AI — one box per step, holding its number and title, laid out by graphviz in a
+        # shape that fits a page). Graceful: writes only the .dot source if graphviz isn't
+        # installed on the host.
         if result.agenda:
             sch = await asyncio.to_thread(
-                render_dot, workflow_schematic_dot(result.agenda, title="Research workflow"),
-                art / "figures", basename="workflow")
+                render_workflow_schematic, result.agenda, art / "figures",
+                title="Research workflow", basename="workflow")
             if sch["status"] == "ok":
                 emit("info", "lab", "Rendered workflow schematic (graphviz).")
             elif sch["status"] == "dependency_missing":
                 emit("info", "lab", "workflow.dot written — install graphviz on the server for rendered schematics.")
+        # A figure that would print as a strip (one side over 8 times the other) is kept out of
+        # the reports: not offered to the writers, and an embed of it is removed before rendering.
+        # Decided from the image headers, by arithmetic, now that every figure of the run exists;
+        # what was left out is on record in process/figure_checks.md and in the technical report.
+        figure_diag = await asyncio.to_thread(_check_figure_shapes, art, emit)
         # Build the report: hand the model the figure inventory + previews of the result
         # tables so it writes a structured, journal-style report with INLINE data tables
         # and contextual figure references (Ddx41-style), then append an authoritative
@@ -6766,6 +7988,15 @@ async def _run_lab(conn: Connection, req: LabRequest, *,
             from results that are already on disk, so abandoning costs prose, never data."""
             return run.hard_stop.is_set()
 
+        # The processed dataset first: it is data, not narrative (a second Stop does not skip it), it
+        # must exist before the cleanup releases its checkpoints, and the report names it.
+        await _export_result_dataset(conn, run_id, decisions, analysis_executor, req.question, emit)
+        _stamp_cellqc_result(conn, run_id, decisions, analysis_executor is not None, emit)
+        if getattr(req, "save_results", False):
+            # before the report is written, so "The dataset" can say where the data ended up
+            await _autosave_results(conn, run_id, emit)
+
+        brief = _wants_brief_report(getattr(lab_obj, "scope", None), result)
         if abandoned():
             report_md = ("# Research report (write-up skipped)\n\n"
                          "You stopped this run a second time, so the model-written report, the "
@@ -6773,6 +8004,12 @@ async def _run_lab(conn: Connection, req: LabRequest, *,
                          "tables every completed step produced are in this bundle, and "
                          "`process/run_state.json` can resume it.\n\n"
                          f"{result.final_answer or ''}\n")
+        elif brief:
+            # Asked for ("a short report"), or all the run did was QC: a one-page summary built
+            # from what the tools returned — no manuscript, no model-written prose to check.
+            say_key("📝 Writing the short report…")
+            report_md = await asyncio.to_thread(
+                _build_brief_report, art, req.question, result, getattr(lab_obj, "scope", None))
         else:
             say_key("📝 Writing the research report…")
             report_md = await asyncio.to_thread(
@@ -6786,7 +8023,8 @@ async def _run_lab(conn: Connection, req: LabRequest, *,
             append_design_background, degradation_note, empty_references, insert_references,
             strip_intext_citation_markers)
 
-        say_key("📚 Collecting accepted literature citations…")
+        if not brief:
+            say_key("📚 Collecting accepted literature citations…")
         # Prefer deep_literature (the corpus tool the pipeline actually runs); fall back to an
         # accepted Europe PMC literature_search step (dev / no-HPC runs).
         lit = _references_from_accepted_deep_literature(result)
@@ -6821,19 +8059,29 @@ async def _run_lab(conn: Connection, req: LabRequest, *,
             _src = "indexed corpus (deep_literature)" if lit["tier"] == "lab_deep_literature" \
                 else "literature-search step"
             emit("success", "lab", f"References: reused {len(lit['citations'])} citation(s) from the accepted {_src}.")
-        else:
+        elif not brief:
             emit("warning", "lab", "References: no accepted literature citations in this run (none fabricated; no hidden fallback search).")
         # Self-review the draft BEFORE rendering: strip leftover/placeholder content, fix
         # numbering, validate figure refs, embed tables (best-effort; keeps draft on failure).
-        if not abandoned():
+        if not abandoned() and not brief:
             say_key("🔍 Self-reviewing the draft…")
             report_md = await asyncio.to_thread(
                 _review_and_finalize_report, report_md, art, complete_fn, req.question, lit)
             emit("info", "lab", "Self-reviewed the report draft before rendering.")
         # Checked on the FINAL text: the writer and the self-review both write prose of their own.
         report_md = _correct_manuscript_markers(report_md, result)
+        # How we know it is right: every number traced to the run's outputs, what each label rests
+        # on, the QC arithmetic, unfinished steps. Built by code on the FINAL text; the full
+        # statement is report/verification.md, the manuscript carries its summary.
+        verification_md, verification = await asyncio.to_thread(
+            _verification_statement, report_md, art, result, lit)
+        if verification_md:
+            if not abandoned():
+                report_md = _insert_verification_note(report_md, verification)
+            emit("info", "lab", _verification_chat_line(verification))
         say_key("📄 Rendering the report (PDF / DOCX)…" if not abandoned()
                 else "💾 Saving report.md — skipping the render.", "info")
+        report_md = _drop_strip_embeds(report_md, art, emit, "report")
         # Title the document by CONTENT (the report's own H1 / main finding), not a generic
         # constant — promotes the first heading to the pandoc title and drops it from the body.
         report_title, report_md = _promote_doc_title(report_md, "AiScientist Research Report")
@@ -6865,6 +8113,9 @@ async def _run_lab(conn: Connection, req: LabRequest, *,
         made = [f for f in ("pdf_path", "docx_path") if rep.get(f)]
         if made:
             emit("success", "lab", f"Rendered report.{' + report.'.join(f.split('_')[0] for f in made)} (pandoc).")
+            if "pdf_path" not in made and rep.get("error"):
+                # One format made it; say why the PDF did not (e.g. no HPC3 session to typeset it).
+                emit("warning", "lab", f"report.pdf was not rendered — {str(rep['error'])[:300]}")
         elif rep["status"] == "markdown_only":
             emit("info", "lab", "report.md written — install pandoc (+ texlive-xetex for PDF) on the server.")
         else:
@@ -6884,7 +8135,7 @@ async def _run_lab(conn: Connection, req: LabRequest, *,
         # Post-render text review: read the rendered document back and flag any remaining
         # issues (advisory — saved to process/report_review.md, never blocks the run).
         visual_diag = ""
-        if made:
+        if made and not brief:
             # Post-render reviews are ADVISORY and must NEVER throw past here: the analysis is done
             # and checkpointed, and the bundle is published BELOW — a review that raises would skip
             # the publish and the user would lose the ENTIRE run (analysis included) to a "Chat
@@ -6902,7 +8153,8 @@ async def _run_lab(conn: Connection, req: LabRequest, *,
                 # tables) and RE-RENDERS with escalated format to fix them. Residual defects feed the
                 # technical report's Diagnostics only — the manuscript ships clean.
                 visual_diag = await asyncio.to_thread(
-                    _postrender_visual_check, rep, report_md, report_title, art, conn)
+                    _postrender_visual_check, rep, report_md, report_title, art, conn,
+                    report_render_fn)
             except Exception as exc:  # noqa: BLE001 - advisory; degrade to a warning, keep the bundle
                 traceback.print_exc()
                 emit("warning", "lab", f"Post-render review skipped (non-fatal, bundle preserved): {exc}")
@@ -6913,10 +8165,18 @@ async def _run_lab(conn: Connection, req: LabRequest, *,
         try:
             if abandoned():
                 raise _WriteupAbandoned
+            if brief:
+                raise _BriefReportOnly
             tech_md = await asyncio.to_thread(
-                _build_technical_report, result, art, complete_fn, req.question, lit_note, visual_diag,
+                _build_technical_report, result, art, complete_fn, req.question, lit_note,
+                "\n\n".join(d for d in (figure_diag, visual_diag) if d),
                 _llm_provenance_note(_llm))
+            tech_md = _drop_strip_embeds(tech_md, art, emit, "technical report")
             tech_title, tech_md = _promote_doc_title(tech_md, "AiScientist Technical Report")
+            if verification_md:
+                # The same statement, one heading level down, so the technical PDF carries it too.
+                tech_md = tech_md.rstrip() + "\n\n" + re.sub(
+                    r"(?m)^(#{1,5}) ", lambda m: "#" + m.group(1) + " ", verification_md)
             tech_rep = await asyncio.to_thread(
                 build_pdf_report, tech_md, art / "report",
                 title=tech_title, basename="technical_report", assets_root=art, render_fn=report_render_fn)
@@ -6930,11 +8190,11 @@ async def _run_lab(conn: Connection, req: LabRequest, *,
                 emit("warning", "lab", f"Technical report render failed: {str(tech_rep.get('error', ''))[:160]}")
         except _WriteupAbandoned:
             emit("info", "lab", "Technical report skipped — you stopped the write-up.")
+        except _BriefReportOnly:
+            emit("info", "lab", "Short report only — no technical report was written. The run "
+                                "record is in process/, and report/verification.md lists every check.")
         except Exception as exc:  # noqa: BLE001 - the manuscript already shipped; never fail the run here
             emit("warning", "lab", f"Technical report step failed: {exc}")
-
-        # The processed dataset, BEFORE the cleanup below releases the checkpoints it is built from.
-        await _export_result_dataset(conn, run_id, decisions, analysis_executor, req.question, emit)
 
         say_key("✅ Report ready — see below and the Downloads panel." if not abandoned()
                 else "🛑 Write-up skipped — the run's figures, tables and report.md are in the "
@@ -7038,6 +8298,11 @@ async def _run_lab(conn: Connection, req: LabRequest, *,
 
 
 
+class _BriefReportOnly(Exception):
+    """The run ends with the short report, so the technical report is not written. A control
+    signal for that block's handler, like :class:`_WriteupAbandoned`."""
+
+
 class _WriteupAbandoned(Exception):
     """The user pressed Stop a second time, so a write-up phase inside a best-effort ``try`` is
     skipped rather than attempted. Raised only to reach that block's own handler — it is a control
@@ -7111,13 +8376,58 @@ def _promote_doc_title(md: str, fallback: str) -> tuple[str, str]:
     return fallback, md
 
 
+def _report_figures(art: Path) -> list[Path]:
+    """The figures a report may EMBED: the run's PNGs without those too elongated to print
+    (reporting/figure_checks.py). The output index still lists every file."""
+    from ..reporting.figure_checks import embeddable_figures
+
+    return embeddable_figures(art)
+
+
+def _check_figure_shapes(art: Path, emit: Any = None) -> str:
+    """Record the figures that are left out of the reports for their shape, in
+    ``process/figure_checks.md``. Returns the block the technical report's Diagnostics carries
+    ('' when every figure can be printed). Never raises: the check is not worth a run."""
+    try:
+        from ..reporting.figure_checks import diagnostics_block, strip_figures, write_note
+
+        strips = strip_figures(art)
+        write_note(art, strips)
+    except Exception as exc:  # noqa: BLE001
+        print(f"[lab] figure shape check failed ({exc}); every figure stays embeddable.")
+        return ""
+    if strips and emit:
+        names = ", ".join(f"{s['figure']} ({s['aspect']})" for s in strips[:4])
+        emit("warning", "lab",
+             f"{len(strips)} figure(s) left out of the reports — too elongated to print: {names}. "
+             "See process/figure_checks.md.")
+    return diagnostics_block(strips)
+
+
+def _drop_strip_embeds(md: str, art: Path, emit: Any = None, what: str = "report") -> str:
+    """The last check before a report is rendered: an embed of a strip-shaped figure is removed,
+    whoever wrote it (a writer is given the embeddable figures only, but may name another file)."""
+    try:
+        from ..reporting.figure_checks import remove_strip_embeds
+
+        cleaned, removed = remove_strip_embeds(md, art)
+    except Exception as exc:  # noqa: BLE001
+        print(f"[lab] strip-figure removal failed ({exc}); the {what} is rendered as written.")
+        return md
+    if removed and emit:
+        emit("warning", "lab",
+             f"Removed {len(removed)} figure embed(s) from the {what} — too elongated to print: "
+             f"{', '.join(removed[:4])}.")
+    return cleaned
+
+
 def _assemble_report_md(synthesis: str, art: Path) -> str:
     """Append a deterministic gallery of the run's figures + a table index to the PI's
     synthesis. Image paths are RELATIVE to the artifacts dir (pandoc renders with that
     as cwd), so the PDF embeds the scanpy/gseapy PNGs the analysis tools emitted."""
     parts = [synthesis.strip() or "_(no synthesis text was produced.)_"]
 
-    figs = sorted((art / "figures").glob("*.png")) if (art / "figures").exists() else []
+    figs = _report_figures(art)
     if figs:
         parts.append("\n\n# Figures\n")
         for f in figs:
@@ -7198,10 +8508,14 @@ def _report_writer_system(kind: str = "single_cell") -> str:
         f"{_manuscript_domain(kind)} The manuscript MUST be complete — every section below is "
         "present and substantive, with NO empty or placeholder sections. Use Markdown headings only "
         "(do NOT prefix them with your own '1.'/'2.' numbers):\n"
-        "  # <a concise, informative title summarizing the main finding>\n"
+        "  # <a concise, informative title summarizing the main finding about the USER'S request "
+        "(the 'Research question' below) — never about a follow-up check the team added on the way>\n"
         "  ## Abstract  (ONE paragraph: background, methods, key quantitative results, conclusion)\n"
         "  ## Study question  (2-4 sentences: what was being asked of THIS dataset and why "
-        "that question is answerable from it. NOT textbook background — the reader is the "
+        "that question is answerable from it. It is the user's request as given under 'Research "
+        "question', in its own terms: do NOT replace it with a narrower question the team raised "
+        "during the run (e.g. whether one cell type is present) — such checks are reported in "
+        "Results as follow-up checks. NOT textbook background — the reader is the "
         "person whose data this is and does not need the gene or the tissue explained.)\n"
         "  (Two further sections — '## The dataset' and '## What was run' — are inserted "
         "automatically from the execution record and must NOT be written by you. Do not "
@@ -7577,6 +8891,167 @@ _QC_TOOLS = ("run_scanpy_qc", "run_cellqc")
 _MATRIX_FORMS = {"h5": "`.h5`", "dir": "directory", "tar.gz": "`.tar.gz`"}
 
 
+# Tools whose success does not make a run "more than QC": lookups, generic code, the closing call.
+_NOT_AN_ANALYSIS = frozenset({
+    "finish", "inspect_dataset", "read_tool_source", "describe_environment", "search_skills",
+    "read_skill_reference", "list_dir", "stat_path", "find_files", "read_text", "disk_usage",
+    "run_code", "run_shell", "run_in_environment"})
+_QC_ONLY_TOOLS = frozenset({"run_scanpy_qc", "run_cellqc", "run_doublet_detection"})
+
+
+def _tools_that_ran(result: Any) -> "list[str]":
+    """Each tool with at least one successful call in the run, in first-use order."""
+    seen: list[str] = []
+    for rnd in (getattr(result, "rounds", None) or []):
+        sr = (rnd.get("scientist_result") if isinstance(rnd, dict)
+              else getattr(rnd, "scientist_result", None))
+        for st in ((sr or {}).get("steps") or []):
+            if not isinstance(st, dict) or not st.get("tool") or st["tool"] in seen:
+                continue
+            r = st.get("result")
+            if st.get("ok") or (isinstance(r, dict) and r.get("status") == "ok"):
+                seen.append(str(st["tool"]))
+    return seen
+
+
+def _wants_brief_report(scope: Any, result: Any) -> bool:
+    """A short report instead of the manuscript: when the request asked for one, or when quality
+    control is all the run did — an Abstract, a Discussion and a Methods section around one QC
+    table is padding (Yijun, 2026-10-11, testing CellQC alone)."""
+    if getattr(scope, "brief_report", False):
+        return True
+    analyses = [t for t in _tools_that_ran(result) if t not in _NOT_AN_ANALYSIS]
+    return bool(analyses) and all(t in _QC_ONLY_TOOLS for t in analyses)
+
+
+def _brief_qc_lines(qc: "tuple[str, dict] | None", art: Path) -> "list[str]":
+    """What QC did, from the tool's own return value: per-library counts, why cells were removed,
+    ambient RNA, doublets, the tool's warnings, and the QC figure."""
+    if qc is None:
+        return []
+    tool, r = qc
+    lines = ["## Quality control", ""]
+    libs = [lib for lib in (r.get("libraries") or []) if isinstance(lib, dict)]
+    if libs:
+        lines += ["| Library | Cell Ranger cells | after count / gene / mito filters | after doublet "
+                  "removal | kept | ambient RNA | median % mito |",
+                  "|---|---:|---:|---:|---:|---:|---:|"]
+        for lib in libs:
+            def n(key: str) -> str:
+                v = lib.get(key)
+                return f"{int(v):,}" if isinstance(v, (int, float)) else "—"
+            kept = lib.get("frac_retained")
+            amb = lib.get("ambient_soupx_contamination_mean")
+            mito = lib.get("median_pct_mt")
+            lines.append(
+                f"| {lib.get('sample', '—')} | {n('cells_cellranger')} | {n('cells_after_filter')} | "
+                f"{n('cells_after_doublets')} | "
+                f"{f'{100 * kept:.1f}%' if isinstance(kept, (int, float)) else '—'} | "
+                f"{f'{100 * amb:.1f}%' if isinstance(amb, (int, float)) else '—'} | "
+                f"{f'{mito:.2f}' if isinstance(mito, (int, float)) else '—'} |")
+        lines.append("")
+        for lib in libs:
+            removed = lib.get("removed_only_by") or {}
+            if not removed and lib.get("doublets_removed") is None:
+                continue
+            words = {"min_counts": "too few counts", "min_features": "too few genes",
+                     "max_pct_mt": "too much mitochondrial RNA", "several_thresholds": "several of these"}
+            why = ", ".join(f"{int(v):,} {words.get(k, k)}" for k, v in removed.items()
+                            if isinstance(v, (int, float)))
+            dbl = lib.get("doublets_removed")
+            kappa = lib.get("doublet_kappa")
+            lines.append(
+                f"- **{lib.get('sample', 'library')}** — removed by the filters: {why or 'none'}"
+                + (f"; doublets removed: {int(dbl):,}" if isinstance(dbl, (int, float)) else "")
+                + (f" (the two doublet callers agree at kappa {kappa:.2f})"
+                   if isinstance(kappa, (int, float)) else "") + ".")
+        lines.append("")
+    elif r.get("cells_before") is not None:
+        before, after = int(r["cells_before"]), int(r.get("cells_after") or 0)
+        lines += [f"{after:,} of {before:,} cells kept ({before - after:,} removed); "
+                  f"{int(r.get('genes_after') or 0):,} genes retained.", ""]
+    th = r.get("thresholds") if isinstance(r.get("thresholds"), dict) else {}
+    if th:
+        lines += ["Thresholds: " + ", ".join(f"`{k}` = {v}" for k, v in th.items()) + ".", ""]
+    warnings = [str(w) for w in (r.get("warnings") or []) if str(w).strip()]
+    if warnings:
+        lines += ["**The tool's warnings:**", ""] + [f"- {w}" for w in warnings] + [""]
+    fig = next((f for f in _report_figures(art) if "qc" in f.name), None)
+    if fig is not None:
+        lines += [f"![Per-cell QC metrics after filtering.](figures/{fig.name})", ""]
+    return lines
+
+
+def _brief_labels_lines(art: Path) -> "list[str]":
+    """Clusters and cell types, when the run got that far: the composition table as it was written."""
+    import csv as _csv
+    try:
+        with (art / "tables" / "celltype_composition.csv").open(encoding="utf-8") as fh:
+            rows = [r for r in _csv.DictReader(fh) if r.get("cell_type")]
+    except (OSError, ValueError):
+        return []
+    if not rows:
+        return []
+    lines = ["## Cell types", "", "| Cell type | Cells | % |", "|---|---:|---:|"]
+    for r in rows:
+        try:
+            lines.append(f"| {r['cell_type']} | {int(float(r.get('n_cells') or 0)):,} | "
+                         f"{float(r.get('pct') or 0):.2f} |")
+        except ValueError:
+            continue
+    return lines + ["", "Each label's marker evidence, and why any cluster is unassigned, is in "
+                        "`report/verification.md` and `tables/cluster_cell_types.csv`.", ""]
+
+
+def _build_brief_report(art: Path, question: str, result: Any, scope: Any = None) -> str:
+    """The short report: what came in, what was run, what QC did, what was handed back — every
+    line from the run's own records, none of it written by a model.
+
+    The manuscript writer must produce an Abstract, Study question, Results, Discussion,
+    Limitations, Conclusion and Methods, each "present and substantive". For a run that only did
+    quality control that is several pages around one table."""
+    ran = [t for t in _tools_that_ran(result) if t not in _NOT_AN_ANALYSIS]
+    qc_only = bool(ran) and all(t in _QC_ONLY_TOOLS for t in ran)
+    try:
+        dr = json.loads((art / "data" / "dataset_results.json").read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        dr = {}
+    layout = dr.get("cellranger_layout") if isinstance(dr, dict) else None
+    libs = [str(lib.get("sample")) for lib in ((layout or {}).get("libraries") or [])
+            if isinstance(lib, dict) and lib.get("sample")]
+    name = (", ".join(libs[:3]) + (" …" if len(libs) > 3 else "")) if libs else \
+        Path(str((dr or {}).get("dataset_path") or "dataset")).name
+    out = [f"# {'Quality-control summary' if qc_only else 'Analysis summary'}: {name}", "",
+           f"**Request.** {' '.join((question or '').split())[:500]}", ""]
+    limit = scope.describe() if scope is not None and getattr(scope, "limited", False) else ""
+    out += [("**Scope.** " + (f"As requested ({limit}), " if limit else "")
+             + ("this run did quality control only; no clustering, annotation, differential "
+                "expression or pathway analysis was run." if qc_only else
+                "this is the short report: the tables and figures hold the detail.")), ""]
+    dataset = _dataset_section(art, result)
+    if dataset:
+        out += [dataset.rstrip(), ""]
+    out += _brief_qc_lines(_qc_step_result(result), art)
+    out += _brief_labels_lines(art)
+    pipeline = _pipeline_section(result)
+    if pipeline:
+        out += [pipeline.rstrip(), ""]
+    files = ["## Files", ""]
+    rd = _result_dataset_pointer(art)
+    if rd:
+        files.append(f"- `{rd['name']}` — the processed dataset (see *The dataset* for where it is "
+                     "kept and how to save it).")
+    for rel, what in (("tables/cells.csv", "one row per cell: QC metrics, cluster, label, UMAP"),
+                      ("tables/cellqc_metrics.csv", "CellQC's per-library metrics"),
+                      ("result/report.html", "CellQC's own report; `result/` is CellQC's result "
+                                             "directory, complete but for the per-library .h5ad"),
+                      ("report/verification.md", "how each number here was checked")):
+        if (art / rel).exists() or rel == "report/verification.md":
+            files.append(f"- `{rel}` — {what}.")
+    out += files + [""]
+    return "\n".join(out).rstrip() + "\n"
+
+
 def _qc_step_result(result: Any) -> "tuple[str, dict] | None":
     """The first QC step that completed and counted its input: ``(tool, return value)``, or None.
 
@@ -7766,7 +9241,70 @@ def _dataset_section(art: Path, result: Any = None) -> str:
                                      f"{lib.get('cells_after_filter')} → "
                                      f"{lib.get('cells_after_doublets')}" for lib in libs) + ".")
         lines += ["", note]
+    rd_line = _result_dataset_line(art)
+    if rd_line:
+        lines += ["", rd_line]
     return "\n".join(lines) + "\n"
+
+
+def _one_vs_rest_caveat(art: Path) -> str:
+    """The composition fact a per-cluster (one-vs-rest) pathway result has to be read against.
+
+    Run f3b8268c4fd4 was 81% rods. Its manuscript called phototransduction "enriched in rod clusters
+    and reduced in non-photoreceptor clusters" and "lineage-consistent", while the cone cluster — a
+    photoreceptor — had phototransduction at NES -3.75: every cluster's "rest" was mostly rods, and
+    the Reactome sets are built mostly from rod genes. Empty when no label holds half the cells."""
+    try:
+        import csv as _csv
+        with (art / "tables" / "celltype_composition.csv").open(encoding="utf-8") as fh:
+            rows = [r for r in _csv.DictReader(fh) if r.get("cell_type")
+                    and r.get("cell_type") != "Unassigned"]
+        top = max(rows, key=lambda r: float(r.get("pct") or 0))
+        pct = float(top.get("pct") or 0)
+    except (OSError, ValueError, KeyError):
+        return ""
+    if pct < 50:
+        return ""
+    lab = top["cell_type"]
+    return (f"Composition caveat for every per-cluster (one-vs-rest) result: {lab} makes up "
+            f"{pct:.1f}% of the cells, so each other cluster's 'rest' is mostly {lab}. A marker gene "
+            f"or gene set that is 'down' in every non-{lab} cluster says that {lab} expresses it "
+            "highly, not something about those clusters; a gene set built mostly from "
+            f"{lab}-specific genes can be 'down' even in a related lineage. Say this whenever the "
+            "report interprets such a pattern, and do not call it lineage-consistent unless every "
+            "related cluster shows it.\n\n")
+
+
+def _result_dataset_pointer(art: Path) -> "dict | None":
+    """The processed dataset this run exported (``data/result_dataset.json``), or None."""
+    try:
+        rd = json.loads((art / "data" / "result_dataset.json").read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    return rd if isinstance(rd, dict) and rd.get("name") else None
+
+
+def _result_dataset_line(art: Path) -> str:
+    """"Result dataset" — the file this run hands on, by name, with what each slot holds.
+
+    Run f3b8268c4fd4's Methods said the delivered dataset was ``work/adata_annotated.h5ad``, a
+    checkpoint deleted when the run was published; the real deliverable was named nowhere."""
+    rd = _result_dataset_pointer(art)
+    if rd is None:
+        return ""
+    shape = f"{int(rd.get('n_cells') or 0):,} cells x {int(rd.get('n_genes') or 0):,} genes"
+    obs = [str(c) for c in (rd.get("obs_columns") or []) if str(c) in (
+        "cell_type", "leiden", "louvain", "sampleid", "cluster_note", "doublet_score")]
+    where = ("kept beside the run on HPC3" if rd.get("location") == "hpc3" else "kept on the server")
+    days = rd.get("kept_days")
+    kept = (f"It is saved in your data (`{rd['saved_to']}`) and listed in Datasets." if rd.get("saved_to")
+            else f"It is {where}" + (f" for {days} days" if days else "")
+            + " — Runs → “Save to my data” moves it to your personal folder.")
+    return (f"**Result dataset.** `{rd['name']}` — {shape}; `X` is log-normalised expression; "
+            f"`layers['counts']` holds {rd.get('counts_layer') or 'the integer counts kept by QC'}"
+            + (f"; per-cell columns include {', '.join(f'`{c}`' for c in obs)}" if obs else "")
+            + (f"; embeddings {', '.join(f'`{k}`' for k in rd.get('obsm') or [])}" if rd.get("obsm") else "")
+            + f". {kept} One row per cell is in `tables/cells.csv`.")
 
 
 def _pipeline_section(result: Any = None) -> str:
@@ -7886,7 +9424,8 @@ def _build_report(synthesis: str, art: Path, complete_fn, question: str, result:
     audit = _ca.render_block(_claim_audit_of(result))
     audit_block = f"{audit}\n\n" if audit else ""
 
-    fig_list = "\n".join(f"- figures/{f.name} — {f.stem.replace('_', ' ').strip()}" for f in figs) or "(none)"
+    fig_list = "\n".join(f"- figures/{f.name} — {f.stem.replace('_', ' ').strip()}"
+                         for f in _report_figures(art)) or "(none)"
     # Preview the smallest tables first — summary/overview tables tend to be small, while
     # per-cluster dumps are large; cap the count + size so the prompt stays bounded.
     preview_tables = sorted((t for t in tables if t.stat().st_size <= 200_000),
@@ -7900,14 +9439,23 @@ def _build_report(synthesis: str, art: Path, complete_fn, question: str, result:
     # data/ artifacts (e.g. scGPT predictions) — these never appear in tables/, so surface
     # them explicitly or the model can't see a successful annotation result.
     data_block = _data_artifacts_block(art) or "(no data/ artifacts to surface)"
+    rd = _result_dataset_pointer(art)
+    rd_block = (f"Result dataset delivered with this run: `{rd['name']}` ({rd.get('n_cells')} cells x "
+                f"{rd.get('n_genes')} genes; layers['counts'] = {rd.get('counts_layer')}). When the "
+                "report mentions the delivered dataset, name THIS file; the work/ checkpoints "
+                "(adata_*.h5ad) are deleted when the run is published and are never the "
+                "deliverable.\n\n") if rd else ""
 
     try:
         body = _role_call(complete_fn, [
             {"role": "system", "content": _report_writer_system(kind)},
             {"role": "user", "content": (
-                f"Research question:\n{question}\n\n"
+                f"Research question (the user's own request; it is the study question and "
+                f"the title's subject):\n{question}\n\n"
                 f"{facts_block}"
                 f"{run_status_block}"
+                f"{rd_block}"
+                f"{_one_vs_rest_caveat(art)}"
                 f"{audit_block}"
                 f"Grounded synthesis from the accepted analysis steps (use ONLY these facts):\n"
                 f"{synthesis.strip() or '(no synthesis text was produced)'}\n\n"
@@ -7961,6 +9509,52 @@ def _correct_manuscript_coverage(body: str, art: Path, result: Any) -> str:
         return body
     _record_report_corrections(result, issues)
     return fixed
+
+
+def _verification_statement(report_md: str, art: Path, result: Any,
+                            lit: "dict | None") -> "tuple[str, dict]":
+    """``reporting/verification.py`` on the final manuscript; writes ``report/verification.md``.
+    Never raises: a failed check costs the statement, not the report."""
+    from ..reporting.verification import build_verification
+    try:
+        corrections = list(((getattr(result, "claim_audit", None) or {}).get("report_corrections"))
+                           or [])
+        md, summary = build_verification(art, report_md, list(getattr(result, "agenda", None) or []),
+                                         list(getattr(result, "rounds", None) or []), lit,
+                                         corrections)
+        (art / "report").mkdir(parents=True, exist_ok=True)
+        (art / "report" / "verification.md").write_text(md, encoding="utf-8")
+        (art / "process").mkdir(parents=True, exist_ok=True)
+        (art / "process" / "verification.json").write_text(json.dumps(summary, indent=2),
+                                                           encoding="utf-8")
+        return md, summary
+    except Exception as exc:  # noqa: BLE001
+        print(f"[report] verification statement skipped: {type(exc).__name__}: {exc}")
+        return "", {}
+
+
+def _insert_verification_note(md: str, summary: dict) -> str:
+    """The short ``## Verification`` section, placed before References (or the file index)."""
+    from ..reporting.verification import manuscript_note
+    note = manuscript_note(summary)
+    if not note:
+        return md
+    for heading in ("\n## References", "\n# Output Files Index", "\n## Background consulted"):
+        i = md.find(heading)
+        if i != -1:
+            return md[:i].rstrip() + "\n\n" + note + md[i:]
+    return md.rstrip() + "\n\n" + note
+
+
+def _verification_chat_line(summary: dict) -> str:
+    n = summary.get("numbers_checked", 0)
+    flagged = summary.get("numbers_untraced", 0) + summary.get("numbers_inconsistent", 0)
+    return (f"🔎 Verification: {n} numbers checked against the run's outputs — "
+            f"{summary.get('numbers_exact', 0)} found as they are, {summary.get('numbers_derived', 0)} "
+            f"derived (formulas listed), {summary.get('numbers_printed', 0)} only in model-written "
+            f"code's printout, {flagged} not traced or not adding up; "
+            f"{summary.get('unassigned_clusters', 0)} unassigned cluster(s) explained. Full "
+            "statement: report/verification.md.")
 
 
 def _correct_manuscript_markers(body: str, result: Any) -> str:
@@ -8324,7 +9918,8 @@ def _build_technical_report(result: Any, art: Path, complete_fn, question: str,
     the 'Diagnostics & failures' section records it — while the academic manuscript stays clean."""
     figs = sorted((art / "figures").glob("*.png")) if (art / "figures").exists() else []
     tables = sorted((art / "tables").glob("*.csv")) if (art / "tables").exists() else []
-    fig_list = "\n".join(f"- figures/{f.name} — {f.stem.replace('_', ' ').strip()}" for f in figs) or "(none)"
+    fig_list = "\n".join(f"- figures/{f.name} — {f.stem.replace('_', ' ').strip()}"
+                         for f in _report_figures(art)) or "(none)"
     preview_tables = sorted((t for t in tables if t.stat().st_size <= 200_000),
                             key=lambda t: t.stat().st_size)[:12]
     previews = [f"### tables/{t.name}\n{md}" for t in preview_tables if (md := _csv_preview_md(t))]
@@ -8538,7 +10133,7 @@ def _review_report(draft_md: str, art: Path, complete_fn, question: str) -> str:
     """Pre-render self-review: the model edits its OWN draft to strip leftover/placeholder
     content, fix numbering, validate figure refs and embed tables, returning clean Markdown.
     Best-effort — returns the original draft if the review fails or comes back degenerate."""
-    figs = sorted((art / "figures").glob("*.png")) if (art / "figures").exists() else []
+    figs = _report_figures(art)
     fig_list = "\n".join(f"- figures/{f.name}" for f in figs) or "(none)"
     try:
         reviewed = _role_call(complete_fn, [
@@ -8761,15 +10356,12 @@ def _postrender_text_check(rep: dict[str, Any], art: Path, complete_fn) -> str:
     model for a SHORT list of remaining issues (leftover content, broken/missing tables,
     empty sections). Advisory only — saved to process/report_review.md, never blocks the run.
     Returns the verdict text ('' when clean or unavailable)."""
-    src = rep.get("docx_path") or rep.get("pdf_path")
-    if not src or not Path(src).exists() or not shutil.which("pandoc"):
+    from ..reporting.report import rendered_text
+    # The DOCX is the format pandoc reads back (it has no PDF reader).
+    src = rep.get("docx_path")
+    if not src:
         return ""
-    try:
-        proc = subprocess.run(  # noqa: S603 - fixed argv, no shell
-            ["pandoc", str(src), "-t", "plain"], capture_output=True, text=True, timeout=120)
-        text = (proc.stdout or "")[:16000]
-    except Exception:  # noqa: BLE001
-        return ""
+    text = rendered_text(src)[:16000]
     if not text.strip():
         return ""
     try:
@@ -8870,7 +10462,7 @@ def _write_capability_log(art: Path, result: Any, conn: "Connection",
 
 
 def _postrender_visual_check(rep: dict[str, Any], report_md: str, report_title: str | None,
-                             art: Path, conn: "Connection") -> str:
+                             art: Path, conn: "Connection", report_render_fn: Any = None) -> str:
     """Post-render VISUAL review: the text checks above cannot see LAYOUT defects (text overlap,
     clipped cells, a caption printed on the figure) — those live only in the rendered pixels and
     need a vision model. When ``vlreview_enabled`` and a live SSH session is present, ship the
@@ -8896,9 +10488,14 @@ def _postrender_visual_check(rep: dict[str, Any], report_md: str, report_title: 
         # vlreview/<owner>/pass1 on dfs3b — three runs' job logs sat in one out dir.
         run_id = art.parent.name if art is not None else "run"
 
+        # A re-render goes where the first render went. It used to run local pandoc/xelatex
+        # whatever the session, which put TeX on this host for every report the review reformatted.
+        rerender = report_render_fn or _build_report_render_fn(conn)
+
         def render_fn(overrides: dict[str, Any]) -> dict:
             return build_pdf_report(report_md, art / "report", title=report_title,
-                                    basename="report", assets_root=art, format_overrides=overrides)
+                                    basename="report", assets_root=art, format_overrides=overrides,
+                                    render_fn=rerender)
 
         # The live source on dfs3b (synced at connect) so the job runs the CURRENT reviewer.
         try:
@@ -8927,7 +10524,9 @@ def _postrender_visual_check(rep: dict[str, Any], report_md: str, report_title: 
 # Top-level entries the categorized bundle is supposed to contain. Anything else at the
 # artifacts root is off-script (e.g. a model-made qc_report.docx / self-zipped bundle from
 # run_code) and gets quarantined into extra/ rather than shipped as a canonical deliverable.
-_CANONICAL_BUNDLE_DIRS = {"report", "figures", "tables", "process", "data", "extra"}
+# ``result`` is a QC pipeline's own result directory, under its own name (run_cellqc writes
+# CellQC's there); as ``cellqc/`` it was not listed here, and was filed under extra/ as a stray.
+_CANONICAL_BUNDLE_DIRS = {"report", "figures", "tables", "process", "data", "result", "extra"}
 
 
 def _quarantine_strays(art: Path) -> list[str]:
@@ -8948,51 +10547,138 @@ def _quarantine_strays(art: Path) -> list[str]:
 
 
 @app.get("/api/bundle/{owner}/{run_id}")
-async def get_bundle(owner: str, run_id: str) -> Response:
+async def get_bundle(owner: str, run_id: str, request: Request) -> Response:
     """Zip a run's whole artifacts folder for a single 'download all' click."""
+    refused = _owner_dir_error(owner, request)
+    if refused is not None:
+        return refused
     if not all(part.replace("-", "").isalnum() for part in (owner, run_id)):
         return Response("Bad request", status_code=400)
     base = (CONSOLE_RUNS_DIR / owner / run_id / "artifacts").resolve()
     if not str(base).startswith(str(CONSOLE_RUNS_DIR)) or not base.is_dir():
         return Response("Run not found", status_code=404)
-    buf = io.BytesIO()
-    with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
-        for path in sorted(base.rglob("*")):
-            if path.is_file():
-                zf.write(path, path.relative_to(base))
-    return Response(
-        buf.getvalue(),
-        media_type="application/zip",
-        headers={"Content-Disposition": f'attachment; filename="aiscientist_results_{run_id}.zip"'},
-    )
+    bundle = await asyncio.to_thread(_write_bundle, base)
+    return FileResponse(bundle, media_type="application/zip",
+                        filename=f"aiscientist_results_{run_id}.zip",
+                        background=BackgroundTask(_unlink_quietly, bundle))
 
 
-# --- the processed dataset a run hands on (see _export_result_dataset) ------------------------
-# Saved results go to the user's personal lab folder on HPC3 (never swept), in one subfolder, so a
-# member finds them outside AiScientist too; a local run's go to their uploads.
+_BUNDLE_PREFIX = ".bundle-"
+
+
+def _write_bundle(base: Path) -> Path:
+    """Zip ``base`` into a file beside it and return that file. It used to be built in memory, in
+    the event loop: a run with a few GB of tables then stalled every user's requests and held the
+    whole zip in RAM. Written beside the run (the same disk, not a small /tmp), outside ``base`` so
+    it never zips itself; a leftover of a download that was cut is removed on the next call."""
+    import tempfile
+
+    home = base.parent
+    for stale in home.glob(f"{_BUNDLE_PREFIX}*.zip"):
+        try:
+            if time.time() - stale.stat().st_mtime > 3600:
+                stale.unlink()
+        except OSError:
+            pass
+    fd, name = tempfile.mkstemp(prefix=_BUNDLE_PREFIX, suffix=".zip", dir=home)
+    try:
+        with os.fdopen(fd, "wb") as out, zipfile.ZipFile(out, "w", zipfile.ZIP_DEFLATED) as zf:
+            for path in sorted(base.rglob("*")):
+                if path.is_file():
+                    zf.write(path, path.relative_to(base))
+    except BaseException:
+        _unlink_quietly(name)
+        raise
+    return Path(name)
+
+
+def _unlink_quietly(path: "str | Path") -> None:
+    try:
+        os.unlink(path)
+    except OSError:
+        pass
+
+
+# --- the data a run hands on ---------------------------------------------------------------------
+# Two things, each with a pointer in the bundle's data/: the processed dataset (one .h5ad, see
+# _export_result_dataset) and, after run_cellqc, CellQC's complete result directory. Both stay beside
+# the run (on HPC3 for an HPC3 run) for as long as its process files do. "Save to my data" moves one
+# to the user's personal lab folder on HPC3 (never swept), in one subfolder, so a member finds it
+# outside AiScientist too, and lists it among their datasets; a local run's go to their uploads.
 _RESULTS_FOLDER = "AiScientist_results"
 _RESULT_NAME_RE = re.compile(r"[A-Za-z0-9._-]+\.processed\.[0-9]{8}-[0-9]{4}\.[A-Za-z0-9]+\.h5ad")
+_CELLQC_NAME_RE = re.compile(r"[A-Za-z0-9._-]+\.cellqc\.[0-9]{8}-[0-9]{4}\.[A-Za-z0-9]+")
+# A file OF the directory: a name, never a path. A library is named after its folder, and an upload's
+# folder can be "Sample3 (1)", so everything but a separator, a control character or a leading dot
+# is a name; it is only ever joined to the directory for SFTP, never given to a shell.
+_CELLQC_FILE_RE = re.compile(r"(?!\.)[^/\\\x00-\x1f]{1,255}")
+_RESULT_KINDS = ("dataset", "cellqc")
+# Already compressed: deflating them again costs CPU for the whole download and saves nothing.
+_ZIP_STORED_SUFFIXES = (".h5ad", ".h5", ".gz", ".pdf", ".png", ".zip")
 
 
-def _result_pointer_path(owner: str, run_id: str) -> Path:
-    from ..tools.api import RESULT_DATASET_POINTER
-    return CONSOLE_RUNS_DIR / safe_name(owner) / run_id / "artifacts" / "data" / RESULT_DATASET_POINTER
+def _result_pointer_path(owner: str, run_id: str, what: str = "dataset") -> Path:
+    from ..tools.api import CELLQC_RESULT_POINTER, RESULT_DATASET_POINTER
+    name = CELLQC_RESULT_POINTER if what == "cellqc" else RESULT_DATASET_POINTER
+    return CONSOLE_RUNS_DIR / safe_name(owner) / run_id / "artifacts" / "data" / name
 
 
-def _move_on_hpc(conn: "Connection", src: str, dest: str) -> "tuple[bool, str]":
-    """Move ``src`` (and its ``.json`` record) to ``dest`` on dfs3b. On one filesystem that is a
-    rename, metadata only, fine on the login node. Across filesystems ``mv`` would copy the whole
-    matrix on the login node, which RCIC forbids, so it then runs as a short CPU Slurm job."""
+def _read_pointer(path: Path) -> "dict | None":
+    try:
+        rec = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    return rec if isinstance(rec, dict) else None
+
+
+def _stamp_cellqc_result(conn: "Connection", run_id: str, decisions: dict, on_hpc: bool,
+                         emit: Callable[..., Any]) -> "dict | None":
+    """Complete run_cellqc's pointer with what only the gateway knows: the name the directory is
+    saved under, where it is, and how long it stays there. None when the run did no CellQC."""
+    from ..tools.api import cellqc_result_name
+    path = _result_pointer_path(conn.owner, run_id, "cellqc")
+    rec = _read_pointer(path)
+    if rec is None or not rec.get("files"):
+        return None
+    if rec.get("name"):
+        return rec                                   # a continued run: stamped the first time
+    source = str(decisions.get("dataset_root") or decisions.get("hpc_primary")
+                 or decisions.get("dataset_path") or "")
+    kept_days = conn.settings.temp_ttl_days if on_hpc else conn.settings.checkpoint_ttl_days
+    rec.update(name=cellqc_result_name(source, run_id), run_id=run_id, owner=conn.owner,
+               source_dataset=source, location="hpc3" if on_hpc else "gateway", kept_days=kept_days)
+    try:
+        path.write_text(json.dumps(rec, indent=2), encoding="utf-8")
+    except OSError as exc:
+        emit("warning", "lab", f"CellQC result pointer not updated (non-fatal): {exc}")
+        return None
+    matrices = len(rec.get("matrices") or [])
+    emit("success", "lab",
+         f"📦 CellQC's complete result directory is kept {'on HPC3' if on_hpc else 'on the server'} "
+         f"for {kept_days} days: {len(rec['files'])} files, {int(rec.get('size_bytes') or 0) / 1e6:.0f} MB, "
+         f"with {matrices} per-library .h5ad. “CellQC results (.zip)” downloads all of it as "
+         "result/; “Save to my data” makes it a dataset. The bundle's result/ has every file but "
+         "the matrices.")
+    return rec
+
+
+def _move_on_hpc(conn: "Connection", src: str, dest: str, directory: bool = False) -> "tuple[bool, str]":
+    """Move ``src`` (a file and its ``.json`` record, or a directory) to ``dest`` on dfs3b. On one
+    filesystem that is a rename, metadata only, fine on the login node. Across filesystems ``mv``
+    would copy the whole matrix on the login node, which RCIC forbids, so it then runs as a short
+    CPU Slurm job."""
     q = shlex.quote
     dest_dir = dest.rsplit("/", 1)[0]
     check = conn.executor.exec(
-        f"mkdir -p {q(dest_dir)} && test -f {q(src)} && test ! -e {q(dest)} && "
+        f"mkdir -p {q(dest_dir)} && test {'-d' if directory else '-f'} {q(src)} && test ! -e {q(dest)} && "
         f"echo \"$(stat -c %d {q(src)}) $(stat -c %d {q(dest_dir)})\"")
     if not check.ok:
-        return False, ("the processed file is no longer on HPC3 (process files are swept after a "
-                       "few days), or a file of that name is already in your folder")
+        return False, ("it is no longer on HPC3 (process files are swept after a few days), or "
+                       "something of that name is already in your folder")
     devices = (check.stdout or "").split()[-2:]
-    mv = f"mv {q(src)} {q(dest)} && (mv {q(src + '.json')} {q(dest + '.json')} 2>/dev/null || true)"
+    mv = f"mv {q(src)} {q(dest)}"
+    if not directory:
+        mv += f" && (mv {q(src + '.json')} {q(dest + '.json')} 2>/dev/null || true)"
     if len(devices) == 2 and devices[0] == devices[1]:
         res = conn.executor.exec(mv)
     else:
@@ -9004,84 +10690,88 @@ def _move_on_hpc(conn: "Connection", src: str, dest: str) -> "tuple[bool, str]":
     return res.ok, (res.stderr or res.stdout or "")[-300:]
 
 
-@app.get("/api/result-datasets")
-async def list_result_datasets(request: Request) -> JSONResponse:
-    """The caller's runs that exported a processed dataset, newest first, with where it is now."""
-    if not _AUTH_ENABLED:
-        return JSONResponse({"result_datasets": []})
-    user = _optional_user(request)
-    if user is None:
-        return JSONResponse({"error": "Not authenticated"}, status_code=401)
-    from ..tools.api import RESULT_DATASET_POINTER
-    rows = []
-    for p in (CONSOLE_RUNS_DIR / safe_name(user.username)).glob(f"*/artifacts/data/{RESULT_DATASET_POINTER}"):
-        try:
-            rec = json.loads(p.read_text(encoding="utf-8"))
-        except (OSError, ValueError):
-            continue
-        if isinstance(rec, dict):
-            rows.append({"run_id": p.parents[2].name,
-                         **{k: rec.get(k) for k in ("name", "size_bytes", "n_cells", "n_genes",
-                                                    "created_at", "kept_days", "location",
-                                                    "saved_to", "saved_at")}})
-    rows.sort(key=lambda r: r.get("created_at") or "", reverse=True)
-    return JSONResponse({"result_datasets": rows})
+def _owner_hpc_conn(owner: str, user_id: "int | None" = None) -> "Connection | None":
+    """A live HPC3 session of this account (the files a run handed on are reached through it)."""
+    for c in _owner_connections(safe_name(owner)):
+        if c.executor is not None and (user_id is None or c.app_user_id == user_id):
+            return c
+    return None
 
 
-@app.post("/api/result-datasets/{run_id}/save")
-async def save_result_dataset(run_id: str, request: Request) -> JSONResponse:
-    """Move a run's processed dataset into the caller's personal folder — named with its input,
-    a ``processed`` marker, the time and the run — and list it among their datasets, so the next
-    analysis can start from it without anyone downloading it."""
-    if not _AUTH_ENABLED:
-        return JSONResponse({"error": "Saving a dataset requires accounts."}, status_code=400)
-    user = _optional_user(request)
-    if user is None:
-        return JSONResponse({"error": "Not authenticated"}, status_code=401)
-    if not run_id.isalnum():
-        return JSONResponse({"error": "bad run id"}, status_code=400)
-    pointer_path = _result_pointer_path(user.username, run_id)
-    try:
-        rec = json.loads(pointer_path.read_text(encoding="utf-8"))
-    except (OSError, ValueError):
-        return JSONResponse({"error": "This run has no processed dataset."}, status_code=404)
-    if rec.get("saved_to"):
-        return JSONResponse({"ok": True, "path": rec["saved_to"], "already": True})
-    name, src = str(rec.get("name") or ""), str(rec.get("path") or "")
-    if not _RESULT_NAME_RE.fullmatch(name):
-        return JSONResponse({"error": "unexpected result file name"}, status_code=400)
+def _cellqc_result_root(owner: str, run_id: str, rec: dict, conn: "Connection | None") -> "str | None":
+    """Where the directory a CellQC pointer names is, if that is one of the two places it can be
+    (beside the run, or the owner's saved results); None for any other path. The pointer is a file
+    in the run's bundle, so its ``path`` is checked, never followed."""
+    name = str(rec.get("name") or "")
+    saved = bool(rec.get("saved_to"))
+    if saved and not _CELLQC_NAME_RE.fullmatch(name):
+        return None
+    root = str(rec.get("saved_to") or rec.get("path") or "")
     if rec.get("location") == "hpc3":
-        conn = _active_conn_for_user(user)
         if conn is None:
-            return JSONResponse({"error": "Connect to HPC3 first: the processed dataset is there."},
-                                status_code=409)
-        if src != f"{_temp_base(conn)}/analysis/{run_id}/result/{name}":
-            return JSONResponse({"error": "unexpected source path"}, status_code=400)
+            return None
+        allowed = (f"{_storage_base(conn)}/{_RESULTS_FOLDER}/{name}" if saved
+                   else f"{_temp_base(conn)}/analysis/{run_id}/result/cellqc")
+        return root if root == allowed else None
+    owner_dir = (CONSOLE_RUNS_DIR / safe_name(owner)).resolve()
+    allowed_p = (owner_dir / "uploads" / "processed" / name if saved
+                 else owner_dir / run_id / "result" / "cellqc")
+    try:
+        return root if Path(root).resolve() == allowed_p.resolve() else None
+    except OSError:
+        return None
+
+
+def _save_run_result(owner: str, user_id: "int | None", run_id: str, what: str,
+                     conn: "Connection | None") -> "tuple[int, dict]":
+    """Move what a run handed on into the owner's personal folder and list it among their datasets:
+    the processed dataset (``what="dataset"``, an .h5ad) or CellQC's result directory (``"cellqc"``,
+    a folder). Returns ``(HTTP status, body)``. Talks to HPC3: call it in a thread."""
+    folder = what == "cellqc"
+    pointer_path = _result_pointer_path(owner, run_id, what)
+    rec = _read_pointer(pointer_path)
+    if rec is None:
+        return 404, {"error": "This run kept no CellQC result directory." if folder
+                     else "This run has no processed dataset."}
+    if rec.get("saved_to"):
+        return 200, {"ok": True, "path": rec["saved_to"], "already": True}
+    name, src = str(rec.get("name") or ""), str(rec.get("path") or "")
+    if not (_CELLQC_NAME_RE if folder else _RESULT_NAME_RE).fullmatch(name):
+        return 400, {"error": "unexpected result name"}
+    owner_dir = (CONSOLE_RUNS_DIR / safe_name(owner)).resolve()
+    if rec.get("location") == "hpc3":
+        if conn is None:
+            return 409, {"error": "Connect to HPC3 first: the result is kept there."}
+        expected = f"{_temp_base(conn)}/analysis/{run_id}/result/{'cellqc' if folder else name}"
+        if src != expected:
+            return 400, {"error": "unexpected source path"}
         dest = f"{_storage_base(conn)}/{_RESULTS_FOLDER}/{name}"
-        ok, detail = await asyncio.to_thread(_move_on_hpc, conn, src, dest)
+        ok, detail = _move_on_hpc(conn, src, dest, directory=folder)
         if not ok:
-            return JSONResponse({"error": f"Could not move the dataset: {detail}"}, status_code=409)
+            return 409, {"error": f"Could not move it: {detail}"}
     else:
-        owner_dir = (CONSOLE_RUNS_DIR / safe_name(user.username)).resolve()
         src_p = Path(src).resolve()
-        if src_p.parent != (owner_dir / run_id / "result").resolve() or not src_p.is_file():
-            return JSONResponse({"error": "The processed file is no longer on the server."},
-                                status_code=409)
+        if folder:
+            found = src_p == (owner_dir / run_id / "result" / "cellqc").resolve() and src_p.is_dir()
+        else:
+            found = src_p.parent == (owner_dir / run_id / "result").resolve() and src_p.is_file()
+        if not found:
+            return 409, {"error": "It is no longer on the server."}
         dest_p = owner_dir / "uploads" / "processed" / name
         if dest_p.exists():
-            return JSONResponse({"error": "A file of that name is already saved."}, status_code=409)
+            return 409, {"error": "Something of that name is already saved."}
         dest_p.parent.mkdir(parents=True, exist_ok=True)
         shutil.move(str(src_p), str(dest_p))
         sidecar = src_p.with_name(src_p.name + ".json")
-        if sidecar.is_file():
+        if not folder and sidecar.is_file():
             shutil.move(str(sidecar), str(dest_p.with_name(dest_p.name + ".json")))
         dest = str(dest_p)
     dataset_id = None
     try:
-        if not auth_routes.dataset_path_recorded(user.id, dest):
-            dataset_id = auth_routes.record_dataset(user.id, name, dest,
-                                                    int(rec.get("size_bytes") or 0), "h5ad")
-    except Exception as exc:  # noqa: BLE001 - the file is moved; the history row is best-effort
+        if user_id and not auth_routes.dataset_path_recorded(user_id, dest):
+            dataset_id = auth_routes.record_dataset(user_id, name, dest, int(rec.get("size_bytes") or 0),
+                                                    "folder" if folder else "h5ad")
+    except Exception as exc:  # noqa: BLE001 - the data is moved; the history row is best-effort
         print(f"[result-dataset] record_dataset failed: {exc}")
     rec.update(saved_to=dest, path=dest,
                saved_at=datetime.now(timezone.utc).isoformat(timespec="seconds"))
@@ -9089,7 +10779,198 @@ async def save_result_dataset(run_id: str, request: Request) -> JSONResponse:
         pointer_path.write_text(json.dumps(rec, indent=2), encoding="utf-8")
     except OSError as exc:
         print(f"[result-dataset] could not update {pointer_path}: {exc}")
-    return JSONResponse({"ok": True, "path": dest, "dataset_id": dataset_id})
+    return 200, {"ok": True, "path": dest, "dataset_id": dataset_id, "name": name,
+                 "kind": "folder" if folder else "file"}
+
+
+async def _autosave_results(conn: "Connection", run_id: str, emit: Callable[..., Any]) -> None:
+    """The run asked for its results to be saved to the user's data when it completes: do what the
+    "Save to my data" buttons do, for whatever it handed on. Best-effort, like the export."""
+    if not (_AUTH_ENABLED and conn.app_user_id):
+        emit("info", "lab", "Results were not saved to your data automatically: that needs an account.")
+        return
+    for what, label in (("dataset", "The processed dataset"), ("cellqc", "CellQC's result directory")):
+        if _read_pointer(_result_pointer_path(conn.owner, run_id, what)) is None:
+            continue
+        try:
+            status, body = await asyncio.to_thread(
+                _save_run_result, conn.owner, conn.app_user_id, run_id, what,
+                conn if conn.executor is not None else None)
+        except Exception as exc:  # noqa: BLE001 - the analysis is done; never fail the run over this
+            status, body = 500, {"error": str(exc)}
+        if status == 200:
+            emit("success", "lab", f"💾 {label} is saved to your data: {body['path']} — it is in "
+                                   "Datasets, ready for the next analysis.")
+        else:
+            emit("warning", "lab", f"{label} was not saved to your data automatically "
+                                   f"({body.get('error', status)}); Runs → “Save to my data” still can.")
+
+
+@app.get("/api/result-datasets")
+async def list_result_datasets(request: Request) -> JSONResponse:
+    """What the caller's runs handed on, newest first, with where each is now: the processed dataset
+    (the row's own fields) and, under ``cellqc``, CellQC's result directory."""
+    if not _AUTH_ENABLED:
+        return JSONResponse({"result_datasets": []})
+    user = _optional_user(request)
+    if user is None:
+        return JSONResponse({"error": "Not authenticated"}, status_code=401)
+    from ..tools.api import CELLQC_RESULT_POINTER, RESULT_DATASET_POINTER
+    home = CONSOLE_RUNS_DIR / safe_name(user.username)
+    rows: dict[str, dict] = {}
+    for p in home.glob(f"*/artifacts/data/{RESULT_DATASET_POINTER}"):
+        rec = _read_pointer(p)
+        if rec is not None:
+            rows[p.parents[2].name] = {
+                "run_id": p.parents[2].name,
+                **{k: rec.get(k) for k in ("name", "size_bytes", "n_cells", "n_genes", "created_at",
+                                           "kept_days", "location", "saved_to", "saved_at")}}
+    for p in home.glob(f"*/artifacts/data/{CELLQC_RESULT_POINTER}"):
+        rec = _read_pointer(p)
+        if rec is None or not rec.get("name"):
+            continue                                 # not stamped: the run did not reach its end
+        run_id = p.parents[2].name
+        row = rows.setdefault(run_id, {"run_id": run_id, "created_at": rec.get("created_at")})
+        row["cellqc"] = {**{k: rec.get(k) for k in ("name", "size_bytes", "created_at", "kept_days",
+                                                    "location", "saved_to", "saved_at")},
+                         "n_files": len(rec.get("files") or []),
+                         "n_matrices": len(rec.get("matrices") or []),
+                         "download_url": f"/api/cellqc-result/{safe_name(user.username)}/{run_id}"}
+    ordered = sorted(rows.values(), key=lambda r: r.get("created_at") or "", reverse=True)
+    return JSONResponse({"result_datasets": ordered})
+
+
+@app.post("/api/result-datasets/{run_id}/save")
+async def save_result_dataset(run_id: str, request: Request, what: str = "dataset") -> JSONResponse:
+    """Move what a run handed on into the caller's personal folder — named with its input, what it
+    is, the time and the run — and list it among their datasets, so the next analysis can start
+    from it without anyone downloading it. ``what``: ``dataset`` (the processed .h5ad) or ``cellqc``
+    (CellQC's result directory, as a folder)."""
+    if not _AUTH_ENABLED:
+        return JSONResponse({"error": "Saving a dataset requires accounts."}, status_code=400)
+    user = _optional_user(request)
+    if user is None:
+        return JSONResponse({"error": "Not authenticated"}, status_code=401)
+    if not run_id.isalnum() or what not in _RESULT_KINDS:
+        return JSONResponse({"error": "bad request"}, status_code=400)
+    status, body = await asyncio.to_thread(_save_run_result, user.username, user.id, run_id, what,
+                                           _active_conn_for_user(user))
+    return JSONResponse(body, status_code=status)
+
+
+class _ZipSink:
+    """The write side of a zip that is sent while it is written: zipfile appends here, the response
+    takes what has accumulated. It can tell but not seek, so zipfile writes each entry's sizes
+    after its data (a data descriptor) instead of going back to fill them in."""
+
+    def __init__(self) -> None:
+        self._chunks: list[bytes] = []
+        self._pos = 0
+
+    def write(self, data: bytes) -> int:
+        self._chunks.append(bytes(data))
+        self._pos += len(data)
+        return len(data)
+
+    def tell(self) -> int:
+        return self._pos
+
+    def flush(self) -> None:
+        pass
+
+    def take(self) -> bytes:
+        out = b"".join(self._chunks)
+        self._chunks.clear()
+        return out
+
+
+def _zip_stream(entries: "list[tuple[str, int, Callable[[], Any]]]", top: str):
+    """Yield a zip of ``entries`` — ``(name, size, blocks)``, ``blocks()`` yielding the file's bytes
+    — under the folder ``top``, as the bytes are read. Nothing is written to disk and at most one
+    block is held, so a directory of multi-GB matrices costs this host neither."""
+    sink = _ZipSink()
+    with zipfile.ZipFile(sink, "w", allowZip64=True) as zf:
+        for name, size, blocks in entries:
+            info = zipfile.ZipInfo(f"{top}/{name}", date_time=time.localtime()[:6])
+            info.compress_type = (zipfile.ZIP_STORED if name.lower().endswith(_ZIP_STORED_SUFFIXES)
+                                  else zipfile.ZIP_DEFLATED)
+            info.external_attr = 0o644 << 16
+            info.file_size = size
+            with zf.open(info, "w", force_zip64=size >= 1 << 31) as dst:
+                for block in blocks():
+                    dst.write(block)
+                    data = sink.take()
+                    if data:
+                        yield data
+            data = sink.take()
+            if data:
+                yield data
+    data = sink.take()
+    if data:
+        yield data
+
+
+def _local_blocks(path: Path, block: int = 4 * 1024 * 1024):
+    with path.open("rb") as fh:
+        while True:
+            data = fh.read(block)
+            if not data:
+                return
+            yield data
+
+
+@app.get("/api/cellqc-result/{owner}/{run_id}")
+async def get_cellqc_result(owner: str, run_id: str, request: Request) -> Response:
+    """CellQC's complete ``result/`` directory as one zip, the per-library matrices included
+    (RCHENLAB/AiScientist issue 3). It is read from where it is kept — HPC3 for an HPC3 run — and
+    sent as it is read: the matrices are never stored on this host."""
+    from starlette.responses import StreamingResponse
+    refused = _owner_dir_error(owner, request)
+    if refused is not None:
+        return refused
+    if not all(part.replace("-", "").isalnum() for part in (owner, run_id)):
+        return Response("Bad request", status_code=400)
+    rec = _read_pointer(_result_pointer_path(owner, run_id, "cellqc"))
+    files = [(str(f.get("name") or ""), int(f.get("size") or 0))
+             for f in ((rec or {}).get("files") or []) if isinstance(f, dict)]
+    files = [(n, s) for n, s in files if _CELLQC_FILE_RE.fullmatch(n)]
+    if rec is None or not files:
+        return JSONResponse({"error": "This run kept no CellQC result directory."}, status_code=404)
+    on_hpc = rec.get("location") == "hpc3"
+    conn = _owner_hpc_conn(owner) if on_hpc else None
+    if on_hpc and conn is None:
+        return JSONResponse({"error": "Connect to HPC3 first: CellQC's result directory is kept there."},
+                            status_code=409)
+    root = _cellqc_result_root(owner, run_id, rec, conn)
+    if root is None:
+        return JSONResponse({"error": "unexpected result path"}, status_code=400)
+    if on_hpc:
+        ex = conn.executor
+        present = await asyncio.to_thread(ex.exec, f"test -d {shlex.quote(root)}")
+        if not present.ok:
+            return JSONResponse({"error": "CellQC's result directory is no longer on HPC3: process "
+                                          f"files are swept after {conn.settings.temp_ttl_days} days "
+                                          "unless saved to your data."}, status_code=410)
+        stream = getattr(ex, "read_stream", None)
+
+        def opener(name: str) -> Callable[[], Any]:
+            path = f"{root}/{name}"
+            return (lambda: stream(path)) if stream is not None else (lambda: iter([ex.read_bytes(path)]))
+    else:
+        base = Path(root)
+        if not base.is_dir():
+            return JSONResponse({"error": "CellQC's result directory is no longer on the server."},
+                                status_code=410)
+        files = [(n, (base / n).stat().st_size) for n, _ in files if (base / n).is_file()]
+
+        def opener(name: str) -> Callable[[], Any]:
+            return lambda: _local_blocks(base / name)
+
+    entries = [(name, size, opener(name)) for name, size in files]
+    return StreamingResponse(
+        _zip_stream(entries, "result"), media_type="application/zip",
+        headers={"Content-Disposition": f'attachment; filename="cellqc_result_{run_id}.zip"',
+                 "Cache-Control": "no-store"})
 
 
 @app.get("/api/system")
@@ -9119,9 +11000,16 @@ async def system_overview_endpoint() -> JSONResponse:
 async def ws_endpoint(websocket: WebSocket, connection_id: str) -> None:
     await websocket.accept()
     conn = CONNECTIONS.get(connection_id)
-    if not conn:
-        await websocket.send_json({"type": "error", "message": "Unknown connection id"})
-        await websocket.close()
+    # The stream carries the session's whole event log, its plan and decision prompts and the live
+    # report, so it is the account's like every other connection route. The handshake carries the
+    # session cookie. A refusal closes with 4000 + the HTTP status, which tells the client to stop
+    # reconnecting (a plain drop is retried).
+    refused = (JSONResponse({"error": "Unknown connection id"}, status_code=404) if conn is None
+               else _conn_owner_error(conn, websocket))
+    if refused is not None:
+        await websocket.send_json({"type": "error",
+                                   "message": json.loads(refused.body).get("error", "Refused")})
+        await websocket.close(code=4000 + refused.status_code)
         return
     queue: asyncio.Queue = asyncio.Queue()
     conn.subscribers.add(queue)
@@ -9167,6 +11055,10 @@ async def ws_endpoint(websocket: WebSocket, connection_id: str) -> None:
     finally:
         conn.subscribers.discard(queue)
 
+
+# The upload receiver stops at the complete-file handoff to the existing staging queue.
+from .tus_upload import router as tus_router
+app.include_router(tus_router)
 
 # --- static frontend -------------------------------------------------------
 

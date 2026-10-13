@@ -15,7 +15,7 @@
 #   REMOTE_HOST   server hostname / IP            (REQUIRED, no default)
 #   REMOTE_USER   service account                 (default: <ucinetid>)
 #   REMOTE_PORT   ssh port                         (no default — set it in .deploy.env)
-#   REMOTE_APP    repo dir on the server           (default: /data/BioAgent/app)
+#   REMOTE_APP    repo dir on the server           (default: /data/aiscientist/app)
 #   SSH_KEY       path to a private key            (optional)
 #
 # Usage:
@@ -42,7 +42,7 @@ for _old in $(compgen -v BIOAGENT_ || true); do _new="AISCIENTIST_${_old#BIOAGEN
 REMOTE_HOST="${REMOTE_HOST:-}"
 REMOTE_USER="${REMOTE_USER:-<ucinetid>}"
 REMOTE_PORT="${REMOTE_PORT:-}"
-REMOTE_APP="${REMOTE_APP:-/data/BioAgent/app}"
+REMOTE_APP="${REMOTE_APP:-/data/aiscientist/app}"
 SSH_KEY="${SSH_KEY:-}"
 
 if [ -z "$REMOTE_HOST" ]; then

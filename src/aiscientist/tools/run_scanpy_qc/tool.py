@@ -134,6 +134,8 @@ def run_scanpy_qc(args: dict[str, Any], ctx: Any) -> dict[str, Any]:
     # aggregation (summing log values is meaningless), doublet detection, scVI. Cheap insurance
     # — the layer is the same sparse matrix that was about to be overwritten.
     adata.layers["counts"] = adata.X.copy()
+    adata.uns["counts_layer"] = ("UMI counts as read from the input, for the cells and genes that "
+                                 "passed QC (no ambient-RNA correction)")
 
     # Thresholds that empty the object must fail HERE, with the numbers that caused it. Left to
     # scanpy, HVG selection dies on the empty matrix with `ValueError: Cannot cut empty array` —

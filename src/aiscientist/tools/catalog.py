@@ -11,6 +11,8 @@ the platform needs and whose body is the documentation people read::
     entry: tool:make_tool        # <module in this folder>:<factory>   (this is the default)
     needs: []                    # factory arguments the platform injects: see build()
     chat: false                  # also offered on the fast chat path
+    research: true               # offered to the research agents (the default); false = the tool
+                                 #   runs only from its own console line, no model can call it
     order: 220                   # position in the Scientist's catalog (ascending)
     line: scrna                  # the analysis line it belongs to (optional)
     owner: analysis              # the team line that maintains it
@@ -177,6 +179,7 @@ class ToolManifest:
     entry: str = "tool:make_tool"
     needs: tuple[str, ...] = ()
     chat: bool = False
+    research: bool = True         # in the Scientist's catalog; False = only its own console line runs it
     line: str = ""
     owner: str = ""
     image: str = ""               # container the tool's HPC3 job runs in ("" = the line's image)
@@ -219,7 +222,7 @@ def load_manifest(folder: Path) -> ToolManifest:
         raise ManifestError(f"{path}: runs_on {fields['runs_on']!r} is not one of {RUNS_ON}")
     if fields["category"] not in CATEGORIES:
         raise ManifestError(f"{path}: category {fields['category']!r} is not one of {CATEGORIES}")
-    known = set(_REQUIRED) | {"entry", "needs", "chat", "line", "owner",
+    known = set(_REQUIRED) | {"entry", "needs", "chat", "research", "line", "owner",
                               "image", "cpus", "mem_gb", "time_limit"}
     unknown = set(fields) - known
     if unknown:
@@ -242,7 +245,8 @@ def load_manifest(folder: Path) -> ToolManifest:
         runs_on=fields["runs_on"], order=int(fields["order"]), folder=folder,
         entry=str(fields.get("entry") or "tool:make_tool"),
         needs=tuple(str(n) for n in (needs if isinstance(needs, list) else [needs])),
-        chat=bool(fields.get("chat", False)), line=str(fields.get("line") or ""),
+        chat=bool(fields.get("chat", False)), research=bool(fields.get("research", True)),
+        line=str(fields.get("line") or ""),
         owner=str(fields.get("owner") or ""), image=image,
         cpus=int(fields.get("cpus") or 0), mem_gb=int(fields.get("mem_gb") or 0),
         time_limit=time_limit, doc=body)

@@ -8,7 +8,7 @@ The asset inventory of everything we own on HPC3 is a separate doc: `docs/hpc3_a
 ## The problem this fixes
 
 Results land on the **eyeserver** — `<AISCIENTIST_RESULTS_DIR>/<ucinetid>/<run_id>/artifacts/`
-(prod: `/data/BioAgent`). Every HPC3 executor mirrors its `artifacts/` back there when a step
+(prod: `/data/aiscientist`). Every HPC3 executor mirrors its `artifacts/` back there when a step
 finishes, so the deliverables are never stranded on the cluster.
 
 The **process files** are a different story. Until this change, every HPC3-offloaded step wrote
@@ -47,7 +47,9 @@ one member alone.
 │   ├── scgpt/<run_id>/
 │   ├── reports/
 │   ├── paperqa/
-│   └── scratch/{runcode,analysis,variant,phenotype,paperqa}/   sbatch + args/result + job logs
+│   └── scratch/{analysis,runcode,variant,phenotype,paperqa,report,worker}/
+│                                       <- each job's sbatch script, args/result JSON, Slurm log
+│                                          and tool log (see "Job files" below)
 ├── uploads/<ucinetid>/                 <- raw research data, NEVER swept
 ├── pysrc/<ucinetid>/                   <- synced AiScientist source, rewritten each connect
 └── bin/<ucinetid>/temp_gc.sh           <- the sweeper, staged from deploy/hpc3/
@@ -66,7 +68,38 @@ Deliberately **not** in scope of any automatic deletion:
 * `<shared_root>/{containers,hf,envs,ollama,scgpt_model,vlreview_model}/` — the built assets.
 * `/dfs3b/ruic20_lab/<ucinetid>/` — **every member's personal folder stays untouched.** Old runs
   that predate this change are still there, still browsable, and are only ever removed by hand.
-* `$HOME/.bioagent/` — vLLM port files + `serve.sbatch` (2.4 MB, rewritten in place).
+* `$HOME/.bioagent/` — the vLLM serve job's own files only: `serve.<partition>.sbatch`,
+  `vllm.<jobid>.port` and `vllm.<jobid>.spec` (how the gateway finds and steers a running serve
+  job), plus that job's log `$HOME/bioagent-vllm-<jobid>.log`. No analysis, report or worker job
+  writes there any more (see "Job files" below).
+
+## Job files
+
+Every job a run starts on HPC3 has a few small files of its own: the sbatch script, the args JSON
+it is given, the result JSON it prints, the Slurm log (`#SBATCH --output`) and the tool's stderr
+log. They all go to `Temp/<ucinetid>/scratch/<line>/`, one directory per job line:
+
+| job line | directory under `Temp/<ucinetid>/` |
+|---|---|
+| scanpy analysis tools (QC, clustering, DE, CellQC ...) and image pulls | `scratch/analysis/` |
+| `run_code` snippets | `scratch/runcode/` |
+| offline VEP variant annotation | `scratch/variant/` |
+| LIRICAL phenotype | `scratch/phenotype/` |
+| PaperQA literature | `scratch/paperqa/` |
+| report rendering (pandoc / xelatex), including the staged `render_<n>.tgz` | `scratch/report/` |
+| the session's CPU worker (holder script + log) | `scratch/worker/` |
+| scGPT annotation, render review | beside their output: `scgpt/<run_id>/out/`, `vlreview/<run_id>/pass<n>/out/` |
+
+The gateway takes each of these from one function (`app._scratch_dir`), and the job classes have
+no default directory: a job line that names none fails when it is built instead of writing
+somewhere else. The paths are absolute on purpose. Slurm does not expand `$HOME` in
+`#SBATCH --output`, so a path with a shell variable in it is created as written.
+
+Until 2026-10-12 some of these lines did not follow the layout above: the scanpy analysis line and
+the report renderer wrote to `$HOME/.bioagent/{analysis,report}/`, the scGPT and review scripts went
+to `$HOME/.bioagent/jobs/`, and the CPU worker's log to a directory literally named `$HOME` inside
+the home directory (RCHENLAB/AiScientist issue 2). Nothing in the home directory is swept, so those
+files only accumulated; in `Temp` they are removed with the rest once they go cold.
 
 ## The sweep
 
@@ -142,7 +175,7 @@ real sweep came back clean.
 What is left is the eyeserver:
 
 1. Restart the gateway so the new defaults load.
-2. **Check `/data/BioAgent/app/.env` for pinned `software/bioagent` paths.** They still resolve
+2. **Check `/data/aiscientist/app/.env` for pinned `software/bioagent` paths.** They still resolve
    through the compat symlink, so nothing breaks either way — but update them so the symlink can
    eventually go. `AISCIENTIST_HPC_SHARED_ROOT` itself needs no entry unless you want a non-default.
 3. Optional per-member cron backstop (above).
@@ -159,3 +192,14 @@ Nothing is moved or deleted automatically. Existing
 `/dfs3b/ruic20_lab/<ucinetid>/{analysis,variant,phenotype,reports,scgpt,.bioagent}/` stay exactly
 where they are; a member can review and delete them from the storage panel, which now lists all
 three areas (Temp, Uploads, personal lab folder) with their sizes.
+
+The same holds for the job files left in the home directory before 2026-10-12 (see "Job files"):
+they are not written any more and nothing deletes them. The storage panel does not list the home
+directory, so remove them by hand once no run is in progress:
+
+```
+rm -rf ~/.bioagent/analysis ~/.bioagent/report ~/.bioagent/runcode ~/.bioagent/variant ~/.bioagent/jobs
+rm -rf ~/'$HOME'        # the directory literally named $HOME — keep the single quotes
+```
+
+Leave `~/.bioagent/` itself and the `serve.*`, `vllm.*` files in it: a running serve job reads them.

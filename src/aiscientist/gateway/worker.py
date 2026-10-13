@@ -57,12 +57,42 @@ class WorkerAllocation:
         return {"job_id": self.job_id, "node": self.node, "reused": self.reused}
 
 
+# (host, user, directory as given) -> the absolute path the cluster expands it to. A user's home
+# does not move, so one ``echo`` serves every later worker this gateway process submits for them.
+_RESOLVED_DIRS: dict[tuple[str, str, str], str] = {}
+
+
+def _resolved_dir(executor: RemoteExecutor, path: str) -> str:
+    """Expand shell vars (``$HOME``) in ``path`` to an absolute remote path, ONCE per user.
+
+    The directory is used in the SSH shell, where ``$HOME`` expands, but also in
+    ``#SBATCH --output``, where **Slurm does not expand it**: the holder's log went to a directory
+    literally named ``$HOME`` under the user's home. Resolving up front fixes every use site (same
+    as ``SlurmSandboxExecutor._resolved_scratch``). If the cluster cannot expand it (offline/mock),
+    keep the literal so behaviour is unchanged rather than guessed — and do not cache the miss.
+    """
+    if "$" not in path:
+        return path
+    key = (getattr(executor, "host", "") or "", getattr(executor, "username", "") or "", path)
+    if key not in _RESOLVED_DIRS:
+        got = executor.exec(f"echo {path}")
+        lines = (getattr(got, "out", "") or "").splitlines()
+        if not (getattr(got, "ok", False) and lines and lines[0].startswith("/")
+                and "$" not in lines[0]):
+            return path
+        _RESOLVED_DIRS[key] = lines[0].strip().rstrip("/")
+    return _RESOLVED_DIRS[key]
+
+
 def _holder_script(settings: HPCSettings, name: str, log_dir: str) -> str:
     """A batch script whose only job is to HOLD the allocation open.
 
     ``sleep infinity`` rather than a computed duration: Slurm enforces the wall limit itself, and
     a hand-computed sleep that disagrees with ``--time`` just adds a second, wrong deadline. The
     node is released by ``--time``, by ``scancel`` on disconnect, or by the job being preempted.
+
+    ``log_dir`` must already be absolute (see ``_resolved_dir``): Slurm takes ``--output`` as
+    written, relative to the submit directory.
     """
     account = f"#SBATCH --account={settings.cpu_account}\n" if settings.cpu_account else ""
     return (
@@ -97,9 +127,13 @@ def find_running_worker(executor: RemoteExecutor, username: str = "") -> WorkerA
     return WorkerAllocation(job_id=job_id.strip(), node=node.strip(), reused=True)
 
 
-def ensure_worker(executor: RemoteExecutor, settings: HPCSettings, emit=None,
-                  scratch_dir: str = "$HOME/.bioagent") -> WorkerAllocation:
+def ensure_worker(executor: RemoteExecutor, settings: HPCSettings, emit=None, *,
+                  scratch_dir: str) -> WorkerAllocation:
     """Reuse this user's running worker, or submit and wait for one.
+
+    ``scratch_dir`` holds the holder job's script and log. It must be an absolute directory under
+    the application's storage: Slurm does not expand ``$HOME`` in ``#SBATCH --output``, so a path
+    with a shell variable in it is created literally (a directory named ``$HOME``).
 
     Reuse-first is what keeps a reconnect cheap and stops a user accumulating idle CPU
     allocations across browser reloads — the same reasoning as ``gpu.find_running_job``.
@@ -112,7 +146,8 @@ def ensure_worker(executor: RemoteExecutor, settings: HPCSettings, emit=None,
 
     user = getattr(executor, "username", "") or "user"
     name = job_name(user)
-    log_dir = scratch_dir.rstrip("/")
+    # Absolute before it reaches `#SBATCH --output`, the quoted `mkdir` and the submit directory.
+    log_dir = _resolved_dir(executor, scratch_dir.rstrip("/"))
     executor.exec(f"mkdir -p {shlex.quote(log_dir)}")
     spec = SlurmJobSpec(job_name=name, script=_holder_script(settings, name, log_dir),
                         submit_dir=log_dir)
