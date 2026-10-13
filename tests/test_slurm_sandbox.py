@@ -335,3 +335,34 @@ def test_sync_is_a_no_op_without_a_local_target(tmp_path):
     ex = SlurmCodeExecutor(remote=_Remote(), container_image="x.sif", scratch_dir=SCRATCH,
                            artifacts_dir="/dfs/run/artifacts", local_artifacts=None)
     ex._sync_artifacts_back(changed=["tables/a.csv"])      # no raise
+
+
+class _ScriptHPC(FakeHPC):
+    """Also keeps the staged sbatch script, so its binds and exports can be checked."""
+
+    def __init__(self, *a, **k):
+        super().__init__(*a, **k)
+        self.scripts: list[str] = []
+
+    def exec(self, command, timeout=60.0):
+        # main runs containers with apptainer since 2026-10-09; older settings still say singularity
+        if "apptainer" in command or "singularity" in command:
+            self.scripts.append(command)
+        return super().exec(command, timeout)
+
+
+def test_other_bound_files_are_bound_read_only_and_exported():
+    """--containall hides every unbound path: without an explicit bind a reference atlas on dfs3b
+    existed and no snippet could open it."""
+    hpc = _ScriptHPC({".out": "", ".err": "", ".rc": "0\n"})
+    ex = _executor(hpc, inputs=(
+        {"name": "atlas.h5ad", "role": "reference", "path": "/dfs/lab/uploads/u/atlas.h5ad"},
+        {"name": "panel.bed", "role": None, "path": "/dfs/lab/run/work/panel.bed"},
+    ))
+    out = ex("print(1)")
+    assert out["status"] == "ok"
+    script = "\n".join(hpc.scripts)
+    assert "/dfs/lab/uploads/u:/dfs/lab/uploads/u:ro" in script        # parent dir, read-only
+    assert "uploads/u/atlas.h5ad:/dfs" not in script                    # never the bare file
+    assert "/dfs/lab/run/work:/dfs/lab/run/work:ro" not in script       # already rw-bound
+    assert "AISCIENTIST_REFERENCE" in script and "AISCIENTIST_INPUTS" in script

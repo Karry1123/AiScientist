@@ -24,6 +24,11 @@ The first step of the single-cell line. It computes per-cell quality metrics (ge
   data profile (`⚠ INPUT is a 10x Cell Ranger delivery …`).
 - After `run_cellqc`: it already wrote the filtered, normalised checkpoint. Running this tool on top
   would filter a second time with different thresholds.
+- On a dataset an earlier run handed on (`<input>.processed.<time>.<run>.h5ad`, recognised by its
+  `uns["aiscientist"]` record). It is already filtered and log-normalised, so the tool refuses it:
+  QC there would filter on log values and normalise twice. The gateway has already written such a
+  file back as this run's checkpoints (`_lib/result_dataset.adopt`), so the next tool reads it
+  directly. Tests: `tests/test_session_continuation.py`.
 
 ## Inputs
 

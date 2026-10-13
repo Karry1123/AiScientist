@@ -145,9 +145,10 @@ def test_a_cell_ranger_pipestance_copies_the_delivery_not_the_working_files(shar
 
 def test_the_mirror_path_is_stable_and_shared_by_parent_and_child(shared):
     root, _ = shared
-    base = "/dfs3b/x/uploads/u"
+    base = "/dfs3b/x/Temp/u/server-data/abc123"         # one session's copy area
     tag = "_".join(p for p in root.parts if p != "/")
-    assert sd.mirror_dir(base, root, root / "lab") == f"{base}/server-data/{tag}/lab"
+    assert sd.mirror_tag(root) == tag
+    assert sd.mirror_dir(base, root, root / "lab") == f"{base}/{tag}/lab"
     # Binding the child later reuses the parent's copy: same place, nothing to copy again.
     assert (sd.mirror_dir(base, root, root / "lab" / "Sample3")
             == sd.mirror_dir(base, root, root / "lab") + "/Sample3")
@@ -239,12 +240,79 @@ def test_a_run_admits_own_uploads_and_server_data_and_drops_the_rest(shared, tmp
     assert [a["path"] for a in admitted] == [str(own), sample]
     assert any("Not bound" in s and "keys.txt" in s for s in said)
     remote, copied = mirrors[sample]
-    assert remote.startswith(f"{gw_app._hpc_uploads_dir(conn)}/server-data/")
+    # A temporary copy, in this session's own area under Temp — never among the user's uploads.
+    assert remote.startswith(f"{gw_app._session_mirror_base(conn)}/")
+    assert f"/Temp/tester/server-data/{gw_app._session_tag(conn)}/" in remote
+    assert not remote.startswith(gw_app._hpc_uploads_dir(conn))
     assert "outs/filtered_feature_bc_matrix.h5" in copied
     assert f"{remote}/outs/filtered_feature_bc_matrix.h5" in conn.executor.files
     assert gw_app._mirror_of(mirrors, sample, Path(sample) / "outs" / "filtered_feature_bc_matrix.h5") \
         == f"{remote}/outs/filtered_feature_bc_matrix.h5"
     assert gw_app._mirror_of(mirrors, sample, Path(sample) / "outs" / "molecule_info.h5") is None
+
+
+def test_a_mirror_path_is_told_from_an_upload(shared):
+    sessions, legacy = "/dfs/Temp/u/server-data", "/dfs/uploads/u/server-data"
+    assert sd.split_mirror(f"{sessions}/sessA/data_shared/lab/S3/x.h5", sessions, legacy) \
+        == ("data_shared", "lab/S3/x.h5")
+    assert sd.split_mirror(f"{sessions}/sessA/data_shared", sessions, legacy) == ("data_shared", "")
+    assert sd.split_mirror(f"{legacy}/data_shared/lab/S3", sessions, legacy) == ("data_shared", "lab/S3")
+    assert sd.split_mirror("/dfs/uploads/u/Sample3/x.h5", sessions, legacy) is None     # an upload
+    assert sd.split_mirror(f"{sessions}/sessA", sessions, legacy) is None               # no root
+    assert sd.split_mirror(f"{sessions}/sessA/data_shared/../../x", sessions, legacy) is None
+    assert sd.split_mirror("", sessions, legacy) is None
+
+
+def test_a_resumed_run_gets_this_sessions_copy_of_its_server_data(shared, tmp_path, monkeypatch):
+    """The session that first ran it is gone and its copy with it: the server still has the data,
+    so a resume copies it again and the stored HPC3 paths follow (RCHENLAB/AiScientist issue 4)."""
+    root, _ = shared
+    conn = _conn(tmp_path, analysis_on_hpc=True)
+    tag = sd.mirror_tag(root)
+    sessions = gw_app._session_mirror_base(conn).rsplit("/", 1)[0]
+    gone = f"{sessions}/0ldsession00/{tag}/lab/Sample3"            # removed at that disconnect
+    legacy = f"{gw_app._hpc_uploads_dir(conn)}/server-data/{tag}/lab/Sample3"   # the shared mirror
+    upload = f"{gw_app._hpc_uploads_dir(conn)}/panel.bed"
+    decisions = {
+        "dataset_root": str(root / "lab" / "Sample3"),
+        "hpc_dataset_root": gone,
+        "hpc_primary": f"{gone}/outs/filtered_feature_bc_matrix.h5",
+        "datasets": [{"name": "notes.txt", "hpc_primary": f"{legacy}/notes.txt"},
+                     {"name": "panel.bed", "hpc_primary": upload}],
+    }
+    said: list[str] = []
+    asyncio.run(gw_app._restage_server_data(
+        conn, decisions, lambda text, level="info": said.append(text),
+        lambda level, stage, text: said.append(text)))
+    here = f"{gw_app._session_mirror_base(conn)}/{tag}/lab/Sample3"
+    assert decisions["hpc_dataset_root"] == here
+    assert decisions["hpc_primary"] == f"{here}/outs/filtered_feature_bc_matrix.h5"
+    assert decisions["datasets"][0]["hpc_primary"] == f"{here}/notes.txt"
+    assert decisions["datasets"][1]["hpc_primary"] == upload       # an upload is not a copy
+    assert f"{here}/outs/filtered_feature_bc_matrix.h5" in conn.executor.files
+    assert conn.server_data_synced and any("Copied" in s for s in said)
+    # One copy of the bound folder, not one per file that names a path inside it.
+    assert sum(c.startswith("find ") for c in conn.executor.commands) == 1
+    # Resumed again in the same session: nothing is copied twice and the paths stay.
+    conn.executor.puts.clear()
+    asyncio.run(gw_app._restage_server_data(conn, decisions, lambda *a, **k: None,
+                                            lambda *a, **k: None))
+    assert conn.executor.puts == [] and decisions["hpc_dataset_root"] == here
+
+
+def test_a_resume_whose_server_folder_is_gone_says_so_and_keeps_the_stored_path(shared, tmp_path):
+    root, _ = shared
+    conn = _conn(tmp_path, analysis_on_hpc=True)
+    sessions = gw_app._session_mirror_base(conn).rsplit("/", 1)[0]
+    stored = f"{sessions}/0ldsession00/{sd.mirror_tag(root)}/lab/NoSuchSample"
+    other = f"{sessions}/0ldsession00/some_other_root/x"
+    decisions = {"hpc_primary": stored, "datasets": [{"hpc_primary": other}]}
+    said: list[str] = []
+    asyncio.run(gw_app._restage_server_data(conn, decisions, lambda *a, **k: None,
+                                            lambda level, stage, text: said.append(text)))
+    assert decisions["hpc_primary"] == stored and decisions["datasets"][0]["hpc_primary"] == other
+    assert len(said) == 2 and all("cannot be found again" in s for s in said)
+    assert conn.executor.puts == []
 
 
 def test_without_analysis_on_hpc_server_data_is_read_in_place(shared, tmp_path, monkeypatch):

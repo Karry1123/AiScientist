@@ -3144,3 +3144,29 @@ def test_headless_never_consumes_the_ask_budget():
     for i in range(5):
         lab._failure_decision("q", TaskNode(id=f"s{i}", goal="Cluster"), "boom", [], None, lambda _e: None)
     assert lab._human_failure_asks == 0
+
+
+def test_dataset_profile_names_the_attached_reference():
+    """The profile describes the PRIMARY only; a second upload the user marked as reference must
+    reach the planner by name and role, or a plan cannot use it (and might analyse it as the study)."""
+    from aiscientist.agents.research_harness import HarnessContext
+    from aiscientist.agents.research_lab import LabConfig, ResearchLab
+
+    datasets = [
+        {"name": "query.h5ad", "primary": True},
+        {"name": "atlas.h5ad", "role": "reference", "primary": False,
+         "description": {"one_line_summary": "human retina cell-type atlas"}},
+        {"name": "panel.bed", "role": "gene_panel", "primary": False},
+    ]
+    ctx = HarnessContext(decisions={"dataset_result": {"cells": 10, "genes": 5},
+                                    "datasets": datasets}, tunnel_port=1, model="m")
+    prof = ResearchLab(ctx, LabConfig(), complete_fn=lambda m: "x")._dataset_context()
+    assert "query.h5ad — PRIMARY" in prof
+    assert "atlas.h5ad — REFERENCE: human retina cell-type atlas" in prof
+    assert "panel.bed — GENE_PANEL" in prof
+    assert "AISCIENTIST_REFERENCE" in prof and "never as the study's own data" in prof
+
+    single = HarnessContext(decisions={"dataset_result": {"cells": 10, "genes": 5},
+                                       "datasets": datasets[:1]}, tunnel_port=1, model="m")
+    assert "Attached files" not in ResearchLab(single, LabConfig(),
+                                               complete_fn=lambda m: "x")._dataset_context()

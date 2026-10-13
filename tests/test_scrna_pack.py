@@ -78,6 +78,15 @@ def test_qc_missing_dependency_is_graceful(tmp_path, monkeypatch):
     assert out["dependency"] in {"scanpy", "matplotlib", "anndata"}
 
 
+def _one_installed_library(tmp_path, monkeypatch) -> dict:
+    """A usable library, so the tool gets past the library check to its gseapy import."""
+    gdir = tmp_path / "genesets"
+    gdir.mkdir()
+    (gdir / "TestPathways.gmt").write_text("term\tdesc\tRHO\tPDE6A\n", encoding="utf-8")
+    monkeypatch.setenv("AISCIENTIST_GENESETS_DIR", str(gdir))
+    return {"gene_sets": ["TestPathways"]}
+
+
 def test_enrichment_missing_gseapy_is_graceful(tmp_path, monkeypatch):
     real_import = builtins.__import__
 
@@ -87,7 +96,8 @@ def test_enrichment_missing_gseapy_is_graceful(tmp_path, monkeypatch):
         return real_import(name, *a, **k)
 
     monkeypatch.setattr(builtins, "__import__", fake_import)
-    out = run_enrichment_tool.run_enrichment({}, _ctx(tmp_path))
+    out = run_enrichment_tool.run_enrichment(_one_installed_library(tmp_path, monkeypatch),
+                                             _ctx(tmp_path))
     assert out["status"] == "dependency_missing" and out["dependency"] == "gseapy"
 
 
@@ -419,7 +429,8 @@ def test_prerank_missing_gseapy_is_graceful(tmp_path, monkeypatch):
         return real_import(name, *a, **k)
 
     monkeypatch.setattr(builtins, "__import__", fake_import)
-    out = run_gsea_prerank_tool.run_gsea_prerank({}, _ctx(tmp_path))
+    out = run_gsea_prerank_tool.run_gsea_prerank(_one_installed_library(tmp_path, monkeypatch),
+                                                 _ctx(tmp_path))
     assert out["status"] == "dependency_missing" and out["dependency"] == "gseapy"
 
 

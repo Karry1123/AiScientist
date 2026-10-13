@@ -37,7 +37,8 @@ also documented in the ``run`` skill::
     #SBATCH --output=<scratch>/bioagent_runcode_3-%j.log
 
     apptainer exec --containall --writable-tmpfs \\
-      -B <dataset>:<dataset>:ro -B <work>:<work> -B <artifacts>:<artifacts> \\
+      -B <dataset>:<dataset>:ro -B <dir of each other bound file>:<same>:ro \\
+      -B <work>:<work> -B <artifacts>:<artifacts> \\
       <image> bash -lc 'python <scratch>/snippet_3.py > out 2> err; echo $? > rc'
 """
 
@@ -47,7 +48,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable
 
-from ..agents.sandbox import sandbox_network_enabled
+from ..agents.sandbox import input_env, sandbox_network_enabled
 from .executor import RemoteExecutor
 from .job_store import JobRecord, JobStore
 from .slurm_job import (
@@ -128,6 +129,10 @@ class SlurmCodeExecutor:
     pkgs_cache_dir: str = ""
     # Progress lines for the console, e.g. "building the image": (level, message).
     notify: Callable[[str, str], None] | None = None
+    # The run's OTHER bound files ({name, role, path}, dfs3b paths), exposed read-only as
+    # AISCIENTIST_INPUTS / AISCIENTIST_REFERENCE. ``--containall`` hides every path not bound, so
+    # without this a second upload (a reference atlas) existed on dfs3b and no snippet could open it.
+    inputs: tuple[dict, ...] = ()
     _counter: int = field(default=0, repr=False)
     _images: dict[str, str] = field(default_factory=dict, repr=False)
     _scratch: str | None = field(default=None, repr=False)
@@ -251,6 +256,20 @@ class SlurmCodeExecutor:
                 "note": f"run_code could not run on HPC3 ({reason}), and it is not run on the "
                         "gateway host."}
 
+    def _input_binds(self) -> tuple[str, ...]:
+        """Read-only binds for the other bound files: each one's PARENT directory, never the bare
+        file — a file bind FATALs when that path is absent from the image (slurm_analysis binds
+        dirname() for the same reason). Skipped when already under the rw work/artifacts binds."""
+        rw = [p.rstrip("/") + "/" for p in (self.work_dir, self.artifacts_dir) if p]
+        out: list[str] = []
+        for i in self.inputs:
+            path = str(i.get("path") or "") if isinstance(i, dict) else ""
+            parent = str(Path(path).parent) if path else ""
+            if parent and parent != "/" and parent not in out and not any(
+                    (parent.rstrip("/") + "/").startswith(r) for r in rw):
+                out.append(parent)
+        return tuple(out)
+
     def _resolved_scratch(self) -> str:
         """Expand shell vars (e.g. ``$HOME``) in ``scratch_dir`` to a concrete remote path ONCE.
 
@@ -304,6 +323,7 @@ class SlurmCodeExecutor:
                      ("AISCIENTIST_DATASET_ROOT", self.dataset_root),
                      ("AISCIENTIST_WORK", self.work_dir),
                      ("AISCIENTIST_ARTIFACTS", self.artifacts_dir),
+                     *input_env(self.inputs).items(),
                      *(extra_exports or {}).items()]
         exports = "; ".join(f"export {var}={shlex_quote(val)}" for var, val in variables if val)
         # The lab-shared package cache (run_code only). Resolved INSIDE the container (the key
@@ -319,7 +339,8 @@ class SlurmCodeExecutor:
         root = (self.dataset_root or "").rstrip("/")
         inside_root = bool(root and self.dataset_path
                            and str(self.dataset_path).startswith(root + "/"))
-        binds_ro = tuple(p for p in (root, None if inside_root else self.dataset_path, *cache_binds)
+        binds_ro = tuple(p for p in (root, None if inside_root else self.dataset_path, *cache_binds,
+                                     *self._input_binds())
                          if p)
         binds_rw = tuple(p for p in (self.work_dir, self.artifacts_dir, scratch) if p)
         inner = container_exec(

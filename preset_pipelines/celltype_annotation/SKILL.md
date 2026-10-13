@@ -82,13 +82,13 @@ Adapt the parameters to THIS dataset; plan ordered steps that:
 5b. **Composition** (`run_composition`): the proportion each label makes up, per sample.
 6. Produce figures: a UMAP colored by cluster and by assigned cell type, and violin/dot plots
    of canonical marker genes.
-6b. **Literature grounding** (`literature_search`): search on the cell types, markers and
-   pathway terms the analysis actually surfaced. The manuscript's `## References` are built ONLY
-   from an ACCEPTED `literature_search` step — with no such step they are silently empty, and the
-   labels arrive with nothing tying them to the published biology.
+6b. **Literature grounding** (`literature_search`) — OPTIONAL, and its own step: plan it ONLY when the user asks for literature, references or citations; otherwise leave it out and offer it as a follow-up.
+   When it is planned: search on the cell types, markers and pathway terms the analysis actually
+   surfaced. The manuscript's `## References` are built ONLY from an ACCEPTED literature step, so
+   a run without one has no reference list, and its report says so.
 7. Do NOT plan a report-WRITING or rendering step — the methods + results report is assembled
    automatically from the accepted results. That is about writing it, NOT about interpreting:
-   the enrichment (step 4) and literature (step 6b) evidence is still required.
+   the enrichment (step 4) evidence is still part of a whole analysis.
 
 Ground every label in the marker genes the tools actually returned. Do not fabricate cell
 types, gene names, or numbers a tool did not return; if a step's tool errors, report it

@@ -63,6 +63,11 @@ When this capability applies, and what curated tool (if any) it complements rath
 The code or commands inline, or how to adapt the bundled file.
 ```
 
+`reference.py` is a **template to rewrite**, not code to run blindly. It reads checkpoints from
+`$AISCIENTIST_WORK` and writes deliverables under `$AISCIENTIST_ARTIFACTS`. Files the user attached
+beside the primary dataset (a reference atlas, a BED panel) arrive read-only as `$AISCIENTIST_INPUTS`
+(a JSON list of `{name, role, path}`); the one marked as reference is also `$AISCIENTIST_REFERENCE`.
+
 ### A skill that needs its own software
 
 A skill whose steps are command-line programs that no tool runs (an R or Snakemake pipeline, say)

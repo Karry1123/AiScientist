@@ -123,7 +123,7 @@ class HPCSettings:
     #   <shared_root>/Temp/<user>/...     process files — SWEPT after temp_ttl_days (see hpc_gc.py)
     #   <shared_root>/uploads/<user>/...  raw uploaded data — NEVER swept
     #   <shared_root>/pysrc/<user>/...    the synced AiScientist source (rewritten in place each connect)
-    #   <shared_root>/bin/<user>/         the staged sweeper
+    #   <shared_root>/bin/<user>/         the staged sweeper and session cleanup
     #   <shared_root>/{containers,hf,envs,scgpt_model,vlreview_model,ollama}/   assets, NEVER swept
     # The sweeper is hard-guarded to `<root>/Temp` and cannot walk into the assets. Nothing outside
     # <shared_root> is ever deleted automatically: a member's personal <lab_storage>/<ucinetid>/ dir
@@ -132,6 +132,10 @@ class HPCSettings:
     # Age (days) after which a <shared_root>/Temp/<user>/<kind>/<run> dir whose whole subtree has
     # gone untouched is removed. 0 disables the sweep entirely.
     temp_ttl_days: int = 3
+    # On disconnect, remove what that session alone made under Temp: the folders of the runs it
+    # started and its copies of server-side datasets (hpc_gc.clean_session). Off leaves all of it
+    # to the age sweep above.
+    session_cleanup: bool = True
 
     # --- LLM serving backend ------------------------------------------------
     # "vllm" (Apptainer container, OpenAI-compatible /v1) — the default and only
@@ -506,6 +510,8 @@ class HPCSettings:
             lab_data_group=os.environ.get("AISCIENTIST_LAB_DATA_GROUP", cls.lab_data_group),
             shared_root=(os.environ.get("AISCIENTIST_HPC_SHARED_ROOT") or cls.shared_root).rstrip("/"),
             temp_ttl_days=_int("AISCIENTIST_TEMP_TTL_DAYS", cls.temp_ttl_days),
+            session_cleanup=(os.environ.get("AISCIENTIST_SESSION_CLEANUP", "1").strip().lower()
+                             not in ("0", "false", "no", "off")),
             llm_backend=os.environ.get("AISCIENTIST_LLM_BACKEND", cls.llm_backend).strip().lower(),
             vllm_model=os.environ.get("AISCIENTIST_VLLM_MODEL", cls.vllm_model),
             vllm_image=os.environ.get("AISCIENTIST_VLLM_IMAGE", cls.vllm_image),

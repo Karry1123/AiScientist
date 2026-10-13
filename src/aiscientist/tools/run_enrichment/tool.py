@@ -155,11 +155,6 @@ def run_enrichment(args: dict[str, Any], ctx: Any) -> dict[str, Any]:
     no rate limits). Download the libraries once with ``scripts/fetch_genesets.py`` into
     :func:`_genesets_dir`. Writes an enrichment table + bar plot per group; returns top terms.
     """
-    try:
-        import gseapy as gp
-    except ImportError as exc:
-        return _missing(getattr(exc, "name", None) or "gseapy")
-
     work, art, figs, tables = _dirs(ctx)
 
     gene_sets = args.get("gene_sets") or list(_DEFAULT_GENE_SETS)
@@ -206,6 +201,13 @@ def run_enrichment(args: dict[str, Any], ctx: Any) -> dict[str, Any]:
                           + ("Present but degenerate: "
                              + "; ".join(degenerate_libs.values()) + " " if degenerate_libs else "")
                           + gene_sets_note(gene_sets))}
+
+    # gseapy only now: a library name the host lacks is the caller's to fix and needs no import, so
+    # it is reported, with the installed names, even where the analysis stack is absent.
+    try:
+        import gseapy as gp
+    except ImportError as exc:
+        return _missing(getattr(exc, "name", None) or "gseapy")
 
     # Prefer DE results computed this run — for ANY groupby (leiden, majorclass, cell_type, …),
     # so enrichment runs PER CLASS instead of collapsing to one pooled list. run_de writes

@@ -810,6 +810,16 @@ class SSHExecutor:
         """Forward 127.0.0.1:local_port -> remote_host:remote_port over the SSH
         session. ``local_port=0`` lets the OS pick a free ephemeral port (default);
         a fixed port gives Biomni/Kosmos a stable base_url to reach Qwen3.6."""
+        return self.open_tunnel_to(lambda: (remote_host, remote_port), local_port=local_port,
+                                   label=f"{remote_host}:{remote_port}")
+
+    def open_tunnel_to(self, target: "Callable[[], tuple[str, int] | None]", local_port: int = 0,
+                       label: str = "") -> int:
+        """Forward 127.0.0.1:local_port to wherever ``target()`` says, asked again for every
+        forwarded connection. The local address therefore stays the same while the far end moves:
+        the shared model server changes node and port each time its Slurm job is renewed, and
+        whatever holds the local URL keeps working. ``target()`` returning None refuses the
+        connection (nothing is serving right now)."""
         try:
             self._live_transport()
         except GatewayError as exc:
@@ -827,9 +837,12 @@ class SSHExecutor:
                 if transport is None or not transport.is_active():
                     return
                 try:
+                    dest = target()
+                    if not dest:
+                        return
                     channel = transport.open_channel(
                         "direct-tcpip",
-                        (remote_host, remote_port),
+                        (dest[0], int(dest[1])),
                         self.request.getpeername(),
                     )
                 except Exception:
@@ -872,7 +885,7 @@ class SSHExecutor:
         self._emit(
             "success",
             "ssh_tunnel",
-            f"Tunnel ready: 127.0.0.1:{local_port} -> {remote_host}:{remote_port} (via {self.host}).",
+            f"Tunnel ready: 127.0.0.1:{local_port} -> {label or 'a moving target'} (via {self.host}).",
         )
         return local_port
 

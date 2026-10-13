@@ -653,6 +653,97 @@ def _looks_like_qc_col(name: str) -> bool:
                                 "phase", "batch_key")) or n.startswith("df.")
 
 
+def _h5_value(node: Any) -> Any:
+    """A scalar or small array stored in an h5ad ``uns`` entry, as plain Python."""
+    value = node[()]
+    if hasattr(value, "tolist"):
+        value = value.tolist()
+    if isinstance(value, bytes):
+        return value.decode("utf-8", "replace")
+    if isinstance(value, list):
+        return [v.decode("utf-8", "replace") if isinstance(v, bytes) else v for v in value]
+    return value
+
+
+def _handed_on(handle: Any) -> "dict[str, Any] | None":
+    """The record a run left in the dataset it handed on (``uns["aiscientist"]``, written by
+    ``tools/_lib/result_dataset.export``), plus what that dataset carries — or None for any other
+    file. Read here, with the rest of the profile, so a run that starts from such a file knows it
+    is already quality-controlled and normalised before anything is planned."""
+    try:
+        uns = handle.get("uns")
+        rec = uns.get("aiscientist") if uns is not None and hasattr(uns, "get") else None
+        if rec is None or not _is_group(rec) or "processed" not in rec or not _h5_value(rec["processed"]):
+            return None
+        out: dict[str, Any] = {"processed": True}
+        for key in ("run_id", "created_at", "source_dataset", "question", "checkpoints", "builds_on"):
+            if key in rec and not _is_group(rec[key]):
+                out[key] = _h5_value(rec[key])
+        if "counts_layer" in uns and not _is_group(uns["counts_layer"]):
+            out["counts_layer"] = str(_h5_value(uns["counts_layer"]))
+        for name in ("layers", "obsm"):
+            node = handle.get(name)
+            out[name] = sorted(node.keys()) if node is not None and hasattr(node, "keys") else []
+        return out
+    except Exception:  # noqa: BLE001 - provenance is an extra; a file it cannot be read from is plain input
+        return None
+
+
+# How many stored values of the matrix are read to rank genes by abundance: a few thousand cells.
+# Enough for "which 50 genes dominate", small enough for the run-start profile.
+_TOP_GENES_VALUES = 5_000_000
+
+
+def _var_names(var: Any) -> list[str]:
+    try:
+        idx_key = _decode(var.attrs.get("_index", "_index") if hasattr(var, "attrs") else "_index")
+        return list(_obs_column_values(var, idx_key, _h5_len(var[idx_key])) or []) if idx_key in var else []
+    except Exception:  # noqa: BLE001
+        return []
+
+
+def _top_genes_h5ad(handle: Any, names: list[str], n: int = 50) -> list[str]:
+    """The ``n`` most abundant genes of an .h5ad, from ``layers["counts"]`` when it has one, else
+    ``X`` — over a bounded part of the matrix (blocks of cells spread across a CSR matrix, a CSC
+    one only when it is small, the first 2,000 rows of a dense one). [] when it cannot be told."""
+    try:
+        import numpy as np
+        layers = handle.get("layers")
+        m = layers["counts"] if layers is not None and "counts" in layers else handle.get("X")
+        if m is None or not names:
+            return []
+        if _is_group(m) and all(k in m for k in ("data", "indices", "indptr")):
+            kind = _decode(m.attrs.get("encoding-type", ""))
+            stored = int(m["data"].shape[0])
+            if "csr" in kind:
+                # Blocks of cells spread over the whole matrix, not its first rows: a file is often
+                # ordered by sample or by cell type, and its first cells are then one population.
+                indptr = m["indptr"][:].astype(np.int64)
+                n_cells = max(len(indptr) - 1, 0)
+                blocks = 20 if stored > _TOP_GENES_VALUES else 1
+                per_block = max(1, int(n_cells * min(1.0, _TOP_GENES_VALUES / max(stored, 1)) / blocks))
+                totals = np.zeros(len(names), dtype=np.float64)
+                for b in range(blocks):
+                    r0 = (n_cells * b) // blocks
+                    lo, hi = int(indptr[r0]), int(indptr[min(r0 + per_block, n_cells)])
+                    if hi > lo:
+                        totals += np.bincount(m["indices"][lo:hi], weights=m["data"][lo:hi],
+                                              minlength=len(names))[:len(names)]
+            elif "csc" in kind and stored <= _TOP_GENES_VALUES * 4:
+                cum = np.concatenate([[0.0], np.cumsum(m["data"][:], dtype=np.float64)])
+                totals = np.diff(cum[m["indptr"][:]])
+            else:
+                return []
+        elif hasattr(m, "shape") and len(m.shape) == 2:
+            totals = np.asarray(m[: min(int(m.shape[0]), 2000), :], dtype=np.float64).sum(axis=0)
+        else:
+            return []
+        order = np.argsort(-totals)[:n]
+        return [names[i] for i in order if i < len(names) and totals[i] > 0]
+    except Exception:  # noqa: BLE001 - a hint, never a blocker
+        return []
+
+
 def inspect_h5ad(handle: Any) -> dict[str, Any]:
     x = handle.get("X")
     obs = handle.get("obs")
@@ -684,6 +775,20 @@ def inspect_h5ad(handle: Any) -> dict[str, Any]:
         symbols = _gene_symbol_species(var)
         if symbols:
             result["gene_symbols"] = symbols
+    handed_on = _handed_on(handle)
+    if handed_on:
+        result["handed_on"] = handed_on
+    # Which tissue the most abundant genes point to. An .h5ad says so no more often than a 10x
+    # delivery does, and a run that starts from an earlier run's processed dataset would otherwise
+    # lose the hint the delivery's profile gave that run (measured 2026-10-12: two of three
+    # continuation plans annotated "with no tissue reference, since the profile names no tissue").
+    if var is not None and hasattr(var, "keys"):
+        from ._lib.cellranger import tissue_hint
+        top = _top_genes_h5ad(handle, _var_names(var))
+        hint = tissue_hint(top)
+        if hint:
+            result["top_genes"] = top
+            result["tissue_hint"] = hint
 
     if x is None:
         result["x_encoding"] = "missing"

@@ -147,10 +147,10 @@ files is exactly what we do not do. Raise it with Ziyao; the destination if he a
 
 | path | swept? |
 |---|---|
-| `Temp/<ucinetid>/` | **yes — 3 days**, see `docs/hpc3_storage_layout.md` |
+| `Temp/<ucinetid>/` | **yes — when its session disconnects, and after 3 days**, see `docs/hpc3_storage_layout.md` |
 | `uploads/<ucinetid>/` | never (raw research data) |
 | `pysrc/<ucinetid>/` | never (rewritten each connect) |
-| `bin/<ucinetid>/temp_gc.sh` | never (re-staged each connect) |
+| `bin/<ucinetid>/temp_gc.sh`, `session_clean.sh` | never (re-staged each connect) |
 
 ## Per-user session state — `$HOME/.bioagent/` (2.4 M)
 

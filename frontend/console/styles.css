@@ -1,6 +1,6 @@
 :root {
   /* Warm "tea" palette — soft beige canvas, warm-white surfaces, a warm-black ink.
-     The blue accent stays as one crisp cool pop against the warm ground. */
+     The accent is a clay from the same family (see below). */
   --bg: #ece3d4;
   --surface: #fbf7f0;
   --surface-sunken: #f2ebdc;
@@ -10,8 +10,14 @@
   --text-tertiary: #9c9382;
   --border: #e5ddcc;
   --border-strong: #d7ccb5;
-  --accent: #0071e3;
-  --accent-hover: #0077ed;
+  /* The accent: one warm clay, taken from the same family as the canvas instead of a cool blue
+     laid over it. Every accent-coloured thing in this file reads these — the tints through
+     --accent-rgb — so the whole console is re-toned by changing these five lines. */
+  --accent: #ad5a2b;
+  --accent-hover: #9a4f25;
+  --accent-press: #874520;
+  --accent-rgb: 173, 90, 43;
+  --on-accent: #fffaf3;
   --green: #34a853;
   --amber: #e8930c;
   --red: #e0463b;
@@ -87,7 +93,7 @@ body {
   transition: background 0.15s, color 0.15s;
 }
 .icon-toggle:hover { background: rgba(0, 0, 0, 0.05); color: var(--text-secondary); }
-.icon-toggle.active { color: var(--accent); background: rgba(0, 113, 227, 0.1); }
+.icon-toggle.active { color: var(--accent); background: rgba(var(--accent-rgb), 0.1); }
 .brand .icon-toggle { margin-right: 4px; }
 .panel {
   background: var(--glass-bg);
@@ -126,7 +132,7 @@ body {
 .form input::placeholder, textarea::placeholder { color: var(--text-tertiary); }
 .form input:focus, .form select:focus, textarea:focus, .duo-panel input:focus {
   outline: none; background: var(--surface);
-  border-color: var(--accent); box-shadow: 0 0 0 3.5px rgba(0, 113, 227, 0.16);
+  border-color: var(--accent); box-shadow: 0 0 0 3.5px rgba(var(--accent-rgb), 0.16);
 }
 .form .check { flex-direction: row; align-items: center; gap: 9px; color: var(--text); font-size: 12.5px; cursor: pointer; }
 .form .check input, .pipeline-toggle input { accent-color: var(--accent); width: 15px; height: 15px; }
@@ -142,16 +148,10 @@ button {
 button:hover:not(:disabled) { background: var(--surface-hover); }
 button:active:not(:disabled) { transform: scale(0.98); }
 button:disabled { opacity: 0.4; cursor: not-allowed; }
-/* Softer than a flat saturated fill: a gentle top-lit gradient + a soft shadow + a 1px inner
-   highlight, so the primary CTA reads as a tactile "glass" pill instead of a glaring block. */
-button.primary {
-  background: linear-gradient(180deg, #2a8bf2 0%, var(--accent) 100%);
-  color: #fff;
-  box-shadow: 0 1px 2px rgba(0, 74, 153, 0.20), inset 0 1px 0 rgba(255, 255, 255, 0.22);
-}
-button.primary:hover:not(:disabled) { background: linear-gradient(180deg, #3a97f6 0%, var(--accent-hover) 100%); }
+/* Primary and secondary buttons are defined once, under "buttons" near the end of this file. */
+button.primary { background: var(--accent); color: var(--on-accent); }
 button.ghost { background: transparent; color: var(--accent); }
-button.ghost:hover:not(:disabled) { background: rgba(0, 113, 227, 0.08); }
+button.ghost:hover:not(:disabled) { background: rgba(var(--accent-rgb), 0.08); }
 button.small { padding: 6px 12px; font-size: 12px; }
 .danger-btn {
   width: 100%; margin-top: 10px; background: transparent; color: var(--red);
@@ -245,7 +245,7 @@ button.small { padding: 6px 12px; font-size: 12px; }
   flex: 1; min-width: 160px; background: var(--surface-sunken); border: 1px solid var(--border); color: var(--text);
   border-radius: 980px; padding: 7px 14px; font-size: 12px; font-family: inherit;
 }
-.dataset-input:focus { outline: none; border-color: var(--accent); box-shadow: 0 0 0 3.5px rgba(0, 113, 227, 0.16); }
+.dataset-input:focus { outline: none; border-color: var(--accent); box-shadow: 0 0 0 3.5px rgba(var(--accent-rgb), 0.16); }
 
 /* Material Symbols (fonts.google.com/icons) — one icon set app-wide, bundled LOCALLY (no CDN, so
    it works offline / under strict CSP). Rounded variant for the Apple/Claude feel. The FULL variable
@@ -279,7 +279,7 @@ button.small { padding: 6px 12px; font-size: 12px; }
 }
 .dataset-chip { cursor: default; }
 .dataset-chip .msym { font-size: 16px; color: var(--text-tertiary); }
-.dataset-chip.active { border-color: var(--accent); background: rgba(0, 113, 227, 0.08); color: var(--accent); font-weight: 500; }
+.dataset-chip.active { border-color: var(--accent); background: rgba(var(--accent-rgb), 0.08); color: var(--accent); font-weight: 500; }
 .dataset-chip.active .msym { color: var(--accent); }
 .dataset-chip-name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .dataset-chip-x {
@@ -287,7 +287,16 @@ button.small { padding: 6px 12px; font-size: 12px; }
   width: 16px; height: 16px; padding: 0; border-radius: 50%; font-size: 13px; line-height: 1;
   background: transparent; color: var(--accent); cursor: pointer;
 }
-.dataset-chip-x:hover { background: rgba(0, 113, 227, 0.14); }
+.dataset-chip-x:hover { background: rgba(var(--accent-rgb), 0.14); }
+/* "ref" toggle: marks a bound file as reference data (never the primary) */
+.dataset-chip-ref {
+  display: inline-flex; align-items: center; padding: 0 6px; height: 16px; border-radius: 8px;
+  border: 1px solid currentColor; background: transparent; color: var(--text-tertiary);
+  font-size: 10px; font-family: inherit; line-height: 1; cursor: pointer; opacity: 0.8;
+}
+.dataset-chip-ref:hover { opacity: 1; }
+.dataset-chip-ref.on { background: var(--accent); border-color: var(--accent); color: #fff; opacity: 1; }
+.dataset-chip.reference { border-style: dashed; }
 
 /* "＋ Data" button + popover (upload a file / folder, or pick a recent upload) */
 .data-menu-wrap { position: relative; z-index: 30; }
@@ -314,7 +323,7 @@ button.small { padding: 6px 12px; font-size: 12px; }
 .server-path-offer {
   display: flex; align-items: center; gap: 8px; flex-wrap: wrap; margin: 0 0 8px;
   padding: 8px 12px; border: 1px solid var(--accent); border-radius: 12px;
-  background: rgba(0, 113, 227, 0.06); font-size: 12.5px; color: var(--text);
+  background: rgba(var(--accent-rgb), 0.06); font-size: 12.5px; color: var(--text);
 }
 .server-path-offer .msym { font-size: 18px; color: var(--accent); }
 .server-path-offer .spo-text { flex: 1; min-width: 0; overflow-wrap: anywhere; }
@@ -364,74 +373,230 @@ button.small { padding: 6px 12px; font-size: 12px; }
   background: var(--surface-sunken); border: 1px solid var(--border); color: var(--text);
   border-radius: 980px; padding: 7px 14px; font-size: 12.5px; font-family: inherit; cursor: pointer; font-weight: 500;
 }
-.workflow-select:focus { outline: none; border-color: var(--accent); box-shadow: 0 0 0 3.5px rgba(0, 113, 227, 0.16); }
-/* The plan/clarify render AS a chat message (plan.md style) that stands out from a
-   normal assistant bubble with a blue tint + accent border, and carries inline actions. */
-.plan-card { border: 1px solid rgba(0, 113, 227, 0.3); background: rgba(0, 113, 227, 0.06); max-width: 92%; }
-.plan-card .plan-actions-row { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; margin-top: 13px; }
-.plan-actions-hint { font-size: 12px; color: var(--text-secondary); }
-.plan-actions-status { font-size: 12.5px; font-weight: 600; color: var(--accent); }
+.workflow-select:focus { outline: none; border-color: var(--accent); box-shadow: 0 0 0 3.5px rgba(var(--accent-rgb), 0.16); }
+/* The plan, a clarify question and a decision point are cards in the conversation rather than
+   chat bubbles: warm paper with a hairline edge. The accent is kept for the one action that runs
+   something. (They were an accent-tinted bubble with accent-coloured text buttons, where
+   everything was the accent colour and so nothing was.) */
+.msg.assistant.plan-card {
+  max-width: min(780px, 96%); padding: 16px 18px; white-space: normal;
+  background: var(--surface); border: 1px solid var(--border-strong); border-radius: 18px;
+  box-shadow: var(--shadow-sm);
+}
+.msg.assistant.plan-card h2 { margin: 0 0 10px; }
+.plan-card .clarify-question { margin-bottom: 9px; line-height: 1.45; }
+
+/* The plan itself is a sheet with three bands — header, steps, actions — so it has no padding of
+   its own; each band brings it. `flex: none` because the bands are clipped to the rounded corners:
+   an `overflow: hidden` item in the chat's flex column may otherwise be SHRUNK to fit, and a long
+   plan would lose its last steps and its buttons instead of scrolling. */
+.msg.assistant.plan-card.plan-sheet { flex: none; width: 100%; padding: 0; overflow: hidden; }
+.plan-head {
+  display: flex; align-items: center; gap: 12px; padding: 15px 20px 14px;
+  border-bottom: 1px solid var(--border);
+}
+.plan-head-icon {
+  flex: none; width: 34px; height: 34px; border-radius: 10px; display: grid; place-items: center;
+  color: var(--accent); background: rgba(var(--accent-rgb), 0.11);
+}
+.plan-head-icon .msym { font-size: 20px; }
+.plan-title { font-size: 15.5px; font-weight: 650; letter-spacing: -0.015em; line-height: 1.25; }
+.plan-sub { margin-top: 2px; font-size: 12px; color: var(--text-tertiary); line-height: 1.4; }
+.plan-note {
+  display: flex; align-items: center; gap: 8px; margin: 12px 20px 0; padding: 8px 12px;
+  border-radius: 10px; font-size: 12.5px; color: #7a4a05;
+  background: rgba(232, 147, 12, 0.11); box-shadow: inset 0 0 0 1px rgba(232, 147, 12, 0.28);
+}
+.plan-note .msym { font-size: 16px; }
+
+/* Steps: a numbered rail. The number sits on a line that runs to the next one, so the plan reads
+   as one pipeline rather than as a list of paragraphs. */
+.plan-steps { list-style: none; margin: 0; padding: 8px 20px 6px; }
+.plan-step { position: relative; display: grid; grid-template-columns: 26px minmax(0, 1fr); column-gap: 14px; padding: 12px 0; }
+.plan-step:not(:last-child)::before {
+  content: ""; position: absolute; left: 12.5px; top: 40px; bottom: -10px; width: 1px;
+  background: var(--border-strong);
+}
+.plan-step-num {
+  width: 26px; height: 26px; border-radius: 50%; display: grid; place-items: center;
+  font-size: 12px; font-weight: 650; font-variant-numeric: tabular-nums; color: var(--text-secondary);
+  background: var(--surface-sunken); box-shadow: inset 0 0 0 1px var(--border-strong);
+}
+.plan-step.revised .plan-step-num { color: #7a4a05; background: rgba(232, 147, 12, 0.14); box-shadow: inset 0 0 0 1px rgba(232, 147, 12, 0.55); }
+.plan-step-head { display: flex; align-items: center; gap: 8px; min-height: 26px; flex-wrap: wrap; }
+.plan-step-title { font-size: 14.5px; font-weight: 600; letter-spacing: -0.012em; color: var(--text); }
+.plan-step-flag {
+  font-size: 10px; font-weight: 700; letter-spacing: 0.06em; text-transform: uppercase;
+  color: #7a4a05; background: rgba(232, 147, 12, 0.16); border-radius: 980px; padding: 2px 8px;
+}
+.msg.assistant .plan-step-tool {
+  margin-left: auto; padding: 2px 8px; border-radius: 7px; font-size: 11.5px; color: var(--text-secondary);
+  background: var(--surface-sunken); box-shadow: inset 0 0 0 1px var(--border);
+}
+.plan-step-body { margin-top: 3px; font-size: 13.5px; line-height: 1.6; color: var(--text-secondary); }
+.msg.assistant .plan-step-body code { font-size: 12px; color: var(--text); }
+.plan-step-meta { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; margin-top: 10px; }
+/* A setting the plan fixes: name | value, as one two-tone tag. */
+.plan-setting {
+  display: inline-flex; align-items: stretch; overflow: hidden; border-radius: 7px;
+  font: 11.5px/1 ui-monospace, "SF Mono", Menlo, monospace;
+  background: var(--surface); box-shadow: inset 0 0 0 1px var(--border-strong);
+}
+.plan-setting-k { padding: 5px 7px; color: var(--text-secondary); background: var(--surface-sunken); border-right: 1px solid var(--border-strong); }
+.plan-setting-v { padding: 5px 8px; color: var(--text); font-weight: 600; }
+.plan-where { display: inline-flex; align-items: center; gap: 4px; margin-left: auto; font-size: 11.5px; color: var(--text-tertiary); white-space: nowrap; }
+.plan-where .msym { font-size: 14px; }
+
+.plan-card .plan-actions-row { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; margin-top: 14px; }
+.plan-sheet .plan-actions-row {
+  margin-top: 0; padding: 13px 20px 15px; border-top: 1px solid var(--border);
+  background: rgba(242, 235, 220, 0.6);
+}
+.plan-actions-row button { padding: 8px 15px; font-size: 13px; }
+.plan-actions-row button.primary { padding: 8px 17px 8px 15px; }
+.plan-actions-hint { margin-left: 6px; font-size: 12px; color: var(--text-tertiary); }
+.plan-actions-status { font-size: 12.5px; font-weight: 600; color: var(--text-secondary); }
+
+/* The plan document's editor: a file pane inside the card. */
+.plan-yaml { border-top: 1px solid var(--border); padding: 14px 20px 16px; background: rgba(242, 235, 220, 0.45); }
+.plan-yaml-bar { display: flex; align-items: baseline; gap: 12px; flex-wrap: wrap; margin-bottom: 9px; }
+.plan-yaml-file {
+  display: inline-flex; align-items: center; gap: 5px; font: 600 12px/1 ui-monospace, "SF Mono", Menlo, monospace;
+  color: var(--text);
+}
+.plan-yaml-file .msym { font-size: 15px; color: var(--accent); }
+.plan-yaml-tip { font-size: 12px; color: var(--text-tertiary); line-height: 1.45; }
+.plan-yaml-text {
+  display: block; width: 100%; box-sizing: border-box; resize: vertical; padding: 12px 14px;
+  font: 12.5px/1.6 ui-monospace, "SF Mono", Menlo, Consolas, monospace; tab-size: 2;
+  white-space: pre; overflow-x: auto; color: var(--text);
+  background: #fffdf9; border: 1px solid var(--border-strong); border-radius: 10px;
+}
+.plan-yaml-text:focus { outline: none; border-color: var(--accent); box-shadow: 0 0 0 3.5px rgba(var(--accent-rgb), 0.16); }
+.plan-yaml-actions { display: flex; align-items: center; gap: 8px; margin-top: 10px; }
+.plan-yaml-problems {
+  display: flex; gap: 9px; margin: 0 0 10px; padding: 10px 12px; border-radius: 10px; font-size: 12.5px;
+  color: #7a2d1c; background: rgba(224, 70, 59, 0.08); box-shadow: inset 0 0 0 1px rgba(224, 70, 59, 0.30);
+}
+.plan-yaml-problems .msym { flex: none; font-size: 17px; color: var(--red); }
+.plan-yaml-problems ul { margin: 5px 0 0; padding-left: 17px; }
+.plan-yaml-problems li + li { margin-top: 3px; }
 .plan-card .clarify-q { margin-top: 10px; }
 /* Clarify: option chips + a custom answer via the composer. */
 .plan-clarify { display: flex; flex-direction: column; gap: 12px; }
 .clarify-q { display: flex; flex-direction: column; gap: 7px; }
 .clarify-question { font-size: 13px; font-weight: 600; color: var(--text-primary); }
 .clarify-options { display: flex; flex-wrap: wrap; gap: 8px; }
+/* An answer to pick: an outline on the paper, taking the accent only under the pointer — a row of
+   options, not a row of links. */
 .clarify-chip {
-  font: inherit; font-size: 12.5px; cursor: pointer;
-  padding: 6px 13px; border-radius: 999px;
-  background: #fff; border: 1px solid rgba(0, 113, 227, 0.35); color: var(--accent);
-  transition: background 0.12s, color 0.12s, border-color 0.12s;
+  font: inherit; font-size: 12.5px; font-weight: 550; cursor: pointer;
+  padding: 7px 14px; border-radius: 999px; border: none; color: var(--text);
+  background: transparent; box-shadow: inset 0 0 0 1px var(--border-strong);
 }
-.clarify-chip:hover { background: var(--accent); color: #fff; border-color: var(--accent); }
+.clarify-chip:hover { color: var(--accent); background: rgba(var(--accent-rgb), 0.07); box-shadow: inset 0 0 0 1px rgba(var(--accent-rgb), 0.5); }
+.clarify-chip.ghost { box-shadow: none; color: var(--text-secondary); }
+.clarify-chip.ghost:hover { background: rgba(70, 56, 36, 0.07); color: var(--text); box-shadow: none; }
 .preset-panel {
   margin-top: 10px; padding: 12px 14px; border-radius: 12px;
   background: var(--surface-sunken); border: 1px solid var(--border);
 }
-.preset-hint { font-size: 12.5px; color: var(--text-secondary); margin-bottom: 8px; }
-.preset-subhead { margin: 12px 0 6px; font-size: 11px; font-weight: 600; text-transform: uppercase; letter-spacing: 0.05em; color: var(--text-tertiary); }
-/* Axis A — the "Advanced" disclosure that hides the skill override (the PI chooses by default). */
-.advanced-panel { margin-top: 10px; }
-.advanced-panel > summary {
-  cursor: pointer; font-size: 12.5px; color: var(--text-secondary);
-  list-style: none; user-select: none; padding: 2px 0; width: fit-content;
-}
-.advanced-panel > summary::-webkit-details-marker { display: none; }
-.advanced-panel > summary::before { content: "▸ "; color: var(--text-tertiary); }
-.advanced-panel[open] > summary::before { content: "▾ "; }
-.advanced-panel > summary:hover { color: var(--text-primary); }
-.preset-row { display: flex; flex-direction: column; align-items: stretch; gap: 8px; margin-top: 10px; }
-/* Multi-select skill picker: a search box over a scrollable checklist (Advanced panel). */
+/* The search box of the Pipelines & skills sheet. */
 .preset-search {
   width: 100%; box-sizing: border-box; background: var(--surface);
   border: 1px solid var(--border-strong); border-radius: 8px; padding: 7px 11px;
   font-size: 13px; font-family: inherit;
 }
-.preset-search:focus { outline: none; border-color: var(--accent); box-shadow: 0 0 0 3.5px rgba(0, 113, 227, 0.16); }
-.preset-list {
-  display: flex; flex-direction: column; gap: 2px; max-height: 176px; overflow-y: auto;
-  border: 1px solid var(--border); border-radius: 8px; padding: 4px; background: var(--surface-sunken);
-}
-.preset-item {
-  display: flex; align-items: center; gap: 8px; padding: 5px 8px; border-radius: 6px;
-  font-size: 13px; cursor: pointer; user-select: none;
-}
-.preset-item:hover, .preset-item.checked { background: var(--surface); }
-.preset-item input { margin: 0; accent-color: var(--accent); }
-.preset-item-label { flex: 1; color: var(--text-primary); }
-.preset-empty { padding: 8px; font-size: 12.5px; color: var(--text-tertiary); }
+.preset-search:focus { outline: none; border-color: var(--accent); box-shadow: 0 0 0 3.5px rgba(var(--accent-rgb), 0.16); }
 .preset-prompt {
   width: 100%; box-sizing: border-box; resize: vertical; min-height: 110px;
   background: var(--surface); border: 1px solid var(--border-strong); border-radius: 8px;
   padding: 9px 11px; font-size: 13px; line-height: 1.55; font-family: inherit;
 }
-.preset-prompt:focus { outline: none; border-color: var(--accent); box-shadow: 0 0 0 3.5px rgba(0, 113, 227, 0.16); }
+.preset-prompt:focus { outline: none; border-color: var(--accent); box-shadow: 0 0 0 3.5px rgba(var(--accent-rgb), 0.16); }
+/* "Pipelines & skills": a control pill like the two selects beside it, with a count when this
+   chat requires something. What is required also shows as chips above the composer. */
+.methods-btn {
+  display: inline-flex; align-items: center; gap: 6px; padding: 7px 13px; font-size: 12.5px; font-weight: 500;
+  color: var(--text); background: var(--glass-bg-strong); border: 1px solid var(--glass-border);
+  box-shadow: var(--shadow-sm), var(--glass-highlight);
+}
+.methods-btn .msym { font-size: 16px; color: var(--text-secondary); }
+.methods-btn:not(:disabled):hover { background: var(--surface); border-color: var(--border-strong); transform: none; }
+.methods-count {
+  min-width: 18px; height: 18px; padding: 0 5px; border-radius: 980px; display: inline-grid; place-items: center;
+  font-size: 10.5px; font-weight: 700; font-variant-numeric: tabular-nums; color: var(--on-accent);
+  background: var(--accent);
+}
+.method-chips { display: flex; align-items: center; flex-wrap: wrap; gap: 6px; margin-top: 10px; }
+.method-chips-label { margin-right: 2px; font-size: 10.5px; font-weight: 700; letter-spacing: 0.06em; text-transform: uppercase; color: var(--text-tertiary); }
+.method-chip {
+  display: inline-flex; align-items: center; gap: 5px; max-width: 260px; padding: 4px 5px 4px 9px;
+  border-radius: 980px; font-size: 12px; color: var(--text);
+  background: var(--surface); box-shadow: inset 0 0 0 1px var(--border-strong);
+}
+.method-chip .msym { font-size: 15px; color: var(--accent); }
+.method-chip-name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.method-chip-x {
+  width: 18px; height: 18px; padding: 0; border-radius: 50%; display: inline-grid; place-items: center;
+  font-size: 14px; line-height: 1; color: var(--text-tertiary); background: transparent;
+}
+.method-chip-x:not(:disabled):hover { background: rgba(70, 56, 36, 0.10); color: var(--text); transform: none; }
+
+/* The sheet. Head, tools and foot stay put; the list scrolls between them. */
+.modal-card.methods-card {
+  width: min(760px, 94vw); height: min(720px, 86vh); max-height: 86vh; padding: 0; overflow: hidden;
+  display: flex; flex-direction: column; border: 1px solid var(--border);
+  box-shadow: 0 18px 48px -22px rgba(50, 40, 24, 0.4);
+}
+.methods-head { display: flex; align-items: flex-start; justify-content: space-between; gap: 16px; padding: 20px 22px 12px; }
+.methods-head h2 { margin: 0; font-size: 17px; font-weight: 650; letter-spacing: -0.015em; }
+.methods-sub { margin: 4px 0 0; font-size: 12.5px; line-height: 1.5; color: var(--text-secondary); }
+.methods-tools { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; padding: 0 22px 12px; border-bottom: 1px solid var(--border); }
+.methods-tools .preset-search { flex: 1; min-width: 200px; width: auto; border-radius: 10px; padding: 8px 12px; }
+.methods-tabs { display: inline-flex; gap: 2px; padding: 3px; border-radius: 11px; background: var(--surface-sunken); box-shadow: inset 0 0 0 1px var(--border); }
+.methods-tabs button { padding: 6px 12px; border-radius: 8px; font-size: 12.5px; font-weight: 550; color: var(--text-secondary); background: transparent; }
+.methods-tabs button:not(:disabled):hover { background: rgba(70, 56, 36, 0.06); transform: none; }
+.methods-tabs button.active, .methods-tabs button.active:not(:disabled):hover {
+  color: var(--text); background: var(--surface); box-shadow: inset 0 0 0 1px var(--border-strong);
+}
+.methods-tab-n { margin-left: 4px; font-size: 11px; font-variant-numeric: tabular-nums; color: var(--text-tertiary); }
+.methods-list { flex: 1; min-height: 0; overflow-y: auto; padding: 8px 12px 12px; }
+.method-row { padding: 12px 12px 12px 10px; border-radius: 12px; }
+.method-row + .method-row { margin-top: 2px; }
+.method-row:hover { background: rgba(70, 56, 36, 0.04); }
+.method-row.checked { background: rgba(var(--accent-rgb), 0.055); box-shadow: inset 0 0 0 1px rgba(var(--accent-rgb), 0.22); }
+.method-pick { display: flex; align-items: flex-start; gap: 11px; cursor: pointer; }
+.method-pick input[type="checkbox"] { margin-top: 1px; }
+.method-title { font-size: 13.5px; font-weight: 600; line-height: 1.45; color: var(--text); }
+.method-text { margin: 3px 0 0 29px; font-size: 12.5px; line-height: 1.5; color: var(--text-secondary); }
+.method-meta { display: flex; align-items: center; flex-wrap: wrap; gap: 5px; margin: 8px 0 0 29px; }
+.method-key { font: 11.5px/1 ui-monospace, "SF Mono", Menlo, monospace; color: var(--text-secondary); padding: 4px 7px; border-radius: 6px; background: var(--surface-sunken); box-shadow: inset 0 0 0 1px var(--border); }
+.method-badge { font-size: 10.5px; font-weight: 700; letter-spacing: 0.04em; text-transform: uppercase; color: var(--accent); padding: 3px 8px; border-radius: 980px; background: rgba(var(--accent-rgb), 0.10); }
+.method-tool { font: 11px/1 ui-monospace, "SF Mono", Menlo, monospace; color: var(--text-secondary); padding: 4px 7px; border-radius: 6px; box-shadow: inset 0 0 0 1px var(--border-strong); }
+.method-protocol { margin: 8px 0 0 29px; }
+.method-protocol > summary { width: fit-content; cursor: pointer; font-size: 12px; font-weight: 550; color: var(--accent); user-select: none; }
+.method-protocol-body {
+  margin-top: 8px; padding: 12px 14px; max-height: 300px; overflow-y: auto; border-radius: 10px;
+  font-size: 12.5px; line-height: 1.6; white-space: pre-wrap; color: var(--text-secondary);
+  background: var(--surface-sunken); box-shadow: inset 0 0 0 1px var(--border);
+}
+.method-protocol-body h2, .method-protocol-body h3 { margin: 10px 0 4px; font-size: 13px; color: var(--text); }
+.method-protocol-body code { font-size: 11.5px; }
+.method-empty { padding: 28px 12px; text-align: center; font-size: 13px; color: var(--text-tertiary); }
+.methods-foot { display: flex; align-items: center; gap: 8px; padding: 12px 22px 14px; border-top: 1px solid var(--border); background: rgba(242, 235, 220, 0.6); }
+.methods-summary { flex: 1; font-size: 12.5px; color: var(--text-secondary); }
+.methods-foot button { padding: 7px 15px; font-size: 12.5px; }
+
 .chat-input { display: flex; gap: 10px; margin-top: 10px; }
 .chat-input textarea { flex: 1; resize: none; border-radius: 14px; }
 .chat-input button { align-self: stretch; }
 /* The Send/Stop action is a fixed-width pill — never let the shared full-width
    `.danger-btn` rule stretch Stop across the row and crush the input box. */
 .chat-input #chatSend, .chat-input #chatStop { flex: none; width: auto; min-width: 92px; margin-top: 0; }
+/* ...and a fixed height, sitting on the composer's last line. Stretched to a two-line box it was
+   an oval, which no amount of surface work makes look like a button. */
+.chat-input #chatSend, .chat-input #chatStop { align-self: flex-end; height: 42px; padding-top: 0; padding-bottom: 0; }
 
 /* downloads (right panel) */
 .downloads { display: flex; flex-direction: column; gap: 8px; flex: 1; min-height: 0; overflow: hidden; }
@@ -677,7 +842,7 @@ button.full { width: 100%; margin-top: 6px; }
   border-radius: 10px; padding: 9px 11px; font-size: 13.5px; font-family: inherit; cursor: pointer;
   text-overflow: ellipsis;
 }
-.model-row select:focus { outline: none; border-color: var(--accent); box-shadow: 0 0 0 3.5px rgba(0, 113, 227, 0.16); }
+.model-row select:focus { outline: none; border-color: var(--accent); box-shadow: 0 0 0 3.5px rgba(var(--accent-rgb), 0.16); }
 .model-row .icon-btn { flex: none; }
 
 
@@ -698,7 +863,7 @@ button.full { width: 100%; margin-top: 6px; }
   cursor: pointer; transition: background 0.12s;
 }
 .session-item:hover { background: var(--surface-sunken); }
-.session-item.active { background: rgba(0, 113, 227, 0.1); }
+.session-item.active { background: rgba(var(--accent-rgb), 0.1); }
 .session-item.active .session-title { color: var(--accent); font-weight: 500; }
 .session-text { flex: 1; min-width: 0; display: flex; flex-direction: column; gap: 1px; }
 .session-title { font-size: 13px; color: var(--text); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
@@ -976,7 +1141,7 @@ button.full { width: 100%; margin-top: 6px; }
   font: inherit; transition: background 0.15s, color 0.15s;
 }
 .nav-item:hover { background: var(--surface-sunken); color: var(--text-secondary); }
-.nav-item.active { background: rgba(0, 113, 227, 0.10); color: var(--accent); }
+.nav-item.active { background: rgba(var(--accent-rgb), 0.10); color: var(--accent); }
 .nav-ico { font-size: 20px; line-height: 1; }
 .nav-label { font-size: 11px; font-weight: 600; }
 
@@ -1012,7 +1177,7 @@ button.full { width: 100%; margin-top: 6px; }
 .run-card a.ghost { flex: none; display: inline-flex; align-items: center; gap: 4px; padding: 6px 12px;
   font-size: 12px; font-weight: 500; color: var(--accent); text-decoration: none; white-space: nowrap;
   border-radius: var(--radius-sm); }
-.run-card a.ghost:hover { background: rgba(0, 113, 227, 0.08); }
+.run-card a.ghost:hover { background: rgba(var(--accent-rgb), 0.08); }
 .run-card a.ghost .msym { font-size: 16px; }
 .artifacts-block .result-handoff:empty { display: none; }
 .artifacts-block .result-handoff { margin-top: 8px; }
@@ -1029,7 +1194,7 @@ button.full { width: 100%; margin-top: 6px; }
   flex: 1; max-width: 340px; background: var(--surface-sunken); border: 1px solid var(--border);
   border-radius: 980px; padding: 7px 14px; font: inherit; font-size: 13px; color: var(--text);
 }
-.admin-search input:focus { outline: none; border-color: var(--accent); box-shadow: 0 0 0 3.5px rgba(0, 113, 227, 0.16); }
+.admin-search input:focus { outline: none; border-color: var(--accent); box-shadow: 0 0 0 3.5px rgba(var(--accent-rgb), 0.16); }
 
 /* admin table + create-user form */
 .create-user { display: flex; gap: 8px; flex-wrap: wrap; margin-bottom: 18px; }
@@ -1037,7 +1202,7 @@ button.full { width: 100%; margin-top: 6px; }
   background: var(--surface-sunken); border: 1px solid var(--border); border-radius: 980px;
   padding: 7px 13px; font: inherit; font-size: 13px; color: var(--text);
 }
-.create-user input:focus, .create-user select:focus { outline: none; border-color: var(--accent); box-shadow: 0 0 0 3.5px rgba(0, 113, 227, 0.16); }
+.create-user input:focus, .create-user select:focus { outline: none; border-color: var(--accent); box-shadow: 0 0 0 3.5px rgba(var(--accent-rgb), 0.16); }
 .user-table { width: 100%; border-collapse: collapse; font-size: 13px; }
 .user-table th, .user-table td { text-align: left; padding: 10px 12px; border-bottom: 1px solid var(--border); }
 .user-table th { color: var(--text-tertiary); font-weight: 600; font-size: 12px; }
@@ -1153,7 +1318,6 @@ button, .clarify-chip, .artifact-bundle, .workflow-select, .nav-item,
 /* buttons grow a hair on hover and press in on click */
 button:not(:disabled):hover { transform: translateY(-1px) scale(1.03); }
 button:not(:disabled):active { transform: scale(0.97); }
-button.primary:not(:disabled):hover { box-shadow: 0 4px 14px rgba(0, 113, 227, 0.16), inset 0 1px 0 rgba(255, 255, 255, 0.22); }
 /* full-width buttons lift but do NOT scale (scaling would overflow their container) */
 button.full:not(:disabled):hover, .danger-btn:not(:disabled):hover,
 .chat-input button:not(:disabled):hover { transform: translateY(-1px) scale(1); }
@@ -1207,11 +1371,11 @@ button:not(:disabled):hover { transform: translateY(-1px) scale(1.045); }
    Additive layer (does not touch the rules above): a whisper of warm tea-light behind the
    canvas, a branded logo chip, softer panel float, and top-lit accent surfaces. */
 body {
-  /* soft ambient mesh — a warm glow + a cool + a green whisper — so the frosted-glass panels
+  /* soft ambient mesh — a warm glow, a whisper of the accent and one of green — so the frosted-glass panels
      have something to refract (a flat canvas makes backdrop-blur invisible). */
   background:
     radial-gradient(1100px 720px at 8% -10%, rgba(255, 206, 156, 0.42), transparent 58%),
-    radial-gradient(950px 680px at 110% 4%, rgba(0, 113, 227, 0.10), transparent 55%),
+    radial-gradient(950px 680px at 110% 4%, rgba(var(--accent-rgb), 0.10), transparent 55%),
     radial-gradient(1000px 820px at 50% 122%, rgba(110, 190, 150, 0.12), transparent 60%),
     var(--bg);
   background-attachment: fixed;
@@ -1232,21 +1396,12 @@ body {
   border: 1px solid var(--glass-border);
   box-shadow: 0 1px 2px rgba(70, 56, 36, 0.05), 0 14px 34px -16px rgba(70, 56, 36, 0.16), var(--glass-highlight);
 }
-/* Accent surfaces: a gentle top-lit gradient + a SOFT neutral shadow + inner highlight, so the CTA
-   reads as a tactile pill rather than a glaring saturated block (was a bright colored glow). */
-button.primary {
-  background-image: linear-gradient(180deg, #2f8cf0 0%, #0a72dd 100%);
-  box-shadow: 0 1px 2px rgba(0, 66, 132, 0.20), inset 0 1px 0 rgba(255, 255, 255, 0.28);
-}
-.msg.user {
-  background-image: linear-gradient(180deg, #2f8cf0 0%, #0a72dd 100%);
-  box-shadow: 0 4px 12px -6px rgba(0, 90, 180, 0.35);
-}
-.dl-zip { background-image: linear-gradient(180deg, #1a86ff, #0071e3); }
+/* Accent surfaces are flat: the colour alone marks them. */
+.msg.user { background: var(--accent); color: var(--on-accent); }
 /* Nav + chat selection read as a soft raised pill / accent bar, not a flat wash. */
 .nav-item.active {
-  background: linear-gradient(180deg, rgba(0, 113, 227, 0.16), rgba(0, 113, 227, 0.075));
-  box-shadow: inset 0 0 0 1px rgba(0, 113, 227, 0.14);
+  background: rgba(var(--accent-rgb), 0.12);
+  box-shadow: inset 0 0 0 1px rgba(var(--accent-rgb), 0.14);
 }
 .session-item { position: relative; }
 .session-item.active::before {
@@ -1259,7 +1414,7 @@ button.primary {
    checked — replaces the cheap native checkbox in the connect form, the run toggles, and the picker. */
 .form .check input[type="checkbox"],
 .pipeline-toggle input[type="checkbox"],
-.preset-item input[type="checkbox"] {
+.method-pick input[type="checkbox"] {
   appearance: none; -webkit-appearance: none;
   width: 18px; height: 18px; flex: none; margin: 0; padding: 0;
   border: 1.5px solid var(--border-strong); border-radius: 6px;
@@ -1269,16 +1424,15 @@ button.primary {
 }
 .form .check input[type="checkbox"]:hover,
 .pipeline-toggle input[type="checkbox"]:hover,
-.preset-item input[type="checkbox"]:hover { border-color: var(--accent); }
+.method-pick input[type="checkbox"]:hover { border-color: var(--accent); }
 .form .check input[type="checkbox"]:checked,
 .pipeline-toggle input[type="checkbox"]:checked,
-.preset-item input[type="checkbox"]:checked {
-  background: linear-gradient(180deg, #2f8cf0, #0a72dd); border-color: #0a72dd;
-  box-shadow: 0 1px 3px rgba(0, 90, 180, 0.28);
+.method-pick input[type="checkbox"]:checked {
+  background: var(--accent); border-color: var(--accent);
 }
 .form .check input[type="checkbox"]::after,
 .pipeline-toggle input[type="checkbox"]::after,
-.preset-item input[type="checkbox"]::after {
+.method-pick input[type="checkbox"]::after {
   content: ""; width: 5px; height: 9px; margin-top: -2px;
   border: solid #fff; border-width: 0 2px 2px 0;
   transform: rotate(45deg) scale(0);
@@ -1286,7 +1440,7 @@ button.primary {
 }
 .form .check input[type="checkbox"]:checked::after,
 .pipeline-toggle input[type="checkbox"]:checked::after,
-.preset-item input[type="checkbox"]:checked::after { transform: rotate(45deg) scale(1); }
+.method-pick input[type="checkbox"]:checked::after { transform: rotate(45deg) scale(1); }
 
 /* Run toggles: the label shifts to accent when its checkbox is on, so state reads at a glance. */
 .pipeline-toggle { gap: 8px; transition: color 0.16s var(--ease-spring); }
@@ -1304,12 +1458,24 @@ button.primary {
 }
 .workflow-select:hover { border-color: var(--border-strong); }
 
-/* Primary buttons: a soft glossy top sheen so the accent reads as a tactile "liquid" pill. */
-button.primary { position: relative; overflow: hidden; font-weight: 600; }
-button.primary::before {
-  content: ""; position: absolute; inset: 0 0 auto 0; height: 48%;
-  background: linear-gradient(180deg, rgba(255, 255, 255, 0.22), rgba(255, 255, 255, 0));
-  pointer-events: none;
+/* ===== buttons =====
+   Flat. A primary button is the accent colour and nothing else — no gradient, edge, highlight or
+   shadow — and it answers the pointer by changing shade. A secondary button is an outline on the
+   paper, for an action that sits beside a primary one and must not compete with it; `.quiet` drops
+   the outline until hover. Neither moves or scales. */
+button.primary { background: var(--accent); color: var(--on-accent); font-weight: 600; }
+button.primary:not(:disabled):hover { background: var(--accent-hover); transform: none; }
+button.primary:not(:disabled):active { background: var(--accent-press); transform: none; }
+button.secondary { background: transparent; color: var(--text); font-weight: 550; box-shadow: inset 0 0 0 1px var(--border-strong); }
+button.secondary:not(:disabled):hover { background: rgba(70, 56, 36, 0.06); transform: none; }
+button.secondary:not(:disabled):active { background: rgba(70, 56, 36, 0.11); transform: none; }
+button.secondary.quiet { box-shadow: none; color: var(--text-secondary); }
+button.secondary.quiet:not(:disabled):hover { color: var(--text); }
+button.primary:focus-visible, button.secondary:focus-visible { outline: 2px solid rgba(var(--accent-rgb), 0.6); outline-offset: 2px; }
+/* An icon inside either: sized to the label, filled, optically centred. */
+button.primary .msym, button.secondary .msym {
+  font-size: 1.3em; margin: -0.2em 0.28em -0.2em -0.18em; vertical-align: -0.24em;
+  font-variation-settings: "FILL" 1, "wght" 500;
 }
 
 /* accessibility: honour reduced-motion — drop the transforms and loops */

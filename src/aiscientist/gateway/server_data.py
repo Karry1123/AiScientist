@@ -7,9 +7,11 @@ through the browser would copy it out of the server and back in. Instead a user 
    ``AISCIENTIST_SERVER_DATA_ROOTS``: the allowlist is checked here, in code, never by a model;
 2. :func:`scan` lists it once (metadata only) and decides what an analysis needs from it;
 3. when analysis runs on HPC3, whose nodes cannot see the server's disks, :func:`sync_to_hpc`
-   copies those files to the user's dfs3b uploads area at run start. The copy is incremental (a file
-   already there at the same size is skipped, so a second run copies nothing) and resumable (a large
-   file is written as ``.part`` and continued where an interrupted copy stopped).
+   copies those files to the session's own area under the user's dfs3b ``Temp`` at run start. The
+   copy is incremental (a file already there at the same size is skipped, so a second run in the
+   session copies nothing) and resumable (a large file is written as ``.part`` and continued where
+   an interrupted copy stopped). It is a temporary copy: removed when the session disconnects, and
+   made again from the server by the next session.
 
 Nothing here imports the rest of the gateway: the executor is passed in.
 """
@@ -288,13 +290,36 @@ def scan(path: Path, root: Path, roots: "tuple[Path, ...]",
     return out
 
 
-def mirror_dir(uploads_dir: str, root: Path, path: Path) -> str:
-    """Where ``path`` is mirrored on HPC3: ``<uploads>/server-data/<root as one name>/<rel>``. The
-    same server path always maps to the same place, which is what makes the copy incremental."""
-    tag = "_".join(p for p in root.parts if p not in ("/", "")) or "root"
+def mirror_tag(root: Path) -> str:
+    """An allowlisted root as one directory name (``/data/Users/shared`` -> ``data_Users_shared``)."""
+    return "_".join(p for p in root.parts if p not in ("/", "")) or "root"
+
+
+def mirror_dir(base: str, root: Path, path: Path) -> str:
+    """Where ``path`` is copied on HPC3: ``<base>/<root as one name>/<rel>``. ``base`` is the
+    session's own copy area (``hpc_gc.session_mirror_base``), so within a session the same server
+    path always maps to the same place, which is what makes a second run's copy incremental, and
+    the next session starts from an empty one."""
     rel = path.relative_to(root).as_posix()
-    base = f"{uploads_dir.rstrip('/')}/server-data/{tag}"
-    return base if rel in ("", ".") else f"{base}/{rel}"
+    top = f"{base.rstrip('/')}/{mirror_tag(root)}"
+    return top if rel in ("", ".") else f"{top}/{rel}"
+
+
+def split_mirror(hpc_path: str, sessions_dir: str, legacy_dir: str) -> "tuple[str, str] | None":
+    """``(root name, rel)`` for a path inside a copy of server data on HPC3, whichever session made
+    it: ``<sessions_dir>/<session>/<root name>[/<rel>]``, or the older
+    ``<legacy_dir>/<root name>[/<rel>]`` that every session shared. None for any other path (a
+    dataset the user uploaded, say). A run that is resumed by a later session stored such a path;
+    this is how that session finds what to copy again."""
+    path = (hpc_path or "").rstrip("/")
+    for prefix, skip in ((sessions_dir.rstrip("/") + "/", 1), (legacy_dir.rstrip("/") + "/", 0)):
+        if not path.startswith(prefix):
+            continue
+        parts = path[len(prefix):].split("/")[skip:]
+        if not parts or not parts[0] or ".." in parts:
+            return None
+        return parts[0], "/".join(parts[1:])
+    return None
 
 
 class TransferCancelled(RuntimeError):

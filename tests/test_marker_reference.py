@@ -213,3 +213,18 @@ def test_reference_none_still_works_for_a_tissue_without_one(tmp_path):
                                                                          "Cholangiocyte": ["KRT19"]},
                                          "dominance_ratio": 1.0})
     assert out["reference"] == {} and out["labels"] == {"0": "Hepatocyte", "1": "Cholangiocyte"}
+
+
+def test_the_annotation_draws_its_own_umap_and_marker_dot_plot(tmp_path):
+    """The labels' two figures used to exist only when the plan carried a model-written figure
+    step; a plan that asks for QC and annotation has none."""
+    a = _object(_HUMAN)
+    a.obsm["X_umap"] = np.random.default_rng(1).normal(size=(a.n_obs, 2)).astype("float32")
+    out = _run(tmp_path, a, {"reference": "retina"})
+    assert out["status"] == "ok"
+    assert out["figures"] == ["figures/umap_cell_types.png", "figures/dotplot__cell_type_markers.png"]
+    for rel in out["figures"]:
+        assert (tmp_path / "artifacts" / rel).stat().st_size > 5_000
+    # Without an embedding the dot plot is still drawn, and nothing fails.
+    out = _run(tmp_path / "no_umap", _object(_HUMAN), {"reference": "retina"})
+    assert out["status"] == "ok" and out["figures"] == ["figures/dotplot__cell_type_markers.png"]

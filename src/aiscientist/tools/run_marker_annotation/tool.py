@@ -462,6 +462,7 @@ def run_marker_annotation(args: dict[str, Any], ctx: Any) -> dict[str, Any]:
     # h5py rejects '/' in obs keys (score_Pericyte/SMC) — sanitize before writing.
     adata.obs.columns = [c.replace("/", "_") for c in adata.obs.columns]
     adata.write(work / "adata_annotated.h5ad")
+    figures = _label_figures(sc, adata, disc, use_raw, figs, art)
 
     comp = adata.obs["cell_type"].value_counts()
     total = int(comp.sum()) or 1
@@ -520,8 +521,45 @@ def run_marker_annotation(args: dict[str, Any], ctx: Any) -> dict[str, Any]:
         "tables": [_rel(art, tables / "cluster_cell_types.csv"),
                    _rel(art, tables / "celltype_composition.csv"),
                    _rel(art, tables / "celltype_scores_by_cluster.csv")],
+        "figures": figures,
         "raw_data_to_llm": False,
     }
+
+
+def _label_figures(sc: Any, adata: Any, disc: dict[str, list[str]], use_raw: bool,
+                   figs: Path, art: Path) -> list[str]:
+    """The two figures an annotation is read from, written by the tool that made the labels: the
+    UMAP coloured by assigned cell type, and a dot plot of the deciding markers by cell type.
+
+    They used to exist only when the plan carried a model-written `run_code` "figures" step (run
+    f3b8268c4fd4's ``review_umap_by_celltype.png``). A plan that asks for QC and annotation has no
+    such step, so the labels arrived with no picture of them. Best effort: a figure that cannot
+    be drawn costs the figure, never the labels."""
+    out: list[str] = []
+    try:
+        sc.settings.figdir = str(figs)
+    except Exception:  # noqa: BLE001 - no plotting available: the labels are the result
+        return out
+    if "X_umap" in adata.obsm:
+        try:
+            sc.pl.umap(adata, color=["cell_type"], show=False, save="_cell_types.png")
+            if (figs / "umap_cell_types.png").exists():
+                out.append(_rel(art, figs / "umap_cell_types.png"))
+        except Exception:  # noqa: BLE001
+            pass
+    assigned = [t for t in adata.obs["cell_type"].cat.categories if t in disc and disc[t]]
+    if assigned and adata.obs["cell_type"].nunique() > 1:
+        # At most ~60 columns, as in run_de's marker plot: wider cannot be read on a page.
+        per = max(1, min(3, 60 // len(assigned)))
+        shown = {t: disc[t][:per] for t in assigned}
+        try:
+            sc.pl.dotplot(adata, shown, groupby="cell_type", use_raw=use_raw, show=False,
+                          save="_cell_type_markers.png")
+            if (figs / "dotplot__cell_type_markers.png").exists():
+                out.append(_rel(art, figs / "dotplot__cell_type_markers.png"))
+        except Exception:  # noqa: BLE001
+            pass
+    return out
 
 
 def make_tool() -> HarnessTool:
@@ -540,7 +578,9 @@ def make_tool() -> HarnessTool:
         "raw check CORRECTED, which are unassigned and why (mixed / weak / withdrawn, with each "
         "cluster's own top marker genes), labelled clusters led by another lineage's genes, and "
         "warnings (e.g. a lineage every sample of the tissue contains is missing); all belong in "
-        "the report. Describe an unassigned cluster by its top markers, not by a guessed name.",
+        "the report. Describe an unassigned cluster by its top markers, not by a guessed name. "
+        "Writes the UMAP coloured by assigned cell type and a dot plot of the deciding markers by "
+        "cell type itself: no separate figure step is needed for them.",
         {"type": "object", "properties": {
             "reference": {"type": "string", "enum": ["auto", "none", *available_references()],
                           "description": ("curated marker reference for the tissue; 'auto' (default) "

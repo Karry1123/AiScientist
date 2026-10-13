@@ -60,12 +60,12 @@ Adapt parameters to THIS dataset; plan ordered steps that:
 4. Find marker genes per cluster (`run_de`) so the clusters' biology can be read directly from the data.
 5. CROSS-VALIDATE the scGPT per-cell labels: a confusion-style comparison against the independent Leiden cluster structure AND — when the dataset carries a `celltype`/`majorclass` column — directly against those existing labels (agreement %, per-label confidence, the populations where scGPT disagrees), plus the scGPT confidence distribution flagging low-confidence cells/populations. **Merge the predictions by BARCODE, never by row order (see the ⚑ callout below).** No curated tool covers this — adapt the reference template `crossvalidate_scgpt_vs_leiden.py` via `run_code`; it does the barcode-safe merge and covers BOTH the Leiden confusion table AND the existing majorclass/celltype agreement, so adapt it rather than writing the merge from scratch.
 6. Produce figures: UMAP colored by scGPT predictions AND by Leiden cluster, the confidence distribution, and violins of canonical markers for the predicted types.
-7. **GROUND THE BIOLOGY — plan these, they are what the write-up is allowed to draw on.**
+7. **GROUND THE BIOLOGY — this is what the write-up is allowed to draw on.**
    `run_enrichment` over the step-4 cluster markers (and over any condition contrast the study
-   carries), and `literature_search` on the cell types and genes the analysis actually surfaced.
-   The report writer may name ONLY pathways, enrichment terms and citations that appear in an
-   ACCEPTED step result — so with no enrichment step the report cannot name a single pathway, and
-   with no literature step `## References` is silently empty. Annotation is not by itself a
+   carries). The report writer may name ONLY pathways, enrichment terms and citations that appear
+   in an ACCEPTED step result — so with no enrichment step the report cannot name a single pathway.
+   `literature_search` on the cell types and genes the analysis surfaced is OPTIONAL, and its own step: plan it ONLY when the user asks for literature, references or citations; otherwise leave it out and offer it as a follow-up.
+   A run without it has no reference list, and its report says so. Annotation is not by itself a
    finding: state what the labels and their disagreements MEAN for the question that was asked.
 8. Do NOT plan a report-WRITING or rendering step — the manuscript is assembled automatically from
    the accepted results. That is about writing it, NOT about interpreting: step 7 is still required.

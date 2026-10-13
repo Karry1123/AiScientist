@@ -84,7 +84,8 @@ class _Hpc:
 def _hpc_conn(gw_app, monkeypatch, executor):
     conn = types.SimpleNamespace(
         owner="yijus12", app_user_id=5, executor=executor,
-        settings=types.SimpleNamespace(temp_ttl_days=3, checkpoint_ttl_days=7, cpu_partition="standard",
+        settings=types.SimpleNamespace(temp_ttl_days=3, checkpoint_ttl_days=7, session_cleanup=True,
+                                       cpu_partition="standard",
                                        cpu_account="ruic20_lab"))
     monkeypatch.setattr(gw_app, "_owner_connections", lambda owner: [conn] if owner == "yijus12" else [])
     monkeypatch.setattr(gw_app, "_active_conn_for_user", lambda user: conn)
@@ -152,7 +153,7 @@ def test_a_swept_directory_and_a_closed_session_are_said_plainly(tmp_path, gw, m
     assert r.status_code == 409 and "Connect to HPC3" in r.json()["error"]
     _hpc_conn(gw, monkeypatch, _Hpc("/somewhere/else"))               # the Temp sweeper took it
     r = _client(gw).get("/api/cellqc-result/yijus12/run7")
-    assert r.status_code == 410 and "swept after 3 days" in r.json()["error"]
+    assert r.status_code == 410 and "session disconnects, or after 3 days" in r.json()["error"]
     assert _client(gw).get("/api/cellqc-result/yijus12/none").status_code == 404
 
 
@@ -231,7 +232,8 @@ def test_a_run_that_handed_on_both_lists_both(tmp_path, gw):
 def _run_conn(tmp_path, executor=None, user_id=5):
     return types.SimpleNamespace(owner="yijus12", app_user_id=user_id, executor=executor,
                                  workspace=tmp_path / "yijus12",
-                                 settings=types.SimpleNamespace(temp_ttl_days=3, checkpoint_ttl_days=7))
+                                 settings=types.SimpleNamespace(temp_ttl_days=3, checkpoint_ttl_days=7,
+                                                                session_cleanup=True))
 
 
 def test_the_gateway_names_the_directory_and_says_how_long_it_is_kept(tmp_path, gw):
@@ -246,9 +248,11 @@ def test_the_gateway_names_the_directory_and_says_how_long_it_is_kept(tmp_path, 
                                   lambda level, stage, msg: said.append((level, msg)))
     assert gw._CELLQC_NAME_RE.fullmatch(out["name"]) and out["name"].startswith("Sample3_GSM5676874.cellqc.")
     assert out["name"].endswith(".run7") and out["location"] == "hpc3" and out["kept_days"] == 3
+    assert out["until_disconnect"] is True                # on HPC3 it goes with the session
     assert json.loads(p.read_text())["name"] == out["name"]
     (level, msg), = said
-    assert level == "success" and "11 files" in msg and "1 per-library .h5ad" in msg and "3 days" in msg
+    assert level == "success" and "11 files" in msg and "1 per-library .h5ad" in msg
+    assert "until you disconnect (at most 3 days)" in msg
     # a run without CellQC says nothing
     assert gw._stamp_cellqc_result(_run_conn(tmp_path), "other", {}, True, lambda *a: said.append(a)) is None
     assert len(said) == 1

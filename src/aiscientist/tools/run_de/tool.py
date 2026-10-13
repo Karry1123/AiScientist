@@ -629,14 +629,17 @@ def run_de(args: dict[str, Any], ctx: Any) -> dict[str, Any]:
     # how a plan could declare p-values non-inferential in one step and then gate the enrichment
     # input on padj<0.05 in the next, laundering a pseudoreplicated p-value into "significantly
     # shifted genes". A sidecar makes the label travel with the data.
-    if out.get("inference"):
-        try:
-            (tables / f"de_{key}_inference.json").write_text(
-                json.dumps({"inference": out["inference"], "groupby": groupby,
-                            "reference": reference, "stratify_by": stratify_by or None}),
-                encoding="utf-8")
-        except OSError:
-            pass    # a sidecar we could not write must never fail the DE step itself
+    # Written on EVERY run, not only when there is a label: a marker run reusing a contrast's key
+    # would otherwise leave the contrast's stale label on its tables, and `mode` is the only thing
+    # on disk that tells a one-vs-rest marker table from a contrast — the columns are identical.
+    try:
+        (tables / f"de_{key}_inference.json").write_text(
+            json.dumps({"tool": "run_de", "mode": "contrast" if contrast else "markers",
+                        "inference": out.get("inference"), "groupby": groupby,
+                        "reference": reference, "stratify_by": stratify_by or None}),
+            encoding="utf-8")
+    except OSError:
+        pass    # a sidecar we could not write must never fail the DE step itself
     # The same reason for the true significant counts: run_enrichment selects its input from the
     # per-group tables, and only this says whether such a table is the complete test (a
     # contrast) or a top-n_genes view of it (markers).

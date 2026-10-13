@@ -352,6 +352,52 @@ def test_an_open_tunnel_forwards_over_the_new_transport_after_a_reconnect(net):
         ex.close()
 
 
+def test_a_tunnel_with_a_moving_target_follows_it_and_refuses_when_there_is_none(net):
+    """The shared model server changes node and port at every renewal of its Slurm job; the local
+    port must reach whichever one is current, and nothing while there is none."""
+    ex = _session()
+    opened: list[object] = []
+    remotes: list[socket.socket] = []
+
+    def _open_channel(kind, dest, src):
+        near, far = socket.socketpair()
+        opened.append(dest)
+        remotes.append(far)
+        return near
+
+    net.transports[0].open_channel = _open_channel
+    target: dict = {"at": None}
+    port = ex.open_tunnel_to(lambda: target["at"], label="the shared model server")
+    try:
+        def _send(payload: bytes) -> socket.socket:
+            client = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            client.settimeout(5)
+            client.connect(("127.0.0.1", port))
+            client.sendall(payload)
+            return client
+
+        # Nothing is serving: the connection is dropped (closed or reset), no channel is opened.
+        with _send(b"nobody home") as client:
+            try:
+                assert client.recv(16) == b""
+            except ConnectionError:
+                pass
+        assert opened == []
+
+        for node, remote_port in (("gpu-node-a", 31001), ("gpu-node-b", 42002)):
+            target["at"] = (node, remote_port)
+            with _send(b"hello"):
+                far = _wait_for(lambda: remotes[-1] if len(remotes) == len(opened) and opened
+                                and opened[-1] == (node, remote_port) else None)
+                far.settimeout(5)
+                assert far.recv(16) == b"hello"
+        assert opened == [("gpu-node-a", 31001), ("gpu-node-b", 42002)]
+    finally:
+        for far in remotes:
+            far.close()
+        ex.close()
+
+
 def _wait_for(probe, timeout: float = 5.0):
     import time
 

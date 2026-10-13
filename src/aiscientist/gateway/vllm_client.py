@@ -406,11 +406,16 @@ def complete_ex(
     think: bool = True,
     reasoning_effort: str | None = None,
     idle_timeout: float | None = None,
+    think_kwargs: dict | None = None,
 ) -> tuple[str, dict]:
     """One ``/v1/chat/completions`` — the assistant text AND the provider's usage.
 
     ``reasoning_effort`` overrides ``AISCIENTIST_VLLM_REASONING_EFFORT`` for this call (the gateway sets
     it PER ROLE: planning and the write-up think harder than a routing classifier).
+
+    ``think_kwargs`` overrides ``AISCIENTIST_VLLM_THINK_ON_KWARGS`` for this call. That env var
+    describes the session's own served model; a call to a DIFFERENT local server (the shared
+    reasoning model, see ``shared_llm``) carries that server's dialect instead.
 
     ``idle_timeout`` (local path only) switches to STREAMING with no limit on total time: the call
     fails only when the server sends NOTHING for that many seconds. A reasoning model streams its
@@ -446,10 +451,10 @@ def complete_ex(
         # unchanged. The phenotype mapper uses the session tunnel, never base_url, so this vLLM-only
         # chat-template kwarg never reaches an OpenRouter endpoint that wouldn't understand it.
         payload["chat_template_kwargs"] = {"enable_thinking": False}
-    elif not base_url and _think_on_kwargs():
+    elif not base_url and (think_kwargs or _think_on_kwargs()):
         # Served models whose template does NOT think by default (DeepSeek-V4 under vLLM's
         # deepseek_v4 tokenizer mode) need the opt-IN spelled out; configured per deployment.
-        payload["chat_template_kwargs"] = _think_on_kwargs()
+        payload["chat_template_kwargs"] = think_kwargs or _think_on_kwargs()
     effort = (reasoning_effort or "").strip().lower() or _reasoning_effort()
     if think and not base_url and effort in REASONING_EFFORTS:
         # HOW HARD to think on the local path. chat_template_kwargs only toggles the trace on/off;

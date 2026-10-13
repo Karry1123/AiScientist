@@ -19,6 +19,10 @@ is copied back to the gateway after every step, and a multi-GB matrix has no bus
 ``artifacts`` go the small things — ``tables/cells.csv`` (one row per cell) and
 ``data/result_dataset.json``, the pointer the console uses to offer "save to my data".
 
+The next run of the same conversation starts from that file (:func:`adopt`): it is written back as
+that run's own checkpoints, so every tool reads it exactly as it would read the QC and clustering
+steps' output, and the run plans only what its request adds.
+
 Pure data handling; no model, no network. Runs wherever the checkpoints are (the HPC3 analysis job
 through ``scrna_cli``, or in-process for a local run).
 """
@@ -35,12 +39,19 @@ from typing import Any
 CHECKPOINTS = ("adata_annotated.h5ad", "adata_de.h5ad", "adata_integrated.h5ad",
                "adata_scored.h5ad", "adata_clustered.h5ad", "adata_qc.h5ad")
 BASE_CHECKPOINT = "adata_qc.h5ad"
+CLUSTERED_CHECKPOINT = "adata_clustered.h5ad"
 POINTER = "result_dataset.json"
 # CellQC's complete result/ directory, kept with the run by run_cellqc (which writes this pointer).
 CELLQC_POINTER = "cellqc_result.json"
+# obs columns that hold a clustering, and ones that hold cell-type labels, in the order tried.
+CLUSTER_KEYS = ("leiden", "louvain", "cluster", "clusters", "seurat_clusters")
+LABEL_KEYS = ("cell_type", "celltype", "final_label", "annotation", "majorclass")
 # Stems that say nothing about the data: name the result after the folder holding them instead.
 _GENERIC_STEMS = {"filtered_feature_bc_matrix", "raw_feature_bc_matrix", "matrix", "data",
                   "adata", "counts", "sample_filtered_feature_bc_matrix"}
+
+
+_PROCESSED_TAIL = re.compile(r"\.processed\.[0-9]{8}-[0-9]{4}\.[A-Za-z0-9]+$")
 
 
 def result_name(dataset_path: str, run_id: str, when: "_dt.datetime | None" = None) -> str:
@@ -61,6 +72,9 @@ def _named(dataset_path: str, run_id: str, when: "_dt.datetime | None", what: st
     for suffix in (".h5ad", ".h5", ".loom", ".gz", ".csv", ".tsv", ".txt"):
         if stem.lower().endswith(suffix):
             stem = stem[: -len(suffix)]
+    # A run that started from an earlier run's result names its own after the ORIGINAL input,
+    # not "<input>.processed.<time>.<run>.processed.<time>.<run>".
+    stem = _PROCESSED_TAIL.sub("", stem)
     if stem.lower() in _GENERIC_STEMS and p.parent.name:
         stem = p.parent.name
         if stem.lower() in {"outs", "filtered_feature_bc_matrix"} and p.parent.parent.name:
@@ -184,6 +198,11 @@ def export(workspace: "str | Path", name: str, meta: "dict[str, Any] | None" = N
     created = _dt.datetime.now(_dt.timezone.utc)
     provenance = {"processed": True, "created_at": created.isoformat(timespec="seconds"),
                   "checkpoints": used, "notes": notes, **(meta or {})}
+    # A run that started from an earlier run's dataset says so: the earlier runs, oldest first.
+    earlier = handed_on(adata)
+    if earlier and earlier.get("run_id") and earlier.get("run_id") != provenance.get("run_id"):
+        provenance["builds_on"] = [*[str(r) for r in (earlier.get("builds_on") or [])],
+                                   str(earlier["run_id"])]
     adata.uns["aiscientist"] = _plain(provenance)
 
     out = ws / "result" / name
@@ -220,6 +239,97 @@ def export(workspace: "str | Path", name: str, meta: "dict[str, Any] | None" = N
     return {"status": "ok", "result_dataset": pointer,
             "summary": (f"processed dataset {name}: {adata.n_obs} cells x {adata.n_vars} genes, "
                         f"{size / 1e6:.0f} MB; obs: {', '.join(map(str, adata.obs.columns[:12]))}")}
+
+
+def handed_on(adata: Any) -> "dict[str, Any] | None":
+    """The provenance record of a dataset an earlier run handed on (``uns["aiscientist"]`` written
+    by :func:`export`), or None for any other AnnData."""
+    try:
+        rec = adata.uns.get("aiscientist")
+    except Exception:  # noqa: BLE001 - an object without uns is simply not one of ours
+        return None
+    if not hasattr(rec, "get") or not rec.get("processed"):
+        return None
+    return {str(k): (v.tolist() if hasattr(v, "tolist") else v) for k, v in dict(rec).items()}
+
+
+def already_processed(adata: Any) -> "str | None":
+    """Why a QC tool must not run on ``adata``, or None. A dataset a run handed on is already
+    filtered and log-normalised; QC on it would filter on log values and normalise a second time,
+    with no symptom — every later number would simply be wrong."""
+    rec = handed_on(adata)
+    if rec is None:
+        return None
+    run = str(rec.get("run_id") or "an earlier run")
+    return (f"this dataset was already quality-controlled and log-normalised by run {run} (its "
+            "integer counts are in layers['counts']). Running QC again would filter on log values "
+            f"and normalise twice. It is already in place as this run's checkpoint "
+            f"({BASE_CHECKPOINT}): call the next tool directly.")
+
+
+def adopt(workspace: "str | Path", source: "str | Path") -> "dict[str, Any]":
+    """Start a run from the dataset an earlier run handed on, by writing it as this run's checkpoints.
+
+    The tools find their input by a fixed name (``adata_qc.h5ad`` → ``adata_clustered.h5ad`` …), and
+    a new run has none. The handed-on dataset is the QC checkpoint plus what the later steps added,
+    so it goes back as ``work/adata_qc.h5ad`` with ``.raw`` restored — :func:`export` dropped it as
+    a copy of ``X``, and the DE and annotation tools read the log-normalised matrix from there —
+    and, when it carries a clustering, as ``work/adata_clustered.h5ad`` too. A checkpoint this run
+    already has is never overwritten. ``status`` is ``skipped`` (with ``reason``) for a file no
+    run handed on, which is then used as an ordinary input."""
+    try:
+        import anndata as ad
+    except ImportError as exc:                       # pragma: no cover - the images ship it
+        return {"status": "error", "error": f"cannot read the handed-on dataset: {exc}"}
+    src = Path(source)
+    if not src.is_file() or src.suffix.lower() != ".h5ad":
+        return {"status": "skipped", "reason": f"{src.name} is not an .h5ad file a run handed on"}
+    work = Path(workspace) / "work"
+    if (work / BASE_CHECKPOINT).is_file():
+        return {"status": "skipped", "reason": f"this run already has {BASE_CHECKPOINT}"}
+    try:
+        adata = ad.read_h5ad(src)
+    except Exception as exc:  # noqa: BLE001 - reported, and the run goes on from the plain input
+        return {"status": "error", "error": f"could not read {src.name}: {type(exc).__name__}: {exc}"}
+    rec = handed_on(adata)
+    if rec is None:
+        return {"status": "skipped",
+                "reason": f"{src.name} carries no record of the run that produced it"}
+
+    adata.raw = adata                                  # the full log-normalised matrix, as QC left it
+    work.mkdir(parents=True, exist_ok=True)
+    written = [BASE_CHECKPOINT]
+    tmp = work / ("." + BASE_CHECKPOINT + ".part")
+    adata.write_h5ad(tmp)
+    os.replace(tmp, work / BASE_CHECKPOINT)
+    cluster_key = next((k for k in CLUSTER_KEYS if k in adata.obs.columns), None)
+    label_key = next((k for k in LABEL_KEYS if k in adata.obs.columns), None)
+    if cluster_key and not (work / CLUSTERED_CHECKPOINT).exists():
+        # The same object under the name the DE and annotation tools look for first. A COPY, never
+        # a link: run_clustering rewrites this name in place, which through a link would replace
+        # the QC checkpoint as well.
+        import shutil
+        shutil.copyfile(work / BASE_CHECKPOINT, work / CLUSTERED_CHECKPOINT)
+        written.append(CLUSTERED_CHECKPOINT)
+
+    def levels(key: "str | None") -> "int | None":
+        return int(adata.obs[key].astype(str).nunique()) if key else None
+
+    adopted = {
+        "from": src.name, "source_run": str(rec.get("run_id") or ""),
+        "builds_on": [str(r) for r in (rec.get("builds_on") or [])],
+        "checkpoints": written, "n_cells": int(adata.n_obs), "n_genes": int(adata.n_vars),
+        "cluster_key": cluster_key, "n_clusters": levels(cluster_key),
+        "label_key": label_key, "n_labels": levels(label_key),
+        "obs_columns": [str(c) for c in adata.obs.columns],
+        "obsm": sorted(str(k) for k in adata.obsm.keys()),
+        "layers": sorted(str(k) for k in adata.layers.keys()),
+        "counts_layer": str(adata.uns.get("counts_layer") or ""),
+    }
+    summary = (f"started from {src.name}: {adata.n_obs} cells x {adata.n_vars} genes"
+               + (f", {adopted['n_clusters']} clusters ({cluster_key})" if cluster_key else "")
+               + (f", {adopted['n_labels']} cell-type labels ({label_key})" if label_key else ""))
+    return {"status": "ok", "adopted": adopted, "summary": summary}
 
 
 def _labels_from_table(adata: Any, table: Path, pd: Any) -> str:

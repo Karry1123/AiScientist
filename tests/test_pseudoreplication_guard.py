@@ -138,6 +138,23 @@ def test_a_stratified_contrast_runs_but_is_labelled_exploratory(tmp_path):
     assert "exploratory ranking" in joined and "not as differential expression" in joined
 
 
+def test_the_label_beside_the_tables_is_rewritten_on_every_run(tmp_path):
+    """A marker run reusing a stratified contrast's key must not inherit its label: run_enrichment
+    would treat the markers as descriptive, and nothing else on disk tells markers from a contrast
+    (the columns are identical)."""
+    import json
+
+    ctx = _qc(tmp_path, _retina_like(tmp_path))
+    sidecar = tmp_path / "artifacts" / "tables" / "de_majorclass_inference.json"
+    run_de_tool.run_de({"groupby": "sampleid", "reference": "WT", "stratify_by": "majorclass"}, ctx)
+    meta = json.loads(sidecar.read_text())
+    assert (meta["mode"], meta["inference"], meta["reference"]) == ("contrast", "exploratory_ranking", "WT")
+
+    assert run_de_tool.run_de({"groupby": "majorclass"}, ctx)["status"] == "ok"
+    meta = json.loads(sidecar.read_text())
+    assert (meta["mode"], meta["inference"], meta["reference"]) == ("markers", None, "rest")
+
+
 def test_force_runs_the_pooled_test_and_says_what_it_just_did(tmp_path):
     """`force` is a deliberate override, not a way to make the problem go away: the result carries
     the label so a downstream writer cannot present it as ordinary DE."""

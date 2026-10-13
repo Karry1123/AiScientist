@@ -107,47 +107,69 @@ CodeExecutor = Callable[[str], dict[str, Any]]
 
 
 _PI_SYSTEM = (
-    "You are the Principal Investigator of a bioinformatics lab. Given a research question AND the "
-    "list of tools your scientist can actually run, break the work into AS MANY CONCRETE, ORDERED "
-    "steps as the analysis genuinely needs — plan EVERY analysis the question AND the data genuinely "
-    "warrant; do NOT drop a step the design needs (e.g. a comparison the design calls for, annotation "
-    "validation, DE) just to keep the list short — but equally, do NOT pad the plan with a step the "
-    "data cannot give meaning to (see profile rule (d) on enrichment without a contrast). There is NO "
-    "small step limit — completeness beats brevity: a thorough single-cell study is commonly 6-12 "
-    "steps and up to ~20 is perfectly acceptable; never compress or merge real analyses to hit a "
-    "smaller number. "
+    "You are the Principal Investigator of a bioinformatics lab. Given a request AND the list of "
+    "tools your scientist can actually run, plan the CONCRETE, ORDERED steps that deliver what the "
+    "request asks for — and nothing beyond it. "
+    "THE REQUEST SETS HOW MUCH IS PLANNED; THE DATA SETS HOW IT IS DONE. First name, to yourself, "
+    "what the request asks to be delivered (a quality-controlled matrix, cell-type labels, a "
+    "comparison between two groups, enriched pathways, ...). Then plan (1) the steps that deliver "
+    "it, and (2) a PREREQUISITE only when a requested step cannot run without it and the data does "
+    "not already carry its result: clusters before marker genes, QC before clustering — but not "
+    "when the dataset, or the earlier work of this conversation, already provides them. Do NOT add "
+    "an analysis because the dataset could support it, because a protocol lists it, or to make the "
+    "study look thorough: an enrichment, composition, literature, sensitivity or robustness step "
+    "nobody asked for stays out of the plan. The user works in a conversation — after seeing these "
+    "results they ask for the next analysis, and it starts from this run's processed dataset — so "
+    "a short plan loses nothing, while a long one makes them wait for, and read, work they did "
+    "not request. "
+    "A request for THE WHOLE ANALYSIS ('analyse this dataset', 'a full analysis', 'what does this "
+    "data show', or a protocol the user named) asks for the standard pipeline for this kind of "
+    "data: plan every stage of the research-path guidance when one is given (with none, for "
+    "single-cell expression data that is QC, clustering, marker genes and cell-type annotation, "
+    "plus the comparison between conditions when the design has them), each real analysis as "
+    "its own step — never compress or merge analyses to make that list shorter, and never drop a "
+    "stage the design needs (the comparison a two-condition design calls for, annotation "
+    "validation, DE). A request that NAMES the analyses it wants ('run QC and annotate the cell "
+    "types', 'compare KO with WT in the rods') asks for exactly those: the guidance is then a "
+    "reference for HOW to do the stages you plan, not a list of stages to include. Say which it "
+    "was in `breadth`: \"whole\" or \"specific\". In `later`, list up to 4 analyses you left out "
+    "because the request did not ask for them, each as ONE short sentence the user could send as "
+    "their next message; leave it empty when there are none. "
     "THE USER'S OWN LIMITS COME FIRST: when the request says to do only certain analyses, or not to "
-    "run certain ones, plan exactly that — a limit the user set is not an omission to repair, and "
-    "the completeness rule above applies only inside it. "
+    "run certain ones, plan exactly that — a limit the user set is not an omission to repair. "
+    "Never pad the plan with a step the data cannot give meaning to (see profile rule (d) on "
+    "enrichment without a contrast). "
     "Each step must be ACHIEVABLE WITH THE AVAILABLE TOOLS (do not plan steps the tools cannot do; if a tool is "
     "limited, scope the step to what it returns). RULES: each step is ONE tool's worth of work — do "
     "NOT combine multiple analyses into one step (e.g. don't say 'run DE AND enrichment AND make a "
     "report'). Every step must be performed by one of the listed pipeline tools — do NOT plan steps "
-    "that write your own scripts to reproduce what a tool already does. If the user asks for "
-    "literature context, biological interpretation, background, references/citations, or a report "
-    "grounded in published biology, you MUST reserve one agenda step for `deep_literature` near "
-    "the end, using focused biomedical terms from the question and findings. Keep that literature "
-    "step IN ADDITION to the analysis steps — never drop a real analysis to make room for it. "
-    "Do NOT add that literature step only when the user explicitly "
-    "asks for no literature. Do NOT add ANY step that "
+    "that write your own scripts to reproduce what a tool already does. "
+    "LITERATURE IS A SEPARATE STEP, PLANNED ONLY WHEN THE USER ASKS FOR IT: when the request itself "
+    "asks for literature, published background, references or citations, you MUST reserve one "
+    "agenda step for `deep_literature` near the end, using focused biomedical terms from the "
+    "question and findings, IN ADDITION to the analysis steps. In every other case — a whole "
+    "analysis included, and whatever the guidance lists — do NOT plan a literature step: name it "
+    "in `later` instead. The word 'report' is not such a request; every run ends with a report. "
+    "Do NOT add ANY step that "
     "writes, renders, packages, zips, organizes, exports, or duplicates a report/document/archive "
     "(no .docx/.pdf/.html/.zip, no 'compile the report', no 'bundle the outputs'): the figures, "
     "tables, and the final PDF+DOCX report are assembled AUTOMATICALLY when the run finishes, so any "
     "such step is wasted, duplicate work. Plan ONLY the analysis. "
     "USE THE DATASET PROFILE when one is given (cell/gene counts + the dataset's obs/metadata "
     "columns, with category values when few): plan around the data's ACTUAL design, not a generic "
-    "template. (a) If a column looks like an experimental CONDITION/group — genotype, treatment, "
-    "timepoint, knockout vs wild-type, etc. — with 2+ categories (e.g. a 'sampleid' with values "
-    "like KO and WT), plan a step that COMPARES the groups (differential expression / abundance "
-    "between conditions); do NOT settle for a condition-agnostic descriptive atlas when the design "
-    "is clearly comparative. (b) If a column already holds cell-type or cluster ANNOTATIONS "
+    "template. (a) When the request is for the whole analysis, or asks about the groups, and a "
+    "column looks like an experimental CONDITION/group — genotype, treatment, timepoint, knockout "
+    "vs wild-type, etc. — with 2+ categories (e.g. a 'sampleid' with values like KO and WT), plan "
+    "a step that COMPARES the groups (differential expression / abundance between conditions); do "
+    "NOT settle for a condition-agnostic descriptive atlas when the design is clearly comparative. "
+    "For a request that names other analyses, that comparison goes in `later`. (b) If a column already holds cell-type or cluster ANNOTATIONS "
     "(e.g. celltype, majorclass, a predicted-label column), REUSE it — validate it against markers "
     "— rather than planning fully de-novo clustering + annotation from scratch. (c) Only reference "
     "columns that actually exist in the profile; never invent metadata. (d) If the data has NO "
     "experimental contrast — one sample/condition, i.e. every non-annotation obs column holds a "
     "single value — AND already carries cell-type labels, there is no differential question to "
-    "answer: plan ONLY QC, a canonical-marker/UMAP check that VALIDATES the existing annotation, and "
-    "a short descriptive summary. Do NOT plan pathway/GO enrichment or discovery-style DE in that "
+    "answer: a whole-analysis request gets ONLY QC, a canonical-marker/UMAP check that VALIDATES "
+    "the existing annotation, and a short descriptive summary. Do NOT plan pathway/GO enrichment or discovery-style DE in that "
     "case — enriching a known cell type's own identity markers is circular (it just restates the "
     "cell type's definition), and de-novo re-clustering to re-derive existing labels is redundant. "
     "START EVERY STEP WITH A SHORT BOLD TITLE: `**<2-6 word action title>** — <the full step "
@@ -182,10 +204,15 @@ _PI_SYSTEM = (
     "arguments or code (say '10% mitochondrial', not `max_pct_mt=10`), and never put file paths "
     "in a step. "
     "The example below shows ONLY the writing STYLE and level of detail — ADAPT "
-    "the real steps to THIS question and dataset (apply the profile rules above); do NOT copy it "
-    "verbatim or treat it as a fixed pipeline. "
-    'Reply with ONLY a JSON object {"agenda": [step strings]}, e.g. '
-    '{"agenda": ['
+    "the real steps to THIS request and dataset (apply the rules above); do NOT copy it "
+    "verbatim or treat it as a fixed pipeline. It answers a WHOLE-analysis request ('analyse "
+    "this dataset, with literature context') on an unprocessed single-sample matrix; for the "
+    "request 'run QC and cluster the cells' on the same data the reply would hold only its "
+    "first two steps, with `breadth` \"specific\" and `later` naming the marker and "
+    "enrichment analyses in a sentence each. "
+    'Reply with ONLY a JSON object {"breadth": "whole" | "specific", "agenda": [step '
+    'strings], "later": [one-sentence suggestions]}, e.g. '
+    '{"breadth": "whole", "agenda": ['
     '"**QC & normalization** — Measure each cell\'s quality with `run_scanpy_qc` and remove the ones that cannot support an '
     'analysis: cells detecting fewer than 200 genes (empty droplets and dying cells) and cells whose '
     'reads are more than 10% mitochondrial (stressed or lysed), plus genes seen in fewer than 3 '
@@ -212,7 +239,7 @@ _PI_SYSTEM = (
     'would inflate every p-value. This turns gene lists into interpretable biology.", '
     '"**Literature grounding** — Search the published literature with `deep_literature` for the key genes and pathways found '
     'above and attach real, DOI-backed citations that support the biological interpretation."'
-    ']}. '
+    '], "later": []}. '
     "DECLARE WHAT THE PROTOCOL DID NOT COVER. A research protocol cannot anticipate every dataset, "
     "so going beyond it is expected and often correct — but it must be VISIBLE, because a reader "
     "otherwise cannot tell a protocol-mandated choice from one you made. After the analysis steps, "
@@ -622,6 +649,41 @@ def _parse_plan(raw: str, max_steps: int, allow_clarify: bool) -> tuple[str, Any
     if agenda:
         return ("agenda", agenda)
     return None
+
+
+#: How many "ask for this next" suggestions a plan may carry. They are shown to the user, not run.
+MAX_LATER = 4
+#: How long a proposed step waits for the user's answer. No answer is a no.
+NEW_STEP_ASK_SECONDS = 300
+# What counts as "yes, add it" when the user types instead of clicking. Anything else is a no.
+_APPROVAL_WORDS = ("add", "yes", "approve", "ok", "sure", "加", "可以", "同意", "批准", "好", "行")
+
+
+def _step_title(step: str) -> str:
+    """``**QC & normalization** — Measure…`` → ``QC & normalization``."""
+    text = str(step or "").strip()
+    return (text.split(" — ")[0].replace("**", "").strip() or text)[:90]
+
+
+def _parse_plan_extras(raw: str) -> "tuple[str, list[str]]":
+    """``(breadth, later)`` from the PI's planning reply: how much the request asked for
+    (``"whole"`` / ``"specific"``, ``""`` when the reply does not say) and the analyses it left
+    out because nobody asked for them. Both are optional, so a reply that is only
+    ``{"agenda": [...]}`` — or not an object at all — parses exactly as it did before."""
+    obj = _parse_verdict(raw or "")
+    if not isinstance(obj, dict):
+        return "", []
+    breadth = str(obj.get("breadth") or "").strip().lower()
+    breadth = breadth if breadth in ("whole", "specific") else ""
+    later: list[str] = []
+    items = obj.get("later")
+    for item in (items if isinstance(items, list) else []):
+        text = " ".join(str(item or "").split())
+        if text and text.lower() not in {x.lower() for x in later}:
+            later.append(text[:240])
+        if len(later) >= MAX_LATER:
+            break
+    return breadth, later
 
 
 def _parse_verdict(raw: str) -> dict[str, Any] | None:
@@ -1660,6 +1722,44 @@ def _is_label_fork(options: "Any") -> bool:
     return "label" in text and "cluster" in text
 
 
+_CLUSTER_COLS = ("leiden", "louvain", "cluster", "clusters", "seurat_clusters")
+
+
+def handed_on_note(dr: "dict[str, Any] | None") -> str:
+    """The planning note for a dataset an earlier run handed on (profile key ``handed_on``), or ''.
+
+    Such a file is already filtered and log-normalised and carries that run's clusters and labels.
+    Nothing said so, and nothing about the file looks unusual, so a plan for it opened with QC and
+    normalisation again — on log values, with no symptom."""
+    rec = dr.get("handed_on") if isinstance(dr, dict) else None
+    if not isinstance(rec, dict) or not rec.get("processed"):
+        return ""
+    cats = dr.get("obs_categoricals") if isinstance(dr.get("obs_categoricals"), dict) else {}
+    cols = [*cats, *[str(k) for k in (dr.get("obs_keys") or [])]]
+    clusters = next((c for c in cols if c in _CLUSTER_COLS), None)
+    labels = next((c for c in cols if _looks_like_celltype_col(c)), None)
+    counts = str(rec.get("counts_layer") or "integer counts")
+    has = ["quality-controlled and log-normalised expression (do not filter or normalise again)"]
+    if "counts" in (rec.get("layers") or []):
+        has.append(f"the counts in layers['counts'] ({counts})")
+    if clusters:
+        has.append(f"clusters in `{clusters}`")
+    if labels:
+        has.append(f"cell-type labels in `{labels}`")
+    if "X_umap" in (rec.get("obsm") or []):
+        has.append("a UMAP embedding")
+    run = str(rec.get("run_id") or "").strip()
+    return ("⚠ THIS DATASET IS THE PROCESSED OUTPUT OF AN EARLIER RUN"
+            + (f" (run {run})" if run else "") + ". It carries: " + "; ".join(has) + ". It is "
+            "already in place as this run's checkpoint, so `run_de`, `run_marker_annotation`, "
+            "`run_composition` and `run_clustering` read it directly. Do NOT plan QC, doublet "
+            "removal, normalisation or a matrix-provenance step (QC cannot be redone from this "
+            "file: it holds only the cells the earlier QC kept), and do not plan clustering or "
+            "annotation again unless the request asks to redo them. Tables and figures of the "
+            "earlier run are in its own report; a step that needs a table (enrichment needs a DE "
+            "table) must have the step that computes it in THIS plan.")
+
+
 def _dataset_mode_rule(dr: "dict[str, Any] | None") -> str:
     """``"team"`` / ``"single"`` when the dataset profile settles it, else ``""``.
 
@@ -2666,14 +2766,18 @@ _PLAN_REVIEW_CRITIC_SYSTEM = (
     "You are the Scientific Critic reviewing a DRAFT analysis plan with the PI, BEFORE any step runs. "
     "When `user_scope` is given, the user limited this run on purpose: an analysis it rules out is "
     "NOT a gap — do not flag its absence and do not add it in a revision. "
+    "`request_breadth`, when given, is how much the user asked for — \"whole\" (the whole analysis "
+    "of this dataset) or \"specific\" (the analyses the request names); `earlier_work`, when "
+    "given, is what this conversation's earlier run already did and what the dataset it handed on "
+    "carries. "
     "You are given the research question, the dataset profile, the ordered draft agenda, and "
     "`tools_named_in_plan` — what each tool the plan names computes and returns, in the words "
     "the tool's own contract uses. "
     "USE YOUR OWN KNOWLEDGE OF SINGLE-CELL AND GENOMICS METHOD, not only the protocol you were "
     "handed: a plan can follow a protocol's wording and still be scientifically incoherent, and "
     "catching that is exactly your job. Judge the plan AS A WHOLE, not step by step:\n"
-    "(1) NECESSARY — a step is an orphan only when NOTHING consumes its output AND the dataset does "
-    "not warrant it. A step that only re-reads, parses, tabulates or restates what an earlier step "
+    "(1) NECESSARY — a step is an orphan only when NOTHING consumes its output AND the request does "
+    "not ask for it. A step that only re-reads, parses, tabulates or restates what an earlier step "
     "already produced is not an analysis step; it produces no new knowledge and must be dropped. "
     "The same goes for re-RENDERING: volcano plots, per-group DEG tables and the final report are "
     "produced automatically by the tools that computed them, so a step that exists to draw or "
@@ -2693,16 +2797,26 @@ _PLAN_REVIEW_CRITIC_SYSTEM = (
     "another step's operation on a subset under a new name (keeping only the reference arm's "
     "cells inside the other arm's depth range IS depth matching, whatever the step calls it). "
     "Name the tool and the output the step duplicates; that is a reason ON THIS DATA. "
-    "But a NARROWLY WORDED QUESTION IS NOT A REASON TO DROP AN ANALYSIS. A researcher who writes "
-    "'run tool X and report what it returns' is naming a starting point, not commissioning a "
-    "one-line study, and the standard is what the DATA warrants: quality control, the "
-    "composition comparison, the per-cell-type stratification, and pathway interpretation stay in "
-    "the plan when the dataset's design supports them, even though the question mentions none of "
-    "them. Removing them is the failure this review exists to prevent, not an example of it — "
-    "measured on this exact prompt, an earlier wording cut a sound 5-step plan to 2 steps by "
-    "calling QC and composition 'orphans relative to the research question'. Drop a step only when "
-    "you can say what makes it redundant or impossible ON THIS DATA (it recomputes a column the "
-    "profile already carries; it needs replicates the profile shows do not exist).\n"
+    "A LITERATURE STEP IS NEVER A GAP: it is a separate step, planned only when the user asks for "
+    "literature, references or citations — do not add one in any other case, whole analysis "
+    "included, and do not flag its absence. "
+    "THE REQUEST SETS THE BREADTH, THE DATA DOES NOT. The plan was drafted to deliver what the "
+    "request asks for, plus the prerequisites those steps cannot run without. For a SPECIFIC "
+    "request an analysis the request did not ask for is NOT a gap: do not add composition, "
+    "enrichment, stratification or sensitivity steps because the dataset would support "
+    "them — the user asks for those in a later message, which starts from this run's results — "
+    "and a step in the draft that delivers nothing the request asked for, and whose output no "
+    "requested step reads, is out of scope: say so and drop it. What you must still protect is a "
+    "PREREQUISITE: the QC, clustering or labels a requested step reads, when neither the profile "
+    "nor `earlier_work` shows the data already carries them, stay in the plan although the request "
+    "never mentions them — measured on this prompt, an earlier wording cut a sound plan by "
+    "calling its QC step an 'orphan relative to the research question'. For a WHOLE-analysis "
+    "request (or when `request_breadth` is absent) the standard is the pipeline this kind of data "
+    "warrants: quality control, the comparison the design calls for and pathway interpretation "
+    "stay when the dataset's design supports them. In both cases drop a step only when you can "
+    "name what makes it redundant or impossible ON THIS DATA (it recomputes a column the profile "
+    "already carries; it needs replicates the profile shows do not exist; `earlier_work` already "
+    "did it), or outside the request and not a prerequisite of anything inside it.\n"
     "(2) COHERENT — do any two steps CONTRADICT each other? If a later step's justification says the "
     "earlier step's method is invalid (e.g. step 5 aggregates to samples 'instead of treating cells "
     "as independent replicates' while step 3 does exactly that and its output is still reported), the "
@@ -2742,7 +2856,8 @@ _PLAN_REVIEW_CRITIC_SYSTEM = (
     "the same sentence claimed both. A wrong description is copied verbatim into the paper's "
     "Methods, where nobody can check it against the code.\n"
     "(10) THE PRIMARY ANALYSIS IS PRESENT — before critiquing what IS written, name the analysis "
-    "the question and the protocol are asking for, and check the plan actually contains it. Every "
+    "the REQUEST is asking for (for a whole-analysis request, the one the protocol is built "
+    "around), and check the plan actually contains it. Every "
     "other rule here judges the steps that exist; this one is about the step that is missing, "
     "which nothing downstream can notice. The failure to catch: a differential-expression plan "
     "arrived with QC, a depth-matched check, composition and two enrichment steps — and no DE "
@@ -2771,11 +2886,14 @@ _PLAN_REVIEW_CRITIC_SYSTEM = (
     "wrongly drop is gone silently — no later step reports its absence, and the result simply "
     "lacks an analysis nobody sees was missing — while a step you wrongly keep costs some compute "
     "and is visible in the output where a reader can discount it. So hold a drop to the higher "
-    "bar: say which specific thing makes it redundant or impossible ON THIS DATA, and if the "
-    "reason is only that a step looks tangential to a narrowly worded question, keep it. Measured "
-    "on this prompt: reviewing two drafts that were missing their DE step, this review added "
-    "nothing and removed the composition step from both. Dropping nothing is a perfectly good "
-    "review; a shorter agenda is not the goal. The PI makes the final call."
+    "bar: say which specific thing makes it redundant or impossible ON THIS DATA, or that it "
+    "delivers nothing the request asked for and no remaining step reads its output. An ADD is held "
+    "to the same bar from the other side: add a step only for an analysis the request asks for "
+    "that no step computes, or for a prerequisite a planned step cannot run without — never "
+    "because the dataset would support one more analysis. Measured on this prompt: reviewing two "
+    "drafts that were missing their DE step, this review added nothing and removed the "
+    "composition step from both. Dropping nothing is a perfectly good review; a shorter agenda is "
+    "not the goal, and neither is a longer one. The PI makes the final call."
 )
 # The Critic writes its issues in prose, so "did it report a missing analysis, and WHICH one"
 # are both text questions. The family matters: a first version of this asked only whether the
@@ -2821,6 +2939,22 @@ def _names_tool(agenda: "list[str]", tools: "tuple[str, ...]") -> bool:
     return any(re.search(r"`%s`" % re.escape(t), text) for t in tools)
 
 
+def retick_tools(steps: "list[str]", names: "Iterable[str]") -> "list[str]":
+    """``steps`` with the backticks put back around tool names written bare.
+
+    Every consumer of a plan finds a step's tool by its backticks: the scope filter, the tooling
+    check, the plan review's contracts, the DAG's node kinds. The PI's finalising turn rewrites
+    steps and sometimes writes ``run run_scanpy_qc`` without them (measured 2026-10-12: one of
+    fifteen reviewed plans, all three of its steps), after which the plan names no tool at all as
+    far as the code can tell. Only names with an underscore are restored, so no ordinary word is
+    ever quoted; a longer name is never split (``run_de`` inside ``run_depth_matched_de``)."""
+    wanted = sorted({n for n in names if "_" in n}, key=len, reverse=True)
+    if not wanted:
+        return list(steps)
+    bare = re.compile(r"(?<![`\w])(" + "|".join(re.escape(n) for n in wanted) + r")(?![`\w])")
+    return [bare.sub(r"`\1`", step) for step in steps]
+
+
 def plan_tool_contracts(agenda: "list[str]", catalog: "list[Any]") -> "dict[str, str]":
     """``{tool name: what the model is told it does}`` for every catalog tool the agenda names.
 
@@ -2837,14 +2971,18 @@ def plan_tool_contracts(agenda: "list[str]", catalog: "list[Any]") -> "dict[str,
 _PLAN_REVIEW_PI_SYSTEM = (
     "You are the Principal Investigator finalizing the analysis plan after the Critic reviewed it, "
     "BEFORE any step runs. You OWN the plan. When `user_scope` is given, the user limited this run "
-    "on purpose: the final agenda stays inside it. You are given the question, the dataset profile, the draft "
+    "on purpose: the final agenda stays inside it. `request_breadth` (\"whole\" analysis, or the "
+    "\"specific\" analyses the request names) and `earlier_work` (what this conversation already "
+    "did) say how much is being asked for: the final agenda delivers the request and the "
+    "prerequisites it cannot run without, and adds no analysis the request did not ask for. "
+    "You are given the question, the dataset profile, the draft "
     "agenda, and the Critic's issues + proposed revision. Decide the FINAL agenda: adopt the fixes you "
     "agree with, keep steps you still want, never drop a step you believe is needed — but DO remove a "
     "genuinely orphan, circular, or redundant step. Do NOT put back, in its place, a 'reconciliation', "
     "'cross-check' or 'claim gate' step that re-reads other steps' results: before the report is "
     "written, a claim audit checks every candidate conclusion against the design (depth gap, "
-    "replication) and the artifacts, so such a step duplicates it. Add a step only for an analysis no "
-    "step computes. "
+    "replication) and the artifacts, so such a step duplicates it. Add a step only for a requested "
+    "analysis, or a prerequisite of one, that no step computes. "
     'Reply with ONLY a JSON object: {"final_agenda": ["<step>", ...], "reason": "<one sentence>"}.'
 )
 
@@ -2981,6 +3119,16 @@ class LabConfig:
     # stops a hallucinated/pathological plan. Tunable via AISCIENTIST_MAX_STEPS.
     max_steps: int = 20
     max_revisions: int = 2              # revisions on one step before force-advancing
+    # A step the plan did not contain (exploration proposes one after a surprising result) is run
+    # only after the user approves it. Nobody to ask — bypass mode, a resumed run, an earlier
+    # proposal left unanswered — means it is NOT run; it is listed for the user to ask for.
+    # False restores the unattended behaviour (the step is added without asking): an operator's
+    # choice for autonomous campaigns, AISCIENTIST_NEW_STEPS_AUTO=1.
+    new_steps_need_approval: bool = True
+    # What this conversation's earlier run(s) already did, when this run CONTINUES one: the steps,
+    # their findings and what the dataset handed on carries (gateway ``_prior_work_block``). Shown
+    # to the PI and the plan review so the new plan adds to that work instead of repeating it.
+    prior_work: str = ""
     # Planner/scheduler. "linear" = the flat-agenda _run_loop (default, unchanged). "dag" =
     # structure the agenda into a dependency DAG and run it with the ready-set scheduler +
     # Coordinator (_run_dag): data-driven ordering, structural task reuse, scoped node briefs.
@@ -3421,6 +3569,15 @@ class ResearchLab:
         # What the user limited this run to ("only QC", "no DE"): read once in _run_inner, enforced
         # wherever a step can enter the plan (agents/scope.py).
         self._scope: RunScope = RunScope()
+        # How the PI read the request (``"whole"`` analysis / ``"specific"`` analyses / ``""`` when
+        # it did not say), and the analyses it left out for a later message (``_parse_plan_extras``).
+        self._request_breadth: str = ""
+        self._later: list[str] = []
+        # Asking the user mid-run (the gateway's decision card), and the steps proposed after a
+        # result that were not added: declined, unanswered, or with nobody to ask.
+        self._decision_review: "Callable[[Any], dict[str, Any]] | None" = None
+        self._proposed_steps: list[dict[str, Any]] = []
+        self._step_asks_unanswered = False
         # The skills steering THIS run: the user-PINNED ones (mandatory) + one the PI auto-selects on
         # top (Axis B), extended in ``run()``. Carry their reference-code templates (progressive
         # disclosure). Empty = free planning.
@@ -3472,6 +3629,23 @@ class ResearchLab:
     def scope(self) -> RunScope:
         """The limit the user's request put on this run (empty when it set none)."""
         return self._scope
+
+    @property
+    def request_breadth(self) -> str:
+        """``"whole"`` / ``"specific"`` as the PI read the request, ``""`` when it did not say."""
+        return self._request_breadth
+
+    @property
+    def later(self) -> "list[str]":
+        """Analyses the PI left out because the request did not ask for them — what the user can
+        ask for next in the same conversation."""
+        return list(self._later)
+
+    @property
+    def proposed_steps(self) -> "list[dict[str, Any]]":
+        """Steps a result prompted that were NOT added to the run (``step``, ``why``, ``decision``:
+        declined / unanswered / not_asked), for the user to ask for afterwards."""
+        return [dict(p) for p in self._proposed_steps]
 
     @property
     def self_sourced(self) -> str:
@@ -3561,6 +3735,8 @@ class ResearchLab:
     ) -> LabResult:
         emit: EventFn = on_event or (lambda _e: None)
         self._checkpoint = checkpoint
+        self._decision_review = decision_review
+        self._proposed_steps, self._step_asks_unanswered = [], False
 
         # A2 continuation: re-enter the SAME state machine without re-planning. Skip skill/mode/PI
         # planning, reuse the prior agenda + accepted rounds, and re-execute from the changed step
@@ -3687,11 +3863,12 @@ class ResearchLab:
                                  "Stopped by the user before the plan was drafted — no tools ran.")
             return None
 
-        if self._scope.keep and self.config.mode == "auto":
-            # The design meeting exists to widen a study; a request that names the only analyses it
-            # wants has nothing for it to design.
+        if (self._scope.keep or self.config.prior_work) and self.config.mode == "auto":
+            # The design meeting designs a study. A request that names the only analyses it wants,
+            # or one that adds a step to work this conversation already did, has no study to design.
             self._mode = "single"
-            emit({"type": "mode_selected", "mode": "single", "reason": "scope"})
+            emit({"type": "mode_selected", "mode": "single",
+                  "reason": "scope" if self._scope.keep else "continuation"})
         else:
             self._mode = (self._route_mode(question, emit) if self.config.mode == "auto"
                           else self.config.mode)
@@ -3701,11 +3878,14 @@ class ResearchLab:
             exec_roster, exec_multi = self._team, True
             design = self._team_meeting(
                 question,
-                "How should we approach this question? Propose the analysis plan, the key "
-                "pitfalls to avoid, and how to validate the result.",
+                "How should we carry out what this request asks for? Propose how to do the "
+                "requested analysis on THIS data, the key pitfalls to avoid, and how to validate "
+                "the result. Stay inside the request: an analysis the user did not ask for is a "
+                "suggestion for a later message, not part of this plan.",
                 self._team, "design", emit)
             self._guidance = ((self._guidance + "\n\n") if self._guidance else "") + \
-                "Team design-meeting synthesis (incorporate into the plan):\n" + design
+                ("Team design-meeting synthesis (how to carry out the request — it does not "
+                 "widen it):\n") + design
 
         # PI node. In plan mode the PI may ask a clarifying question first; without it,
         # force a straight agenda (there is no one to answer a clarify).
@@ -5457,7 +5637,7 @@ class ResearchLab:
         instead of defaulting to a generic descriptive atlas. ``''`` when no dataset is loaded."""
         dr = (self.ctx.decisions or {}).get("dataset_result")
         if not isinstance(dr, dict):
-            return ""
+            return self._bound_files_context()
         head: list[str] = []
         if dr.get("cells") and dr.get("genes"):
             head.append(f"{dr['cells']} cells x {dr['genes']} genes")
@@ -5469,6 +5649,11 @@ class ResearchLab:
         # starts on the right branch instead of being corrected after a wrong QC step has run.
         if dr.get("input_layout_hint"):
             lines.append("⚠ " + str(dr["input_layout_hint"]))
+        handed = handed_on_note(dr)
+        if handed:
+            lines.append(handed)
+        if dr.get("tissue_hint"):           # an .h5ad's; a 10x delivery's is in its layout hint
+            lines.append("⚠ " + str(dr["tissue_hint"]).strip())
 
         cats = dr.get("obs_categoricals") or {}
         if isinstance(cats, dict) and cats:
@@ -5668,6 +5853,35 @@ class ResearchLab:
                     "UMAP for visualization is fine, but de-novo re-clustering to re-derive the cell types is "
                     "redundant here."
                 )
+        bound = self._bound_files_context()
+        if bound:
+            lines.append(bound)
+        return "\n".join(lines)
+
+    def _bound_files_context(self) -> str:
+        """The run's OTHER attached files (feature ②) with the role the user gave each, or ``''``
+        for a single-file run. The profile above describes only the primary; without this the
+        planner never learned that a second upload — a reference atlas, say — existed at all."""
+        records = [r for r in ((self.ctx.decisions or {}).get("datasets") or [])
+                   if isinstance(r, dict) and r.get("name")]
+        if len(records) <= 1:
+            return ""
+        lines = ["Attached files (the profile above describes the PRIMARY only; run_code reads the "
+                 "others through AISCIENTIST_INPUTS, and the other tools read only the primary):"]
+        for r in records:
+            role = str(r.get("role") or "").strip()
+            label = "PRIMARY" if r.get("primary") else (role.upper() if role else "extra file")
+            desc = r.get("description") if isinstance(r.get("description"), dict) else {}
+            gist = str(desc.get("one_line_summary") or desc.get("file_kind") or "").strip()
+            lines.append(f"  - {r['name']} — {label}" + (f": {gist}" if gist else ""))
+        refs = [str(r["name"]) for r in records
+                if not r.get("primary") and str(r.get("role") or "").strip().lower() == "reference"]
+        if refs:
+            lines.append(
+                f"REFERENCE — the user marked {', '.join(refs)} as reference data (e.g. a cell-type "
+                "atlas): plan to use it as comparison evidence for the primary dataset (through "
+                "run_code, AISCIENTIST_REFERENCE), never as the study's own data — do not QC, "
+                "cluster or test it as if it were.")
         return "\n".join(lines)
 
     def _answer_plan_question(self, question: str, agenda: list[str], asked: str) -> str:
@@ -5795,8 +6009,15 @@ class ResearchLab:
         parts = [f"Research question:\n{question}\n"]
         if self._scope.limited:
             parts.append(self._scope.prompt_block() + "\n")
+        if self.config.prior_work:
+            parts.append(self.config.prior_work + "\n")
         if self._guidance:
-            parts.append(f"Follow this research-path guidance when planning:\n{self._guidance}\n")
+            # The guidance lays out a whole pipeline. It used to be handed over as "follow this",
+            # so every plan carried every stage of it whatever the request asked for.
+            parts.append("Follow this research-path guidance when planning. It describes the WHOLE "
+                         "pipeline for this kind of study: plan all of its stages only for a "
+                         "whole-analysis request; for a request that names the analyses it wants, "
+                         "use it for HOW to do the stages you plan.\n" + self._guidance + "\n")
         dataset_ctx = self._dataset_context()
         if dataset_ctx:
             parts.append(dataset_ctx + "\n")
@@ -5841,6 +6062,13 @@ class ResearchLab:
         if kind == "clarify":
             emit({"type": "pi_clarify", "questions": payload})
         else:
+            # How the PI read the request, and what it left for a later message. A revision that
+            # does not restate them keeps the first draft's reading.
+            breadth, later = _parse_plan_extras(raw)
+            if breadth:
+                self._request_breadth = breadth
+            if later or not feedback:
+                self._later = later
             # Split off the PI's SELF-SOURCED disclosure — what it decided on its own knowledge
             # rather than from the guidance or the profile. It is a statement, not work: leaving it
             # in the agenda would hand it to the Scientist as a step to execute. Kept on the lab so
@@ -5888,6 +6116,9 @@ class ResearchLab:
             if not feedback:
                 payload = self._apply_scope(list(payload), emit)
             emit({"type": "pi_agenda", "agenda": payload})
+            if self._later:
+                emit({"type": "plan_later", "later": list(self._later),
+                      "breadth": self._request_breadth})
         return kind, payload
 
     def _apply_scope(self, agenda: list[str], emit: EventFn) -> list[str]:
@@ -6725,6 +6956,10 @@ class ResearchLab:
 
         # 3. Accept the steps that test a hypothesis we hold, are new, and are real analysis.
         existing = {_norm_step(s) for s in plan_steps}
+        # A step the user declined, or did not answer about, is not proposed again after the next
+        # result — neither word for word nor as another test of the same hypothesis.
+        existing |= {_norm_step(p["step"]) for p in self._proposed_steps}
+        turned_down = {p.get("hypothesis_id") for p in self._proposed_steps}
         added: list[str] = []
         for item in (rev.get("new_steps") or [])[:2]:
             if not isinstance(item, dict) or len(added) >= room:
@@ -6736,13 +6971,61 @@ class ResearchLab:
             h = self._ledger.find(str(item.get("hypothesis", "")))
             if h is None:   # orphan step — no hypothesis behind it, so no reason to spend a step on it
                 continue
+            if h.id in turned_down:
+                continue
             existing.add(key)
+            if not self._approve_new_step(text, h, step, emit):
+                turned_down.add(h.id)
+                continue
             added.append(text)
             self._ledger.link_test(h.id, text)
             emit({"type": "step_added", "step": text, "hypothesis_id": h.id,
                   "statement": h.statement, "after_step": step})
         self._new_steps_added += len(added)
         return added
+
+    def _approve_new_step(self, text: str, hypothesis: Any, after_step: str, emit: EventFn) -> bool:
+        """May a step the plan did not contain be added? Only when the user says so.
+
+        The plan the user approved is the plan. Prod run 1e887ed2bf8e ("Run CellQC … quality
+        control report") added an "Ambient rod-leak audit" after CellQC without asking, spent three
+        failed attempts on it, and the user had asked for one step. So: ask through the decision
+        card, and add the step on an explicit yes. A no, no reply, or nobody to ask (bypass mode, a
+        resumed run) leaves the step out and records it, so it can be asked for afterwards. After
+        one unanswered proposal the run stops asking — nobody is there — and only records."""
+        from types import SimpleNamespace
+        why = str(getattr(hypothesis, "statement", "") or "")
+        record = {"step": text, "why": why, "after_step": _step_title(after_step),
+                  "hypothesis_id": getattr(hypothesis, "id", "")}
+
+        def left_out(decision: str) -> bool:
+            self._proposed_steps.append({**record, "decision": decision})
+            emit({"type": "step_proposed", **record, "decision": decision})
+            return False
+
+        if not self.config.new_steps_need_approval:
+            return True
+        ask = self._decision_review
+        if ask is None or self._step_asks_unanswered:
+            return left_out("not_asked")
+        yes, no = "Add this step", "Do not add it"
+        fork = SimpleNamespace(
+            id=f"add-step-{len(self._proposed_steps) + self._new_steps_added + 1}",
+            kind="add_step", decision=True, options=(yes, no), timeout_s=NEW_STEP_ASK_SECONDS,
+            goal=(f"The result of “{record['after_step']}” prompted a step that is NOT in your "
+                  f"plan: {text} — Why: {why or 'no reason given'}. It runs only if you approve "
+                  "it; without a reply it is left out and listed at the end."))
+        decision = ask(fork) or {}
+        if decision.get("timed_out"):
+            self._step_asks_unanswered = True
+            return left_out("unanswered")
+        if str(decision.get("action", "")).lower() == "cancel":
+            return left_out("declined")
+        choice = str(decision.get("choice", "")).strip().lower()
+        if choice == yes.lower() or choice.startswith(_APPROVAL_WORDS):
+            emit({"type": "step_approved", **record})
+            return True
+        return left_out("declined")
 
     def _plan_review(self, question: str, agenda: list[str], emit: EventFn) -> list[str]:
         """PI↔Critic review of the WHOLE draft agenda, BEFORE any step runs — the plan-time complement
@@ -6762,7 +7045,14 @@ class ResearchLab:
         contracts = plan_tool_contracts(agenda, self.scientist.catalog)
         # A limit the user set is not a gap in the plan: both reviewers are told, and the result
         # is filtered by the callers.
-        scope_note = ({"user_scope": self._scope.prompt_block()} if self._scope.limited else {})
+        scope_note: dict[str, Any] = (
+            {"user_scope": self._scope.prompt_block()} if self._scope.limited else {})
+        # How much the request asked for, and what this conversation already did: without them the
+        # review measures the plan against the dataset and puts back what the request left out.
+        if self._request_breadth:
+            scope_note["request_breadth"] = self._request_breadth
+        if self.config.prior_work:
+            scope_note["earlier_work"] = self.config.prior_work
         raw_critic = self._complete([
             {"role": "system", "content": _PLAN_REVIEW_CRITIC_SYSTEM},
             {"role": "user", "content": json.dumps(
@@ -6777,7 +7067,8 @@ class ResearchLab:
                   "preview": " ".join((raw_critic or "").split())[:200]})
             critic = {}
         issues = [str(x).strip() for x in (critic.get("issues") or []) if str(x).strip()]
-        proposed = [str(s).strip() for s in (critic.get("revised_agenda") or []) if str(s).strip()]
+        proposed = retick_tools([str(s).strip() for s in (critic.get("revised_agenda") or [])
+                                 if str(s).strip()], [t.name for t in self.scientist.catalog])
         if not issues and (not proposed or proposed == agenda):
             return agenda   # Critic found nothing wrong → no PI round, plan unchanged
         pi = _parse_verdict(self._complete([
@@ -6787,7 +7078,9 @@ class ResearchLab:
                  "tools_named_in_plan": contracts, **scope_note,
                  "critic_issues": issues, "critic_revised_agenda": proposed})},
         ], role="plan")) or {}
-        final = [str(s).strip() for s in (pi.get("final_agenda") or []) if str(s).strip()]
+        tool_names = [t.name for t in self.scientist.catalog]
+        final = retick_tools([str(s).strip() for s in (pi.get("final_agenda") or [])
+                              if str(s).strip()], tool_names)
         if not final or len(final) > self.config.max_steps:
             return agenda   # never worse than the draft
         # Deterministic floor on how much a review may remove: it may HALVE a plan, not gut one.
@@ -6823,14 +7116,15 @@ class ResearchLab:
                 {"role": "system", "content": _PLAN_REVIEW_PI_SYSTEM},
                 {"role": "user", "content": json.dumps(
                     {"research_question": question, "dataset_profile": profile,
-                     "draft_agenda": agenda, "critic_issues": issues,
+                     "draft_agenda": agenda, **scope_note, "critic_issues": issues,
                      "critic_revised_agenda": proposed,
                      "unresolved": f"The Critic reported that the plan is missing an analysis "
                                    f"that none of your steps computes. Add a step that calls one "
                                    f"of {list(_missing)}, keeping every other step you already "
                                    f"decided on."})},
             ], role="plan")) or {}
-            second = [str(x).strip() for x in (retry.get("final_agenda") or []) if str(x).strip()]
+            second = retick_tools([str(x).strip() for x in (retry.get("final_agenda") or [])
+                                   if str(x).strip()], tool_names)
             if second and len(second) <= self.config.max_steps and _names_tool(second, _missing):
                 final = second
             elif _names_tool(proposed, _missing) and len(proposed) <= self.config.max_steps:

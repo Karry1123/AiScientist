@@ -26,9 +26,9 @@ const state = {
   run: null,            // {text, thinking, feed:[], status} or null when idle
   streamDom: null,      // {body, think, thinkBody, feed} DOM refs while owner chat visible
   presets: {},                 // key -> {key, label, prompt, tools} from /api/presets (preset pipelines)
-  presetOrder: [],             // preset-pipeline keys in load order (for the Advanced picker)
+  presetOrder: [],             // preset-pipeline keys in load order (for the Pipelines & skills picker)
   skills: {},                  // name -> {name, summary} from /api/skills (atomic skills)
-  skillOrder: [],              // atomic-skill names in load order (for the Advanced required-skills list)
+  skillOrder: [],              // atomic-skill names in load order (for the Pipelines & skills picker)
   datasets: [],                // uploaded files/folders this session: {name, path, kind}
   serverRoots: [],             // server folders a dataset can be bound from by path (empty = off)
   serverOfferDismissed: new Set(),   // pasted server paths the user said "Not now" to
@@ -37,6 +37,8 @@ const state = {
   boundPaths: [],              // the BIND-SET (feature ②): the server paths of every data file attached
                                // for the next run (a VCF + a BED panel + a 2nd VCF). Ordered by attach;
                                // the server re-ranks to pick the primary. Posted as `datasets`.
+  boundRoles: {},              // path -> role the user set on a bound file ("reference" = comparison
+                               // data such as a cell-type atlas; never picked as the primary).
   datasetPath: null,           // the PRIMARY of the bind-set (highest-ranked) — mirrored into the hidden
                                // datasetInput and posted as the legacy `dataset_path` for back-compat.
   caseNote: null,              // the attached clinical description: {name, text} — the SECOND
@@ -47,6 +49,9 @@ const state = {
   leftAutoCollapsed: false,    // collapse the connect panel once, on first ready
   planPending: false,          // a PI plan/clarify is awaiting the user's decision
   planRevisedSteps: [],        // 1-based step numbers this redraft actually changed (server-sent)
+  planDoc: null,               // the plan as a document {yaml, steps} when the server sends one
+  planProblems: [],            // why the last edit of that document was refused
+  planDraftYaml: "",           // the text of an edit just sent, kept so a refused edit is not lost
   planStatusEl: null,          // the resolved plan card's status line, updated as the PI works
 };
 
@@ -495,7 +500,7 @@ async function loadPresets() {
     state.presetOrder = [];
     for (const p of (data.presets || [])) { state.presets[p.key] = p; state.presetOrder.push(p.key); }
   } catch { /* presets are optional */ }
-  renderPresetList($("presetSearch") ? $("presetSearch").value : "");
+  renderMethods();
 }
 
 async function loadSkills() {
@@ -505,86 +510,223 @@ async function loadSkills() {
     state.skillOrder = [];
     for (const s of (data.skills || [])) { state.skills[s.name] = s; state.skillOrder.push(s.name); }
   } catch { /* skills are optional */ }
-  renderSkillList();
+  renderMethods();
 }
 
-// Render the atomic-skill checklist (Advanced panel). Ticking a skill REQUIRES it — the run must
-// apply that capability. Skills compose (pick several); none ticked = the agent fetches on demand.
-function renderSkillList() {
-  const box = $("skillList");
-  if (!box) return;
-  const s = activeSession();
-  const sel = new Set((s && s.skillKeys) || []);
-  box.innerHTML = "";
-  const names = state.skillOrder || [];
-  if (!names.length) { box.innerHTML = '<div class="preset-empty">No atomic skills.</div>'; return; }
-  for (const name of names) {
-    const sk = state.skills[name] || {};
-    const row = document.createElement("label");
-    row.className = "preset-item" + (sel.has(name) ? " checked" : "");
-    row.title = sk.summary || "";
-    const cb = document.createElement("input");
-    cb.type = "checkbox"; cb.value = name; cb.checked = sel.has(name);
-    cb.addEventListener("change", () => onSkillToggle(name, cb.checked));
-    const label = document.createElement("span");
-    label.className = "preset-item-label";
-    label.textContent = name.replace(/\.py$/, "").replace(/_/g, " ");
-    row.appendChild(cb); row.appendChild(label);
-    box.appendChild(row);
+// ---- pipelines & skills picker ------------------------------------------------------------------
+// By default the PI picks the best-fit preset pipeline and the agent fetches skills on demand. This
+// picker REQUIRES some for the active chat: a ticked pipeline steers every plan in it, a ticked
+// skill must be applied. It opens as a sheet so each entry can say everything it is — the whole
+// description, the tools a pipeline composes, the protocol text — and what is ticked shows as chips
+// above the composer, so a chat's requirements are visible without opening anything. (It replaces
+// an inline "Advanced" disclosure whose two 176 px lists cut all of that off.)
+const METHOD_DATA_TYPES = { scrna: "scRNA-seq", variants: "Variants (VCF)" };
+
+function methodPlain(text) {
+  return String(text == null ? "" : text).replace(/\*\*/g, "").replace(/`/g, "").trim();
+}
+
+function methodName(key) {
+  return String(key || "").replace(/\.py$/, "").replace(/_/g, " ");
+}
+
+// A protocol file is hard-wrapped at about 90 columns. Shown as it is, in a box of another width,
+// every line breaks twice. So the lines of one paragraph or list item are joined, and only the
+// breaks between blocks (blank lines, list items, headings, table rows, code) are kept.
+function methodUnwrap(text) {
+  const out = [];
+  let fence = false;
+  const block = /^\s*(?:[-*+] |\d+[.)] |#{1,6} |\||>)/;
+  for (const line of String(text == null ? "" : text).split("\n")) {
+    if (/^\s*```/.test(line)) { fence = !fence; out.push(line); continue; }
+    const prev = out[out.length - 1];
+    const fresh = fence || !line.trim() || block.test(line) || prev === undefined || !prev.trim()
+      || /^\s*(?:#{1,6} |\||```)/.test(prev);
+    if (fresh) out.push(line);
+    else out[out.length - 1] = prev.replace(/\s+$/, "") + " " + line.trim();
   }
+  return out.join("\n");
 }
 
-// Require specific atomic skills for this chat's runs. Persisted per-chat (localStorage) like the
-// mode; the run sends the checked names and the plan must apply each.
-function onSkillToggle(name, checked) {
+function methodPicks() {
+  const s = activeSession();
+  return { presets: new Set((s && s.presetKeys) || []), skills: new Set((s && s.skillKeys) || []) };
+}
+
+// The entries of one tab that match the search, as plain records.
+function methodEntries(tab, needle) {
+  const q = String(needle || "").trim().toLowerCase();
+  const hit = (text) => !q || text.toLowerCase().includes(q);
+  if (tab === "skills") {
+    return (state.skillOrder || []).map((name) => state.skills[name] || { name })
+      .filter((sk) => hit(`${sk.name} ${methodName(sk.name)} ${sk.summary || ""} ${sk.category || ""}`))
+      .map((sk) => ({ kind: "skill", key: sk.name, title: methodName(sk.name), text: methodPlain(sk.summary),
+                      badge: sk.category || "", tools: [], protocol: false }));
+  }
+  return (state.presetOrder || []).map((k) => state.presets[k] || { key: k })
+    .filter((pp) => hit(`${pp.key} ${pp.label || ""} ${(pp.tools || []).join(" ")} ${pp.data_type || ""}`))
+    .map((pp) => ({ kind: "preset", key: pp.key, title: methodPlain(pp.label) || methodName(pp.key), text: "",
+                    badge: METHOD_DATA_TYPES[pp.data_type] || pp.data_type || "",
+                    tools: Array.isArray(pp.tools) ? pp.tools : [], protocol: !!pp.prompt }));
+}
+
+function methodRowsHtml(tab, needle, picks) {
+  const entries = methodEntries(tab, needle);
+  if (!entries.length) {
+    return `<div class="method-empty">${needle ? "Nothing matches that search." : "Nothing to show here yet."}</div>`;
+  }
+  const chosen = tab === "skills" ? picks.skills : picks.presets;
+  return entries.map((e) => {
+    const on = chosen.has(e.key);
+    return `<div class="method-row${on ? " checked" : ""}" data-kind="${e.kind}" data-key="${escapeHtml(e.key)}">`
+      + `<label class="method-pick"><input type="checkbox"${on ? " checked" : ""} />`
+      + `<span class="method-title">${escapeHtml(e.title)}</span></label>`
+      + (e.text ? `<div class="method-text">${escapeHtml(e.text)}</div>` : "")
+      + `<div class="method-meta"><code class="method-key">${escapeHtml(e.key)}</code>`
+      + (e.badge ? `<span class="method-badge">${escapeHtml(e.badge)}</span>` : "")
+      + e.tools.map((t) => `<span class="method-tool">${escapeHtml(t)}</span>`).join("")
+      + `</div>`
+      // Filled in when opened (renderMethods): a protocol is a few kB of text per pipeline.
+      + (e.protocol ? `<details class="method-protocol"><summary>Read the protocol</summary>`
+                      + `<div class="method-protocol-body"></div></details>` : "")
+      + `</div>`;
+  }).join("");
+}
+
+function methodSummaryText(picks) {
+  const p = picks.presets.size, k = picks.skills.size;
+  if (!p && !k) return "Nothing required — the PI chooses the pipeline, and skills are fetched on demand.";
+  const bits = [];
+  if (p) bits.push(`${p} pipeline${p === 1 ? "" : "s"}`);
+  if (k) bits.push(`${k} skill${k === 1 ? "" : "s"}`);
+  return `${bits.join(" and ")} required in this chat.`;
+}
+
+function methodChipsHtml(picks) {
+  const chip = (kind, key, icon, title) =>
+    `<span class="method-chip" title="${escapeHtml(title)}">`
+    + `<span class="material-symbols-outlined msym" aria-hidden="true">${icon}</span>`
+    + `<span class="method-chip-name">${escapeHtml(methodName(key))}</span>`
+    + `<button type="button" class="method-chip-x" data-kind="${kind}" data-key="${escapeHtml(key)}" `
+    + `aria-label="Stop requiring ${escapeHtml(methodName(key))}">×</button></span>`;
+  const out = [];
+  for (const k of picks.presets) out.push(chip("preset", k, "account_tree", methodPlain((state.presets[k] || {}).label) || k));
+  for (const k of picks.skills) out.push(chip("skill", k, "extension", methodPlain((state.skills[k] || {}).summary) || k));
+  return out.length ? `<span class="method-chips-label">Required</span>` + out.join("") : "";
+}
+
+// Paint everything that shows the active chat's picks: the button's count, the chips, and — when
+// the sheet is open — its list, tab counts and summary. A tick only re-marks the rows that are
+// there (`rebuild` false): rebuilding the list would close the protocol the person is reading.
+function renderMethods(rebuild = true) {
+  const picks = methodPicks();
+  const n = picks.presets.size + picks.skills.size;
+  const count = $("methodsCount");
+  if (count) { count.textContent = String(n); count.classList.toggle("hidden", !n); }
+  const chips = $("methodChips");
+  if (chips) { chips.innerHTML = methodChipsHtml(picks); chips.classList.toggle("hidden", !n); }
+  const modal = $("methodsModal");
+  if (!modal || modal.classList.contains("hidden")) return;
+  const tab = state.methodsTab || "pipelines";
+  for (const btn of modal.querySelectorAll(".methods-tabs [data-tab]")) {
+    const mine = btn.dataset.tab === tab;
+    btn.classList.toggle("active", mine);
+    btn.setAttribute("aria-selected", mine ? "true" : "false");
+    const total = btn.dataset.tab === "skills" ? (state.skillOrder || []).length : (state.presetOrder || []).length;
+    const picked = btn.dataset.tab === "skills" ? picks.skills.size : picks.presets.size;
+    btn.querySelector(".methods-tab-n").textContent = picked ? `${picked}/${total}` : String(total);
+  }
+  const list = $("methodsList");
+  if (rebuild) {
+    list.innerHTML = methodRowsHtml(tab, $("methodsSearch").value, picks);
+  } else {
+    for (const row of list.querySelectorAll(".method-row")) {
+      const on = (row.dataset.kind === "skill" ? picks.skills : picks.presets).has(row.dataset.key);
+      row.classList.toggle("checked", on);
+      row.querySelector('input[type="checkbox"]').checked = on;
+    }
+  }
+  $("methodsSummary").textContent = methodSummaryText(picks);
+  $("methodsClear").disabled = !n;
+}
+
+function openMethods(tab) {
+  if (tab) state.methodsTab = tab;
+  $("methodsModal").classList.remove("hidden");
+  $("methodsSearch").value = "";
+  renderMethods();
+  $("methodsSearch").focus();
+}
+
+function closeMethods() {
+  $("methodsModal").classList.add("hidden");
+}
+
+// Require (or stop requiring) one pipeline or skill for this chat. Persisted per chat like the
+// mode; the run sends the keys, and the plan must follow each pipeline and apply each skill.
+function setMethodPick(kind, key, checked) {
   const s = activeSession();
   if (!s) return;
-  const set = new Set(s.skillKeys || []);
-  checked ? set.add(name) : set.delete(name);
-  s.skillKeys = [...set];
-  const box = $("skillList");
-  if (box) {
-    const row = [...box.querySelectorAll(".preset-item")].find((r) => r.querySelector("input").value === name);
-    if (row) row.classList.toggle("checked", checked);
-  }
+  const field = kind === "skill" ? "skillKeys" : "presetKeys";
+  const set = new Set(s[field] || []);
+  checked ? set.add(key) : set.delete(key);
+  s[field] = [...set];
+  if (kind !== "skill") saveSessionContext(s);   // pipelines are part of the stored conversation
   persistSessions();
+  renderMethods(false);
 }
 
-// Render the skill checklist (Advanced panel), filtered by the search box `q`, ticking the skills
-// the active chat has selected. Ticking FORCES a skill into this conversation's plan; none ticked =
-// the PI auto-selects. Multiple ticks are composed server-side into one guidance block.
-function renderPresetList(q) {
-  const box = $("presetList");
-  if (!box) return;
+function clearMethodPicks() {
   const s = activeSession();
-  const sel = new Set((s && s.presetKeys) || []);
-  const needle = (q || "").trim().toLowerCase();
-  const keys = (state.presetOrder || []).filter((k) => {
-    if (!needle) return true;
-    const p = state.presets[k] || {};
-    return (k + " " + (p.label || "") + " " + ((p.tools || []).join(" "))).toLowerCase().includes(needle);
+  if (!s) return;
+  s.presetKeys = [];
+  s.skillKeys = [];
+  saveSessionContext(s);
+  persistSessions();
+  renderMethods(false);
+}
+
+function wireMethods() {
+  const modal = $("methodsModal");
+  if (!modal) return;
+  $("methodsBtn").addEventListener("click", () => openMethods());
+  $("methodsClose").addEventListener("click", closeMethods);
+  $("methodsDone").addEventListener("click", closeMethods);
+  $("methodsClear").addEventListener("click", clearMethodPicks);
+  modal.addEventListener("click", (e) => { if (e.target === modal) closeMethods(); });
+  document.addEventListener("keydown", (e) => {
+    if (e.key === "Escape" && !modal.classList.contains("hidden")) closeMethods();
   });
-  box.innerHTML = "";
-  if (!keys.length) { box.innerHTML = '<div class="preset-empty">No matching preset pipelines.</div>'; return; }
-  for (const k of keys) {
-    const p = state.presets[k];
-    const row = document.createElement("label");
-    row.className = "preset-item" + (sel.has(k) ? " checked" : "");
-    const cb = document.createElement("input");
-    cb.type = "checkbox"; cb.value = k; cb.checked = sel.has(k);
-    cb.addEventListener("change", () => onPresetToggle(k, cb.checked));
-    const label = document.createElement("span");
-    label.className = "preset-item-label"; label.textContent = p.label || k;
-    row.appendChild(cb); row.appendChild(label);
-    box.appendChild(row);
+  $("methodsSearch").addEventListener("input", () => renderMethods());
+  for (const btn of modal.querySelectorAll(".methods-tabs [data-tab]")) {
+    btn.addEventListener("click", () => { state.methodsTab = btn.dataset.tab; renderMethods(); });
   }
+  const list = $("methodsList");
+  list.addEventListener("change", (e) => {
+    const row = e.target.closest(".method-row");
+    if (row && e.target.matches('input[type="checkbox"]')) setMethodPick(row.dataset.kind, row.dataset.key, e.target.checked);
+  });
+  // `toggle` does not bubble, hence the capture. The protocol is rendered the first time it opens.
+  list.addEventListener("toggle", (e) => {
+    const box = e.target;
+    if (!box.matches || !box.matches(".method-protocol") || !box.open) return;
+    const body = box.querySelector(".method-protocol-body");
+    const row = box.closest(".method-row");
+    if (body && !body.dataset.done && row) {
+      body.innerHTML = renderMarkdown(methodUnwrap((state.presets[row.dataset.key] || {}).prompt));
+      body.dataset.done = "1";
+    }
+  }, true);
+  $("methodChips").addEventListener("click", (e) => {
+    const x = e.target.closest(".method-chip-x");
+    if (x) setMethodPick(x.dataset.kind, x.dataset.key, false);
+  });
 }
 
 // Reflect the active chat's saved research path into the controls.
 function syncPresetUI() {
   // Reflect the active chat's picks (preset pipelines + required skills) and run mode into the UI.
-  renderPresetList($("presetSearch") ? $("presetSearch").value : "");
-  renderSkillList();
+  renderMethods();
   const s = activeSession();
   const modeSel = $("modeSelect");
   if (modeSel) modeSel.value = (s && s.mode) || "auto";
@@ -621,7 +763,7 @@ function applyRouteUI() {
   const corpus = route === "corpus";
   // Neither the fast path nor the corpus scan has a plan to review or a team to convene.
   const noLab = chat || corpus;
-  for (const id of ["modeSelect", "planMode", "autonomousMode", "saveResults"]) {
+  for (const id of ["modeSelect", "planMode", "autonomousMode", "saveResults", "methodsBtn"]) {
     const el = $(id);
     if (el) { el.disabled = noLab; if (el.closest("label")) el.closest("label").classList.toggle("dimmed", noLab); }
   }
@@ -666,21 +808,6 @@ function leaveCorpusRoute(s) {
 // Optional override: force specific research path(s) (the PI auto-selects by default). We persist
 // only the KEYS — each skill's guidance body is PI-internal and never shown/edited; to refine the
 // plan the user talks to the PI in chat (plan mode), not by editing text.
-function onPresetToggle(key, checked) {
-  const s = activeSession();
-  if (!s) return;
-  const set = new Set(s.presetKeys || []);
-  checked ? set.add(key) : set.delete(key);
-  s.presetKeys = [...set];
-  const box = $("presetList");   // update the row's checked styling without a full re-render
-  if (box) {
-    const row = [...box.querySelectorAll(".preset-item")].find((r) => r.querySelector("input").value === key);
-    if (row) row.classList.toggle("checked", checked);
-  }
-  saveSessionContext(s);
-  persistSessions();
-}
-
 // Persist the research-path context onto the server conversation (debounced), so it
 // survives a reload/device change — it's part of the chat's stored context.
 let _ctxSaveTimer = null;
@@ -2624,7 +2751,12 @@ function handleWsMessage(msg) {
       break;
     case "duo_prompt": showDuoPanel(msg.prompt); break;
     case "duo_done": hideDuoPanel(); break;
-    case "plan_prompt": state.planRevisedSteps = msg.revised || []; showPlanPanel(msg.agenda); break;
+    case "plan_prompt":
+      state.planRevisedSteps = msg.revised || [];
+      state.planDoc = msg.plan || null;
+      state.planProblems = msg.problems || [];
+      showPlanPanel(msg.agenda);
+      break;
     case "plan_clarify": showClarify(msg.questions); break;
     case "decision_prompt": showDecision(msg.goal, msg.options); break;
     case "plan_done": hidePlanPanel(); break;
@@ -2904,7 +3036,7 @@ async function sendChat(e) {
   // backward-compatible (the server treats `dataset_path` as the primary when `datasets` is absent).
   const datasets = state.boundPaths.map((p) => {
     const d = state.datasets.find((x) => x.path === p) || {};
-    return { path: p, name: d.name || p.split("/").pop() };
+    return { path: p, name: d.name || p.split("/").pop(), role: state.boundRoles[p] || null };
   });
   const autonomous = !!($("autonomousMode") && $("autonomousMode").checked);
   // Bypass mode overrides plan review — don't also send plan_mode=true (avoids a stale plan card).
@@ -2966,52 +3098,180 @@ function planCardShell() {
   return el;
 }
 
+// A step arrives as `**Short title** — detailed prose`; it is shown as a title with the prose under
+// it, so the plan scans as a pipeline (titles) with detail on demand.
+//
+// Two shapes had to be tolerated rather than assumed. A step may carry its own ordinal
+// ("1. **QC & normalization** — …") when a model echoed the numbered plan back on the revision
+// path; read with `**` anchored to the very start, that step fell through to the untitled branch
+// and rendered as a BARE "1" heading followed by raw markdown — the reviewer's only visible sign
+// that a step had changed was that it looked broken (Ziyao, plan_mode_report_v2_5, 6/6 on that
+// path). The server now strips the ordinal, and this tolerates it anyway so an older server or a
+// fallback plan can't reproduce the bug. And a genuinely untitled step gets its FIRST CLAUSE as
+// the title instead of nothing, so no step is ever a number on its own.
+function planStepParts(text) {
+  const body = String(text == null ? "" : text).replace(/^\(?\d{1,2}[.)、]\s+/, "").trim();
+  const m = /^\*\*(.+?)\*\*\s*[—–:-]+\s*([\s\S]*)$/.exec(body);
+  if (m) return { title: m[1], body: m[2] };
+  const lead = /^(.{4,70}?)(?:\s+[—–-]\s+|[.:]\s+)([\s\S]*)$/.exec(body);
+  return lead ? { title: lead[1], body: lead[2] } : { title: body || "(empty step)", body: "" };
+}
+
+function planSettingText(value) {
+  if (Array.isArray(value)) return value.map(planSettingText).join(", ");
+  if (value === null || value === undefined) return "none";
+  return String(value);
+}
+
+function planRunsOnText(where) {
+  const w = String(where || "");
+  if (w.startsWith("gpu:")) return "GPU job on HPC3";
+  if (w.startsWith("hpc:")) return "Slurm job on HPC3";
+  if (w === "inprocess") return "Runs on the AiScientist server";
+  return "";
+}
+
+function planIcon(name) {
+  return `<span class="material-symbols-outlined msym" aria-hidden="true">${name}</span>`;
+}
+
+// One step of the card. `step` is its entry in the plan document (tool, settings, where it runs)
+// when the server sent one; without it the step is its title and prose alone.
+function planStepHtml(text, n, step, revised, showWhere) {
+  const parts = planStepParts(text);
+  const settings = (step && step.settings) || {};
+  const chips = Object.keys(settings).map((k) =>
+    `<span class="plan-setting" title="Passed to the tool exactly as written">`
+    + `<span class="plan-setting-k">${escapeHtml(k)}</span>`
+    + `<span class="plan-setting-v">${escapeHtml(planSettingText(settings[k]))}</span></span>`).join("");
+  const where = showWhere ? planRunsOnText(step && step.runs_on) : "";
+  const meta = (chips || where)
+    ? `<div class="plan-step-meta">${chips}`
+      + (where ? `<span class="plan-where">${planIcon(where.startsWith("Runs on") ? "dns" : "memory")}${escapeHtml(where)}</span>` : "")
+      + `</div>`
+    : "";
+  return `<li class="plan-step${revised ? " revised" : ""}">`
+    + `<span class="plan-step-num">${n}</span>`
+    + `<div class="plan-step-main">`
+    + `<div class="plan-step-head"><span class="plan-step-title">${renderMarkdown(parts.title)}</span>`
+    + (revised ? `<span class="plan-step-flag">Revised</span>` : "")
+    + (step && step.tool ? `<code class="plan-step-tool">${escapeHtml(step.tool)}</code>` : "")
+    + `</div>`
+    + (parts.body ? `<div class="plan-step-body">${renderMarkdown(parts.body)}</div>` : "")
+    + meta + `</div></li>`;
+}
+
+// The whole card. Which steps the last revision touched comes from the server (it has just applied
+// the edit), so "what did my change actually do?" is answered on the card instead of by diffing two
+// plans by eye.
+function planCardHtml(agenda, doc, revisedSteps) {
+  const docSteps = (doc && doc.steps) || [];
+  const revised = new Set((revisedSteps || []).map(Number));
+  const fixed = docSteps.reduce((n, st) => n + Object.keys((st && st.settings) || {}).length, 0);
+  // Where the steps run is said once, under the title, when it is the same for all of them; a
+  // step only carries its own line when the plan mixes places.
+  const places = [...new Set(docSteps.map((st) => planRunsOnText(st && st.runs_on)).filter(Boolean))];
+  const onePlace = places.length === 1 ? places[0] : "";
+  const sub = `${agenda.length} step${agenda.length === 1 ? "" : "s"}`
+    + (fixed ? ` · ${fixed} setting${fixed === 1 ? "" : "s"} passed to the tools as written` : "")
+    + (onePlace ? ` · ${onePlace.startsWith("Runs") ? onePlace.toLowerCase() : "runs as " + onePlace.replace(/ job /, " jobs ")}` : "");
+  const note = revised.size
+    ? `<div class="plan-note">${planIcon("edit")}<span>Step${revised.size > 1 ? "s" : ""} `
+      + `${[...revised].sort((x, y) => x - y).join(", ")} ${revised.size > 1 ? "were" : "was"} revised — `
+      + `every other step is unchanged.</span></div>`
+    : "";
+  return `<div class="plan-head"><span class="plan-head-icon">${planIcon("checklist")}</span>`
+    + `<div><div class="plan-title">Proposed plan</div><div class="plan-sub">${sub}</div></div></div>`
+    + note
+    + `<ol class="plan-steps">`
+    + agenda.map((s, i) => planStepHtml(s, i + 1, docSteps[i], revised.has(i + 1), !onePlace)).join("")
+    + `</ol>`
+    + planEditorHtml(doc)
+    + `<div class="plan-actions-row">`
+    + `<button class="primary" data-plan="approve">${planIcon("play_arrow")}Run this plan</button>`
+    + (doc && doc.yaml ? `<button class="secondary" data-plan="yaml">${planIcon("data_object")}<span>Edit as YAML</span></button>` : "")
+    + `<button class="secondary quiet" data-plan="cancel">Cancel</button>`
+    + `<span class="plan-actions-hint">or reply below to change it</span></div>`;
+}
+
+// The plan document's editor. Present only when the server sends the plan as a document (`plan`
+// on the plan prompt); a server that does not gets the card without it. An edit is applied by the
+// server's code, not by a model: a step that was not touched cannot change, and an edit that cannot
+// be applied is refused with its reasons while the text that was typed stays in the box.
+function planEditorHtml(doc) {
+  if (!doc || !doc.yaml) return "";
+  const problems = state.planProblems || [];
+  // A refused edit reopens with what was typed, not with the plan it failed to change.
+  const text = (problems.length && state.planDraftYaml) ? state.planDraftYaml : doc.yaml;
+  const rows = Math.max(8, Math.min(26, text.split("\n").length + 1));
+  const banner = problems.length
+    ? `<div class="plan-yaml-problems">${planIcon("error")}<div><strong>Your edit was not applied — the plan is unchanged.</strong>`
+      + `<ul>${problems.map((x) => `<li>${escapeHtml(x)}</li>`).join("")}</ul></div></div>`
+    : "";
+  return `<div class="plan-yaml${problems.length ? "" : " hidden"}">`
+    + `<div class="plan-yaml-bar"><span class="plan-yaml-file">${planIcon("data_object")}plan.yaml</span>`
+    + `<span class="plan-yaml-tip">Change a setting, reword, remove, reorder or add a step. `
+    + `Your edit is applied exactly as written; nothing else in the plan changes.</span></div>`
+    + banner
+    + `<textarea class="plan-yaml-text" rows="${rows}" spellcheck="false" autocapitalize="off" `
+    + `autocomplete="off" aria-label="The plan as YAML">${escapeHtml(text)}</textarea>`
+    + `<div class="plan-yaml-actions"><button class="secondary small" data-plan="edit" disabled>Apply edits</button>`
+    + `<button class="secondary quiet small" data-plan="reset">Reset</button></div></div>`;
+}
+
 function showPlanPanel(agenda) {
   const el = planCardShell();
+  el.classList.add("plan-sheet");
   state.planAgenda = agenda || [];
-  // Steps arrive as `**Short title** — detailed prose`. Render each as its own heading + body so
-  // the plan scans as a pipeline (titles) with detail on demand (prose), instead of one dense
-  // numbered wall.
-  //
-  // Two shapes had to be tolerated rather than assumed. A step may carry its own ordinal
-  // ("1. **QC & normalization** — …") when a model echoed the numbered plan back on the revision
-  // path; the old regex anchored `**` to the very start, so that step fell through to the untitled
-  // branch and rendered as a BARE "1" heading followed by raw markdown — the reviewer's only
-  // visible sign that a step had changed was that it looked broken (Ziyao, plan_mode_report_v2_5,
-  // 6/6 on that path). The server now strips the ordinal, and this tolerates it anyway so an older
-  // server or a fallback plan can't reproduce the bug. And a genuinely untitled step gets its
-  // FIRST CLAUSE as the heading instead of nothing, so no step is ever a number on its own.
-  // Which steps this revision touched, so "what did my change actually do?" is answerable from the
-  // card. Before this the plan simply came back different: the server knew the revised set (it had
-  // just applied a single-step patch) and said so only in the collapsed technical feed, so the
-  // reviewer's only route to the answer was diffing two plans by eye.
-  const revised = new Set((state.planRevisedSteps || []).map(Number));
-  const stepMd = state.planAgenda.map((s, i) => {
-    const body = String(s == null ? "" : s).replace(/^\(?\d{1,2}[.)、]\s+/, "").trim();
-    const mark = revised.has(i + 1) ? " ✏️" : "";
-    const m = /^\*\*(.+?)\*\*\s*[—–:-]+\s*([\s\S]*)$/.exec(body);
-    if (m) return `### ${i + 1} · ${m[1]}${mark}\n\n${m[2]}`;
-    // No bold title: take a short leading clause as the heading so the step still scans.
-    const lead = /^(.{4,70}?)(?:\s+[—–-]\s+|[.:]\s+)([\s\S]*)$/.exec(body);
-    return lead ? `### ${i + 1} · ${lead[1]}${mark}\n\n${lead[2]}`
-                : `### ${i + 1} · ${body || "(empty step)"}${mark}`;
-  }).join("\n\n");
-  const badge = revised.size
-    ? `\n\n> ✏️ Revised step${revised.size > 1 ? "s" : ""} `
-      + `${[...revised].sort((a, b) => a - b).join(", ")} only — every other step is unchanged.`
-    : "";
-  const md = "## 📋 Proposed plan" + badge + "\n\n" + stepMd;
-  el.innerHTML = renderMarkdown(md) +
-    `<div class="plan-actions-row">
-       <button class="primary small" data-plan="approve">▶ Run this plan</button>
-       <button class="ghost small" data-plan="cancel">Cancel</button>
-       <span class="plan-actions-hint">…or type changes below to refine it</span>
-     </div>`;
+  el.innerHTML = planCardHtml(state.planAgenda, state.planDoc, state.planRevisedSteps);
   el.querySelector('[data-plan="approve"]').addEventListener("click", () => submitPlan("approve"));
   el.querySelector('[data-plan="cancel"]').addEventListener("click", () => submitPlan("cancel"));
+  wirePlanEditor(el);
   $("chatInput").placeholder = "Tell the PI what to change (e.g. 'drop the enrichment step')…";
   $("chatStream").scrollTop = $("chatStream").scrollHeight;
   updateComposerButton();
+}
+
+function wirePlanEditor(el) {
+  const panel = el.querySelector(".plan-yaml");
+  if (!panel) return;
+  const box = panel.querySelector(".plan-yaml-text");
+  const original = state.planDoc.yaml;
+  const apply = panel.querySelector('[data-plan="edit"]');
+  const approve = el.querySelector('[data-plan="approve"]');
+  const toggle = el.querySelector('[data-plan="yaml"]');
+  const label = () => { toggle.querySelector("span:last-child").textContent = panel.classList.contains("hidden") ? "Edit as YAML" : "Hide YAML"; };
+  // While the box holds an edit that has not been applied, "Run this plan" would run the plan
+  // WITHOUT it. So the edit becomes the primary action and Run waits for Apply or Reset.
+  const sync = () => {
+    const dirty = !!box.value.trim() && box.value.trim() !== original.trim();
+    apply.disabled = !dirty;
+    apply.classList.toggle("primary", dirty);
+    apply.classList.toggle("secondary", !dirty);
+    approve.disabled = dirty;
+    approve.title = dirty ? "Apply or reset your edit first" : "";
+  };
+  toggle.addEventListener("click", () => {
+    panel.classList.toggle("hidden");
+    label();
+    if (!panel.classList.contains("hidden")) box.focus();
+  });
+  box.addEventListener("input", sync);
+  // Tab indents (YAML is indentation) instead of leaving the box.
+  box.addEventListener("keydown", (ev) => {
+    if (ev.key !== "Tab" || ev.shiftKey || ev.altKey || ev.ctrlKey || ev.metaKey) return;
+    ev.preventDefault();
+    box.setRangeText("  ", box.selectionStart, box.selectionEnd, "end");
+    sync();
+  });
+  apply.addEventListener("click", () => submitPlan("edit", "", box.value));
+  panel.querySelector('[data-plan="reset"]').addEventListener("click", () => {
+    box.value = original;
+    state.planDraftYaml = "";
+    sync();
+  });
+  label();
+  sync();
 }
 
 function showClarify(questions) {
@@ -3103,6 +3363,10 @@ async function submitDecision(choice) {
 // approval persist the plan to history so it survives a reload.
 function finalizePlanCard(note, persistMarkdown) {
   if (state.planCardEl) {
+    // A resolved card is a record: its editor goes with its buttons, or "Apply edits" would stay
+    // clickable on a plan that is no longer waiting for anything.
+    const editor = state.planCardEl.querySelector(".plan-yaml");
+    if (editor) editor.remove();
     const row = state.planCardEl.querySelector(".plan-actions-row");
     if (row) row.innerHTML = `<span class="plan-actions-status">${escapeHtml(note)}</span>`;
     // Keep a handle to the STATUS line after the card is resolved. The card is the only thing on
@@ -3131,12 +3395,18 @@ function hidePlanPanel() {
   updateComposerButton();
 }
 
-// action: "approve" | "revise" | "cancel"; feedback only for "revise".
-async function submitPlan(action, feedback) {
+// action: "approve" | "revise" | "edit" | "cancel"; feedback only for "revise", planYaml only
+// for "edit" (the plan document as the user edited it).
+async function submitPlan(action, feedback, planYaml) {
   if (!state.connectionId) return;
+  // The approved document is saved with the plan: it is what the run was held to.
+  const docMd = (state.planDoc && state.planDoc.yaml)
+    ? "\n\n**Approved plan document**\n\n```yaml\n" + state.planDoc.yaml.trim() + "\n```"
+    : "";
   const agendaMd = (state.planAgenda && state.planAgenda.length)
-    ? "## 📋 Research plan\n\n" + state.planAgenda.map((s, i) => `${i + 1}. ${s}`).join("\n")
+    ? "## 📋 Research plan\n\n" + state.planAgenda.map((s, i) => `${i + 1}. ${s}`).join("\n") + docMd
     : null;
+  state.planDraftYaml = action === "edit" ? (planYaml || "") : "";
   if (action === "approve") {
     finalizePlanCard("▶ Approved — running…", agendaMd);
     // Re-anchor the live bubble below the just-approved plan so the run's activity
@@ -3145,6 +3415,7 @@ async function submitPlan(action, feedback) {
     repaintWorking();
   }
   else if (action === "cancel") finalizePlanCard("✕ Cancelled");
+  else if (action === "edit") finalizePlanCard("✎ Applying your edit…");
   // Neutral until the server says which it was: a reply may be a QUESTION (answered, plan
   // untouched) or a CHANGE (re-planned). Claiming "re-planning" up front was wrong for every
   // question, and stayed wrong on screen for the whole 10-20 min the answer took.
@@ -3155,10 +3426,11 @@ async function submitPlan(action, feedback) {
   try {
     await fetch("/api/lab/plan", {
       method: "POST", headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ connection_id: state.connectionId, conversation_id: state.runSessionId || state.activeId, action, feedback: feedback || "" }),
+      body: JSON.stringify({ connection_id: state.connectionId, conversation_id: state.runSessionId || state.activeId, action, feedback: feedback || "", plan_yaml: action === "edit" ? (planYaml || "") : "" }),
     });
     if (action === "approve") toast("Plan approved — running…");
     else if (action === "cancel") toast("Plan cancelled.");
+    else if (action === "edit") toast("Edit sent — checking it…");
     else toast("Sent to the PI — re-planning…");
   } catch (err) { toast(isUnreachable(err) ? "Can't reach the local server." : "Plan submit failed: " + err.message); }
 }
@@ -3927,14 +4199,15 @@ function _suffixRank(name) {
   _PRIMARY_SUFFIXES.forEach((s, i) => { if (low.endsWith(s) && i < best) best = i; });
   return best;
 }
-// The primary = highest-ranked bound file (attach order breaks ties) — mirrors the server.
+// The primary = highest-ranked bound file (attach order breaks ties) — mirrors the server's
+// _bound_primary_key: a file marked "reference" is ranked after every other file.
 function primaryBoundPath() {
   if (!state.boundPaths.length) return null;
   const meta = state.boundPaths.map((p, i) => {
     const d = state.datasets.find((x) => x.path === p);
-    return { p, i, r: _suffixRank(d ? d.name : p) };
+    return { p, i, ref: state.boundRoles[p] === "reference" ? 1 : 0, r: _suffixRank(d ? d.name : p) };
   });
-  meta.sort((a, b) => a.r - b.r || a.i - b.i);
+  meta.sort((a, b) => a.ref - b.ref || a.r - b.r || a.i - b.i);
   return meta[0].p;
 }
 
@@ -4025,6 +4298,14 @@ async function bindServerPath(path) {
   }
 }
 
+// Mark/unmark one bound file as REFERENCE data (e.g. a cell-type atlas to compare against).
+function toggleReference(path) {
+  if (!path) return;
+  if (state.boundRoles[path] === "reference") delete state.boundRoles[path];
+  else state.boundRoles[path] = "reference";
+  syncDatasetSelection();
+}
+
 function addDataset(d) {
   if (!d || !d.path) return;
   if (!state.datasets.some((x) => x.path === d.path)) state.datasets.unshift(d);
@@ -4036,11 +4317,11 @@ function addDataset(d) {
 function toggleBound(path) {
   if (!path) return;
   const i = state.boundPaths.indexOf(path);
-  if (i >= 0) state.boundPaths.splice(i, 1); else state.boundPaths.push(path);
+  if (i >= 0) { state.boundPaths.splice(i, 1); delete state.boundRoles[path]; } else state.boundPaths.push(path);
   syncDatasetSelection();
 }
 
-function clearBound() { state.boundPaths = []; syncDatasetSelection(); }
+function clearBound() { state.boundPaths = []; state.boundRoles = {}; syncDatasetSelection(); }
 
 function syncDatasetSelection() {
   state.datasetPath = primaryBoundPath();
@@ -4052,7 +4333,7 @@ function syncDatasetSelection() {
 }
 // Back-compat alias: some call sites still say selectDataset(path|null) — a single-file select is just
 // "replace the set with this one" (or clear it).
-function selectDataset(path) { state.boundPaths = path ? [path] : []; syncDatasetSelection(); }
+function selectDataset(path) { state.boundPaths = path ? [path] : []; state.boundRoles = {}; syncDatasetSelection(); }
 
 function renderDatasetChips() {
   const host = $("datasetChips");
@@ -4063,10 +4344,16 @@ function renderDatasetChips() {
     const d = state.datasets.find((x) => x.path === path) || { name: path.split("/").pop(), path, kind: "file" };
     const ico = datasetIcon(d.kind);
     const isPrimary = path === primary && state.boundPaths.length > 1;
+    const isRef = state.boundRoles[path] === "reference";
     const gist = d.gist ? ` — ${d.gist}` : "";                 // the file's ① skim, when known
-    return `<span class="dataset-chip active" title="${escapeHtml(d.path + gist)}">` +
+    // The reference toggle appears once a second file is attached: one file is always the study.
+    const refBtn = state.boundPaths.length > 1
+      ? `<button type="button" class="dataset-chip-ref${isRef ? " on" : ""}" data-ref-path="${escapeHtml(path)}" ` +
+        `title="${isRef ? "Reference data — click to use it as an ordinary file" : "Mark as reference data (e.g. a cell-type atlas to compare against)"}">ref</button>`
+      : "";
+    return `<span class="dataset-chip active${isRef ? " reference" : ""}" title="${escapeHtml(d.path + gist)}">` +
       `<span class="material-symbols-outlined msym">${ico}</span>` +
-      `<span class="dataset-chip-name">${escapeHtml(d.name)}${isPrimary ? " ★" : ""}</span>` +
+      `<span class="dataset-chip-name">${escapeHtml(d.name)}${isPrimary ? " ★" : ""}</span>` + refBtn +
       `<button type="button" class="dataset-chip-x" data-clear-path="${escapeHtml(path)}" title="Remove this file">×</button></span>`;
   }).join("");
 }
@@ -4558,7 +4845,7 @@ async function loadRuns() {
 
 // What a run hands on besides its bundle, neither of them in the zip: the processed dataset (an
 // .h5ad) and, after CellQC, CellQC's whole result folder with the per-library matrices. Both are
-// kept beside the run for a few days; "Save to my data" makes one a dataset, and the folder also
+// kept beside the run until the session disconnects (a few days at most); "Save to my data" makes one a dataset, and the folder also
 // downloads as one zip. Shown on the run's card and under the results in its chat.
 let resultHandoffs = null;              // a promise of { run id: row }; null = ask the server again
 function loadResultHandoffs(fresh) {
@@ -4573,7 +4860,7 @@ function resultHandoffHtml(runId, r) {
   const mb = (n) => `${(Number(n || 0) / 1e6).toFixed(0)} MB`;
   const kept = (x, label, what) => (x.saved_to
     ? `<span class="ok small" title="${escapeHtml(x.saved_to)}">Saved to my data</span>`
-    : `<span class="muted small">kept ${escapeHtml(String(x.kept_days ?? ""))} days ${x.location === "hpc3" ? "on HPC3" : "on the server"}</span>` +
+    : `<span class="muted small">kept ${x.location === "hpc3" ? "on HPC3" : "on the server"} ${x.until_disconnect ? `until you disconnect (at most ${escapeHtml(String(x.kept_days ?? ""))} days)` : `for ${escapeHtml(String(x.kept_days ?? ""))} days`}</span>` +
       `<button class="ghost small" data-save-result="${escapeHtml(runId)}" data-what="${what}" data-label="${escapeHtml(label)}">${escapeHtml(label)}</button>`);
   let html = "";
   if (r.name) {
@@ -4884,7 +5171,12 @@ function init() {
   $("chatStop").addEventListener("click", stopRun);
   $("datasetFile").addEventListener("change", (e) => { for (const f of e.target.files || []) uploadDataset(f); e.target.value = ""; });   // multi-attach: each file joins the bind-set
   $("datasetDir").addEventListener("change", (e) => { if (e.target.files && e.target.files.length) uploadFolder(e.target.files); e.target.value = ""; });
-  $("datasetChips").addEventListener("click", (e) => { const x = e.target.closest("[data-clear-path]"); if (x) toggleBound(x.dataset.clearPath); });
+  $("datasetChips").addEventListener("click", (e) => {
+    const r = e.target.closest("[data-ref-path]");
+    if (r) { toggleReference(r.dataset.refPath); return; }
+    const x = e.target.closest("[data-clear-path]");
+    if (x) toggleBound(x.dataset.clearPath);
+  });
   $("caseNoteChips").addEventListener("click", (e) => { if (e.target.closest("[data-clear-note]")) { state.caseNote = null; renderCaseNoteChip(); } });
   $("caseNoteFile").addEventListener("change", (e) => { const f = e.target.files[0]; if (f) attachCaseNote(f); e.target.value = ""; });
   // "＋ Data" popover: upload a file/folder, or pick a recent upload.
@@ -4931,7 +5223,7 @@ function init() {
   };
   $("serverPathBind").addEventListener("click", bindTyped);
   $("serverPathInput").addEventListener("keydown", (e) => { if (e.key === "Enter") { e.preventDefault(); bindTyped(); } });
-  { const ps = $("presetSearch"); if (ps) ps.addEventListener("input", () => renderPresetList(ps.value)); }
+  wireMethods();
   $("modeSelect").addEventListener("change", onModeChange);
   { const rs = $("routeSelect"); if (rs) rs.addEventListener("change", onRouteChange); }
   $("newSessionBtn").addEventListener("click", newSession);

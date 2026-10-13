@@ -1,4 +1,4 @@
-# HPC3 storage layout & the 3-day Temp sweep
+# HPC3 storage layout, the 3-day Temp sweep and the session cleanup
 
 **Status:** implemented; the HPC3 side is **created and live-verified**. Needs an eyeserver
 restart (and a `.env` review — see [Deploy](#deploy)) to take effect in prod.
@@ -40,19 +40,23 @@ one member alone.
 /dfs3b/ruic20_lab/software/AiScientist/  <- AISCIENTIST_HPC_SHARED_ROOT (was software/bioagent)
 ├── containers/ hf/ envs/ ollama/       <- 350+ GB of assets, NEVER swept (docs/hpc3_assets.md)
 │   scgpt_model/ vlreview_model/
-├── Temp/<ucinetid>/                    <- process files, SWEPT after 3 days
-│   ├── analysis/<run_id>/{work,artifacts}/
+├── Temp/<ucinetid>/                    <- process files: removed when their session disconnects,
+│   │                                      and SWEPT after 3 days whatever happened to the session
+│   ├── analysis/<run_id>/{work,artifacts,result}/
 │   ├── variant/<run_id>/
 │   ├── phenotype/<run_id>/
 │   ├── scgpt/<run_id>/
-│   ├── reports/
+│   ├── reports/<run_id>/               <- the render bundle (was one shared reports/ until 2026-10-13)
+│   ├── server-data/<session>/          <- this session's copies of datasets bound from the server
 │   ├── paperqa/
 │   └── scratch/{analysis,runcode,variant,phenotype,paperqa,report,worker}/
 │                                       <- each job's sbatch script, args/result JSON, Slurm log
 │                                          and tool log (see "Job files" below)
 ├── uploads/<ucinetid>/                 <- raw research data, NEVER swept
 ├── pysrc/<ucinetid>/                   <- synced AiScientist source, rewritten each connect
-└── bin/<ucinetid>/temp_gc.sh           <- the sweeper, staged from deploy/hpc3/
+└── bin/<ucinetid>/                     <- staged from deploy/hpc3/ at each connect:
+    ├── temp_gc.sh                         the sweeper
+    └── session_clean.sh                   the session cleanup
 ```
 
 Temp sits in the *same* root as the containers and model weights, so the sweeper's confinement to
@@ -63,7 +67,11 @@ sweep untouched.
 Deliberately **not** in scope of any automatic deletion:
 
 * `uploads/` — raw uploaded data. Manual deletion only, from the storage panel or the dataset
-  list. (Long-standing rule: 误删研究数据的风险 > 存储成本.)
+  list. (Long-standing rule: 误删研究数据的风险 > 存储成本.) With `AISCIENTIST_UPLOADS_ON_HPC` a
+  file uploaded through the browser is moved here and removed from the server, so this is its only
+  copy: no session end and no sweep may take it. The one exception is not an upload: the old
+  `uploads/<ucinetid>/server-data/<root>/` mirror of server-side data (see "When a session
+  disconnects").
 * `pysrc/` — bind-mounted read-only by running jobs for their whole lifetime.
 * `<shared_root>/{containers,hf,envs,ollama,scgpt_model,vlreview_model}/` — the built assets.
 * `/dfs3b/ruic20_lab/<ucinetid>/` — **every member's personal folder stays untouched.** Old runs
@@ -135,7 +143,7 @@ Because the sweep is asynchronous, what the console can report *now* is what the
 deleted — read from its job log (`<shared_root>/bin/<ucinetid>/temp_gc.log`, one small `tail`).
 Housekeeping does not need a synchronous answer, and this keeps the login node idle.
 
-### When it runs
+### When the sweep runs
 
 1. **On every connect** — `app._prepare_shared_storage` creates this user's dirs and submits.
 2. **Every 6 h per live session** — `app._hpc_temp_gc_loop`.
@@ -148,6 +156,63 @@ Housekeeping does not need a synchronous answer, and this keeps the login node i
 
    `scrontab` is **disabled** on HPC3 (`scrontab: fatal: scrontab is disabled on this cluster`),
    so a Slurm-native cron is not an option; `/etc/cron.deny` is empty, so ordinary `crontab` is.
+
+## When a session disconnects
+
+The sweep removes by **age**, and only when the same user connects again. So until 2026-10-13 a
+session's files outlived it by at least three days, and its copy of a dataset bound from the server
+sat under `uploads/`, which nothing sweeps (RCHENLAB/AiScientist issue 4: 14 GB of BAM left three
+times over in one member's uploads). A disconnect now removes by **owner**:
+
+| removed at disconnect | why it is safe |
+|---|---|
+| `Temp/<ucinetid>/<kind>/<run_id>/` for every run this session started or resumed (analysis, variant, phenotype, reports, scgpt, vlreview, corpus) | the deliverables are already on the server (`artifacts/`); what goes is the working copy |
+| `Temp/<ucinetid>/server-data/<session>/` | a copy of data that lives on the server; the next session copies it again |
+| `uploads/<ucinetid>/server-data/<root>/` | the same copies, from before they were per session; nothing reads them any more |
+
+`deploy/hpc3/aiscientist_session_clean.sh`, staged to `<shared_root>/bin/<ucinetid>/session_clean.sh`
+at connect. `/api/disconnect` submits it as one `sbatch --wrap` on the free CPU partition (job
+`aiscientist-sessionclean-<ucinetid>`, log `bin/<ucinetid>/session_clean.log`) and then closes the
+SSH session; the job needs neither. The gateway decides the targets (`app._session_cleanup_targets`)
+and the script removes exactly those: it never lists a directory to choose what to delete.
+
+What a disconnect does **not** remove:
+
+* **A run that is still executing**, and the earlier run a continuing run reads its dataset from.
+  Their folders, and with them the session's `server-data/` copies, are left to the sweep.
+* **A run another live session also knows** (the same run resumed from a second device).
+* **Anything of another session.** Server data is copied per session for this reason: two sessions
+  bound to the same folder each have their own copy, so one ending cannot take the other's files.
+* **Uploads and saved results.** A dataset uploaded through the browser, and anything "Save to my
+  data" moved into the user's folder, is never a target.
+* **`scratch/` and `paperqa/`**: per-job scripts and logs, shared by the user's sessions. The sweep
+  removes them once cold.
+
+What it costs: after a disconnect a run can no longer be continued from a **middle** step, and its
+processed dataset or CellQC result directory is gone unless it was saved to the user's data first
+(the console says "kept on HPC3 until you disconnect"). The report, figures and tables are on the
+server and stay.
+
+Why a middle step and not the rest: continuing from step *k* reads the AnnData checkpoint step
+*k-1* wrote (`analysis/<run_id>/work/adata_*.h5ad`, hundreds of MB to several GB). Those exist only
+on HPC3: the server receives a run's `artifacts/` and removes its own `work/` when the report is
+written, so there is nothing on the server to copy back. What the server does hold is the *input*:
+a run resumed in a later session (from its first step, or an interrupted run) has its server-side
+datasets copied into that session again and its stored paths repointed
+(`app._restage_server_data`). To carry a finished analysis across sessions, save the processed
+dataset ("Save to my data", or the run option that saves it at completion): a later message then
+starts a new run from it and skips the steps already done.
+
+**Not covered: a session that ends without a disconnect.** Closing the browser tab, a gateway
+restart, or a dropped connection run no cleanup: the run may still be executing, and an
+interrupted run is resumed from these very files. Those sessions fall back to the sweep, which
+still runs only when that user connects again.
+
+Verified on HPC3 (2026-10-13, compute node `hpc3-l18-04`, bash 5.1.8, GNU find 4.8.0), in a
+throwaway tree: the named run's folders under four kinds, the session's copies and the old mirror
+removed; another session's run and copies, another member's run of the same name, an upload and
+`containers/` untouched; `..`, a name with `/`, and a call without `--user` all exit 2 with nothing
+removed. `tests/test_session_cleanup.py` runs the same script against a real tree.
 
 ### What still touches a login node
 
@@ -162,6 +227,7 @@ transfer: staging goes over `access-hpc3` (the DTN) via `put_file`.
 |---|---|---|
 | `AISCIENTIST_HPC_SHARED_ROOT` | `/dfs3b/ruic20_lab/software/AiScientist` | shared project root |
 | `AISCIENTIST_TEMP_TTL_DAYS` | `3` | age after which a cold Temp unit is removed; `0` disables |
+| `AISCIENTIST_SESSION_CLEANUP` | `1` | remove a session's own Temp files when it disconnects; `0` leaves them to the sweep |
 
 Both also accept the `AISCIENTIST_*` prefix (`core.config.apply_brand_env_aliases`).
 

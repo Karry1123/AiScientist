@@ -25,6 +25,8 @@ from aiscientist.tools._lib.result_dataset import result_name
     ("/x/CellQC_testdata/Sample1_WT/filtered_feature_bc_matrix.h5", "Sample1_WT"),
     ("/x/Sample2_Ddx41/outs/filtered_feature_bc_matrix.h5", "Sample2_Ddx41"),
     ("/u/yijus12/Ddx41_DEG.h5ad", "Ddx41_DEG"),
+    # a run that started from an earlier run's result is named after the original input
+    ("/t/run1/result/Sample1_WT.processed.20261007-2215.f3b8268c4fd4.h5ad", "Sample1_WT"),
     ("", "dataset"),
 ])
 def test_the_name_says_what_it_came_from_that_it_is_processed_when_and_which_run(path, stem):
@@ -245,7 +247,8 @@ def test_a_stopped_run_still_exports_its_dataset(tmp_path):
             return {"status": "skipped", "reason": "test"}
 
     ex = Executor()
-    conn = SimpleNamespace(settings=SimpleNamespace(temp_ttl_days=3, checkpoint_ttl_days=7),
+    conn = SimpleNamespace(settings=SimpleNamespace(temp_ttl_days=3, checkpoint_ttl_days=7,
+                                                     session_cleanup=True),
                            workspace=tmp_path, owner="u")
     asyncio.run(_export_result_dataset(conn, "r1", {"dataset_path": "/x/a.h5ad"}, ex, "q",
                                        lambda *a, **k: None))

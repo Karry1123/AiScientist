@@ -259,6 +259,10 @@
                   <option value="single">🧑‍🔬 Single agent</option>
                   <option value="team">👥 Virtual Lab (multi-agent)</option>
                 </select>
+                <button id="methodsBtn" type="button" class="methods-btn" title="Preset pipelines and atomic skills. The PI picks the best-fit pipeline by itself — open this to see what each one does, or to require some for this chat.">
+                  <span class="material-symbols-outlined msym">tune</span> Pipelines &amp; skills
+                  <span id="methodsCount" class="methods-count hidden">0</span>
+                </button>
                 <label class="pipeline-toggle" title="The PI proposes a plan first; you refine it in chat (no manual editing) before any tool runs"><input id="planMode" type="checkbox" checked /> Plan first (PI proposes; refine in chat)</label>
                 <label class="pipeline-toggle" title="Bypass mode: run the whole research loop end-to-end with NO human gates — no plan review and no decision-point pauses (the agent decides at every fork). Stop and mid-run notes still work. Off = Manual (review gates on)."><input id="autonomousMode" type="checkbox" /> Bypass (run autonomously, no HITL)</label>
                 <label class="pipeline-toggle" title="When the run completes, save what it hands on to your data: the processed dataset (.h5ad) and, after CellQC, CellQC's whole result folder. They appear in Datasets, ready for the next analysis, with nothing to download or upload. Off = they are kept beside the run for a few days, and Runs → “Save to my data” saves them."><input id="saveResults" type="checkbox" /> Save results to my data</label>
@@ -295,17 +299,9 @@
                      no box). Updated once per fast-chat turn. -->
                 <div id="ctxMeter" class="ctx-meter hidden"></div>
               </div>
-              <details id="advancedPanel" class="advanced-panel">
-                <summary title="Optional: force a specific preset pipeline instead of letting the PI choose">Advanced — force a preset pipeline (the PI chooses by default)</summary>
-                <div class="preset-row">
-                  <input id="presetSearch" type="text" class="preset-search" autocomplete="off" placeholder="Search preset pipelines to require… (empty = PI decides)" title="Filter the preset-pipeline list; tick one or more to REQUIRE them for this conversation. The PI still auto-adds a best-fit pipeline on top. (These are full end-to-end pipelines, not composable tools.)" />
-                  <div id="presetList" class="preset-list" role="group" aria-label="Required preset pipelines"></div>
-                </div>
-                <div class="preset-hint">Optional. Tick preset pipelines to <b>require</b> them in this conversation (mandatory) — the PI still auto-adds the best-fit one on top. Leave empty to let the PI choose.</div>
-                <div class="preset-subhead">Require atomic skills (composable capabilities)</div>
-                <div id="skillList" class="preset-list" role="group" aria-label="Required atomic skills"></div>
-                <div class="preset-hint">Optional. Tick atomic <b>skills</b> the run must apply (e.g. E-distance ranking) — they compose, so pick several. Leave empty and the agent fetches skills on demand.</div>
-              </details>
+              <!-- What this chat REQUIRES (preset pipelines, atomic skills), as removable chips. Empty
+                   and hidden by default: the PI chooses. Picked in the "Pipelines & skills" sheet. -->
+              <div id="methodChips" class="method-chips hidden" aria-label="Required pipelines and skills"></div>
               <div id="serverPathOffer" class="server-path-offer hidden" role="status"></div>
               <form id="chatForm" class="chat-input">
                 <textarea id="chatInput" rows="2" placeholder="Ask AiScientist to plan or interpret an ocular bioinformatics analysis..."></textarea>
@@ -411,6 +407,33 @@
             <div id="systemBody"><div class="empty-hint">Loading…</div></div>
           </div>
         </section>
+      </div>
+    </div>
+  </div>
+
+  <!-- Pipelines & skills: every preset pipeline and atomic skill with its whole description, the
+       tools a pipeline composes and its protocol. Ticking one requires it for the active chat. -->
+  <div id="methodsModal" class="modal hidden">
+    <div class="modal-card methods-card" role="dialog" aria-modal="true" aria-labelledby="methodsTitle">
+      <div class="methods-head">
+        <div>
+          <h2 id="methodsTitle">Pipelines &amp; skills</h2>
+          <p class="methods-sub">The PI picks the best-fit pipeline for each request by itself. Tick anything here to <b>require</b> it in this chat.</p>
+        </div>
+        <button id="methodsClose" type="button" class="icon-btn" aria-label="Close">✕</button>
+      </div>
+      <div class="methods-tools">
+        <div class="methods-tabs" role="tablist">
+          <button type="button" role="tab" data-tab="pipelines" class="active">Preset pipelines <span class="methods-tab-n">0</span></button>
+          <button type="button" role="tab" data-tab="skills">Atomic skills <span class="methods-tab-n">0</span></button>
+        </div>
+        <input id="methodsSearch" type="search" class="preset-search" autocomplete="off" placeholder="Search by name, description or tool…" aria-label="Search pipelines and skills" />
+      </div>
+      <div id="methodsList" class="methods-list"></div>
+      <div class="methods-foot">
+        <span id="methodsSummary" class="methods-summary"></span>
+        <button id="methodsClear" type="button" class="secondary small">Clear all</button>
+        <button id="methodsDone" type="button" class="primary small">Done</button>
       </div>
     </div>
   </div>

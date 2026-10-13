@@ -263,7 +263,7 @@ def test_exploration_and_cycles_compose_within_and_across_cycles():
             return {"continue": True, "reason": "settle it properly", "agenda": list(CYCLE2)}
         return {"continue": False, "reason": "done", "agenda": []}
 
-    cfg = LabConfig(max_cycles=3, hypothesis_driven=True)
+    cfg = LabConfig(max_cycles=3, hypothesis_driven=True, new_steps_need_approval=False)
     lab = ResearchLab(_ctx(), cfg,
                       complete_fn=_router(CYCLE1, explore=explore, next_cycle=next_cycle),
                       scientist=ResearchHarness(catalog=default_catalog(), chat_fn=_scientist()))

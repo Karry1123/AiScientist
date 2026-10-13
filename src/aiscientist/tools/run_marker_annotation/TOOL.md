@@ -48,6 +48,7 @@ Two checks run after the labels are assigned:
 - `work/adata_annotated.h5ad`.
 - `tables/cluster_cell_types.csv` and `.json` (label, evidence, `unassigned_reason`, `top_markers`, `top_markers_of_other_lineages` per cluster), `tables/celltype_scores_by_cluster.csv`, `tables/celltype_composition.csv`.
 - In the result: `unassigned_detail` (reason, evidence and top markers of each unassigned cluster).
+- `figures/umap_cell_types.png` (when the checkpoint has a UMAP) and `figures/dotplot__cell_type_markers.png` (the deciding markers by assigned cell type). Written by the tool, so a plan needs no figure step for them.
 
 ## Where it runs
 
@@ -85,5 +86,7 @@ On the fast chat path: no (research runs only).
 > which are unassigned and why (mixed / weak / withdrawn, with each cluster's own top marker
 > genes), labelled clusters led by another lineage's genes, and warnings (e.g. a lineage every
 > sample of the tissue contains is missing); all belong in the report. Describe an unassigned
-> cluster by its top markers, not by a guessed name.
+> cluster by its top markers, not by a guessed name. Writes the UMAP coloured by assigned cell
+> type and a dot plot of the deciding markers by cell type itself: no separate figure step is
+> needed for them.
 <!-- /generated:model-description -->

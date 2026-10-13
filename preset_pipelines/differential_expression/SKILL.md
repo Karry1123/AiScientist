@@ -176,7 +176,8 @@ enrichment on the changed genes"** — plan that without waiting for the user to
    must be `tested_universe`, not `constant_fallback`.
 5. **Cross-cell-type synthesis.** Find genes changed in the SAME direction across ≥2 cell types
    (a shared / pan-tissue signature) vs cell-type-specific changes.
-5b. **Literature grounding** (`deep_literature`): after the DE and pathway results exist, ground
+5b. **Literature grounding** (`deep_literature`) — OPTIONAL, and its own step: plan it ONLY when the user asks for literature, references or citations; otherwise leave it out and offer it as a follow-up.
+   When it is planned: after the DE and pathway results exist, ground
    the surviving findings in published work. The query is built from what the analysis ACCEPTED —
    the actual genes, cell types and pathways — not from the user's original question, so this step
    is planned last among the analysis steps and never first. Ask focused questions ("is <gene> up

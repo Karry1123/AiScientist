@@ -30,6 +30,7 @@ account's saved keys, so there ``run_code`` runs on HPC3 or not at all.
 
 from __future__ import annotations
 
+import json
 import os
 import signal
 import subprocess
@@ -37,7 +38,7 @@ import sys
 import tempfile
 import time
 from dataclasses import dataclass, field
-from typing import Callable
+from typing import Any, Callable
 
 
 def sandbox_network_enabled() -> bool:
@@ -105,6 +106,25 @@ def describe_dataset_obs(dataset_path: str | None, *, max_cols: int = 40, max_le
             pass
 
 
+REFERENCE_ROLE = "reference"
+
+
+def input_env(inputs: "Any") -> dict[str, str]:
+    """The env vars that hand a snippet the run's OTHER bound files (feature ②), as the executor
+    sees them: ``AISCIENTIST_INPUTS`` = a JSON list of ``{name, role, path}``, and
+    ``AISCIENTIST_REFERENCE`` = the first file the user marked as the reference. One definition for
+    the local sandbox and the HPC3 executor, so a snippet reads the same names on either."""
+    rows = [{"name": str(i.get("name") or ""), "role": i.get("role") or None, "path": str(i["path"])}
+            for i in (inputs or ()) if isinstance(i, dict) and i.get("path")]
+    if not rows:
+        return {}
+    env = {"AISCIENTIST_INPUTS": json.dumps(rows, ensure_ascii=False)}
+    ref = next((r["path"] for r in rows if r["role"] == REFERENCE_ROLE), None)
+    if ref:
+        env["AISCIENTIST_REFERENCE"] = ref
+    return env
+
+
 def build_run_code_context(executor: object) -> str:
     """Build the live 'execution environment' guidance appended to the ``run_code`` tool
     description, so the CodeAct model stops guessing paths / column names / working directory.
@@ -118,8 +138,9 @@ def build_run_code_context(executor: object) -> str:
     artifacts = getattr(executor, "artifacts_dir", None)
     uploads = getattr(executor, "uploads_dir", None)
     root = getattr(executor, "dataset_root", None)
+    inputs = [i for i in (getattr(executor, "inputs", None) or ()) if isinstance(i, dict) and i.get("path")]
     mem_mb = getattr(executor, "mem_mb", None)
-    if not any((dataset, work, artifacts, uploads, root)):
+    if not any((dataset, work, artifacts, uploads, root, inputs)):
         return ""
     parts = [
         "",
@@ -164,6 +185,18 @@ def build_run_code_context(executor: object) -> str:
             "with nested subfolders preserved. Use os.walk(os.environ['AISCIENTIST_UPLOADS']) to "
             "discover all inputs — incl. folders added after the primary dataset.)"
         )
+    if inputs:
+        parts.append(
+            "- AISCIENTIST_INPUTS = the run's OTHER attached files (read-only), as a JSON list of "
+            "{name, role, path} — json.loads(os.environ['AISCIENTIST_INPUTS']):")
+        parts.extend(f"  - {i.get('name') or i['path']} ({i.get('role') or 'extra file'}): {i['path']}"
+                     for i in inputs)
+        ref = input_env(inputs).get("AISCIENTIST_REFERENCE")
+        if ref:
+            parts.append(
+                f"- AISCIENTIST_REFERENCE = {ref}  (the file the user marked as the REFERENCE, e.g. "
+                "a cell-type atlas: evidence to compare the primary dataset against — never QC, "
+                "cluster or test it as the study's own data)")
     if mem_mb:
         parts.append(
             f"- Memory is capped (~{int(mem_mb)} MB). Do NOT load the full AnnData and .copy() large "
@@ -208,6 +241,9 @@ class CodeSandbox:
     # AISCIENTIST_DATASET_ROOT: a delivery's other files (the raw matrix beside the filtered one)
     # are part of the dataset, not separate uploads.
     dataset_root: str | None = None
+    # The run's OTHER bound files ({name, role, path}, local paths), exposed read-only as
+    # AISCIENTIST_INPUTS / AISCIENTIST_REFERENCE (see input_env).
+    inputs: list[dict] | None = None
     # Stop button: polled while the snippet runs so a Stop KILLS the in-flight subprocess (and
     # its whole process group) within ~a second, instead of the old blocking subprocess.run that
     # ignored Stop until the 180s timeout. Set to conn.chat_stop.is_set.
@@ -287,12 +323,21 @@ class CodeSandbox:
                 out.append(p)
         return out
 
+    def _input_paths(self) -> list[str]:
+        """Existing host paths of the other bound files not already under a data path above."""
+        covered = [p.rstrip("/") + "/" for p in self._data_paths()]
+        return [str(i["path"]) for i in (self.inputs or ())
+                if isinstance(i, dict) and i.get("path") and os.path.exists(str(i["path"]))
+                and not any(str(i["path"]).startswith(c) for c in covered)]
+
     def _command(self, script: str, workdir: str):
         if self.container_image:
             net = [] if self.allow_network else ["--net", "--network", "none"]
             binds = ["-B", f"{workdir}:{workdir}"]
             for p in self._data_paths():            # mount the dataset + run dirs read/write
                 binds += ["-B", f"{p}:{p}"]
+            for p in self._input_paths():           # the other bound files, read-only
+                binds += ["-B", f"{p}:{p}:ro"]
             cmd = [
                 self.container_bin, "exec", "--containall", "--writable-tmpfs", *net,
                 *binds, self.container_image, "python", script,
@@ -351,4 +396,5 @@ class CodeSandbox:
             env["AISCIENTIST_UPLOADS"] = str(self.uploads_dir)
         if self.dataset_root:
             env["AISCIENTIST_DATASET_ROOT"] = str(self.dataset_root)
+        env.update(input_env(self.inputs))
         return env

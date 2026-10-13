@@ -74,8 +74,9 @@ Put the two tracks side by side and say what they agree on:
 - **Variant-only hit** — a compelling variant in a gene LIRICAL did not rank. **This is expected and is
   NOT a contradiction.** LIRICAL scores against *curated* HPO/OMIM annotations, so a gene whose
   disease association is new, or a phenotype expansion of a known gene, CANNOT rank — by construction.
-  Treat a low LIRICAL rank as "not in the curated annotations", never as "not causal". Use
-  `literature_search` on that gene + the phenotype to check for recent evidence the curation lags.
+  Treat a low LIRICAL rank as "not in the curated annotations", never as "not causal". When the
+  user asks for literature, `literature_search` on that gene + the phenotype checks for recent
+  evidence the curation lags; otherwise say that this check is available as a follow-up.
 
 Report BOTH tracks even when they disagree — the disagreement is often the finding.
 

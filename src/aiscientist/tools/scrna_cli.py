@@ -27,6 +27,7 @@ from typing import Any
 RESULT_MARKER = "AISCIENTIST_RESULT_JSON "
 INSTALL_DEPENDENCY = "_install_dependency"
 EXPORT_RESULT_DATASET = "_export_result_dataset"
+ADOPT_RESULT_DATASET = "_adopt_result_dataset"
 
 
 class _Ctx:
@@ -74,6 +75,13 @@ def run_tool(tool: str, workspace: str, dataset_path: str | None, args: dict[str
         # checkpoints are released, to hand on the processed dataset (see _lib/result_dataset).
         from ._lib.result_dataset import export
         return export(workspace, str(args.get("name", "")), args.get("meta") or {})
+    if tool == ADOPT_RESULT_DATASET:
+        # Not a model-facing tool: the gateway submits it once at the start of a run that continues
+        # an earlier one, so the dataset that run handed on becomes this run's checkpoints.
+        from ._lib.result_dataset import adopt
+        if not dataset_path:
+            return {"status": "skipped", "reason": "no dataset is bound to this run"}
+        return adopt(workspace, dataset_path)
     fn = _analysis_tools(only=tool).get(tool)
     if fn is None:
         return {"status": "error", "error": f"unknown analysis tool: {tool}"}

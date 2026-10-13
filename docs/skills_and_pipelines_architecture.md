@@ -104,6 +104,10 @@ still resolve.
   `LabConfig.required_skills` (validated against the library) → a "REQUIRED skills" directive
   appended to the PI's planning guidance; a `🧩 Required skills` feed line. Distinct from pinning a
   preset-pipeline (which steers the whole plan shape).
+  Since 2026-10-12 both checklists (preset pipelines and atomic skills) are in the composer's
+  **Pipelines & skills** sheet instead of an inline "Advanced" disclosure: each entry is shown whole
+  (description, the tools a pipeline composes, its protocol), and what a chat requires appears as
+  removable chips above the composer.
 - **`search_skills(query)` retrieval** — a `search_skills` Scientist tool (`agents/skills.py`):
   keyword/token-overlap ranking over name > summary > body (offline, deterministic, no embedder).
   The brief used to stop listing above `AISCIENTIST_SKILL_MANIFEST_MAX` (12) skills and say "search"

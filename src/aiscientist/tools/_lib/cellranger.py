@@ -352,8 +352,9 @@ def tissue_hint(top_genes: "list[str]") -> str:
     shown = ", ".join(f"{g} ({hits[g]})" for g in order[:6])
     return (f"TISSUE HINT (from gene abundance — no tissue label came with the data): the 50 most "
             f"abundant genes include {shown}, markers in the curated {name} reference, so the tissue "
-            f"is most likely {name}. Plan `run_marker_annotation` with `reference: \"{name}\"` unless "
-            "the marker genes say otherwise, and say in the report that the tissue was inferred. ")
+            f"is most likely {name}. A step that annotates or validates cell types passes "
+            f"`reference: \"{name}\"` to `run_marker_annotation` unless the marker genes say "
+            "otherwise, and the report says that the tissue was inferred. ")
 
 
 def _provenance(libs: "list[dict[str, Any]]") -> str:

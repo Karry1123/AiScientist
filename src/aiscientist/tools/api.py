@@ -72,6 +72,9 @@ _EXPORTS: dict[str, tuple[str, str]] = {
     # CellQC's complete result/ directory, kept with the run (run_cellqc writes the pointer)
     "CELLQC_RESULT_POINTER": ("aiscientist.tools._lib.result_dataset", "CELLQC_POINTER"),
     "cellqc_result_name": ("aiscientist.tools._lib.result_dataset", "cellqc_result_name"),
+    # ... and the next run of the conversation starts from (written back as its checkpoints)
+    "ADOPT_RESULT_DATASET": ("aiscientist.tools.scrna_cli", "ADOPT_RESULT_DATASET"),
+    "adopt_result_dataset": ("aiscientist.tools._lib.result_dataset", "adopt"),
     "resolve_run_dependency": ("aiscientist.tools.run_deps", "resolve"),
     "DEPS_DIRNAME": ("aiscientist.tools.run_deps", "DEPS_DIRNAME"),
     "SITECUSTOMIZE": ("aiscientist.tools.run_deps", "SITECUSTOMIZE"),

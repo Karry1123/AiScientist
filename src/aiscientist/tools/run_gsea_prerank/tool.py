@@ -38,11 +38,6 @@ def run_gsea_prerank(args: dict[str, Any], ctx: Any) -> dict[str, Any]:
     Ranks come from the ``rank_<groupby>_<group>.rnk`` files ``run_de`` writes (the Wilcoxon
     z-score, so a positive NES means "up in this group vs the rest").
     """
-    try:
-        import gseapy as gp
-    except ImportError as exc:
-        return _missing(getattr(exc, "name", None) or "gseapy")
-
     work, art, figs, tables = _dirs(ctx)
 
     gene_sets = args.get("gene_sets") or list(_DEFAULT_GENE_SETS)
@@ -63,6 +58,12 @@ def run_gsea_prerank(args: dict[str, Any], ctx: Any) -> dict[str, Any]:
                 "missing_libraries": missing_libs,
                 "error": (f"no local gene-set (.gmt) files found in {gdir} for {gene_sets}. "
                           + gene_sets_note(gene_sets))}
+
+    # gseapy only now, as in run_enrichment: an unknown library name needs no import to report.
+    try:
+        import gseapy as gp
+    except ImportError as exc:
+        return _missing(getattr(exc, "name", None) or "gseapy")
 
     labels: dict[str, str] = {}
     groupby = str(args.get("groupby", "")).strip()
