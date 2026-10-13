@@ -356,3 +356,34 @@ def test_gateway_forwards_every_cli_knob_from_its_env(monkeypatch, tmp_path):
     missing = {k: v for k, v in expected.items() if executor.inject_args.get(k) != v}
     assert not missing, f"CLI knobs the gateway does not forward: {sorted(missing)}"
     assert executor.inject_args["llm_base_url"] == "http://hpc3-gpu-m54-01:39124/v1"
+
+
+def test_a_session_on_the_users_api_key_gets_no_deep_literature(monkeypatch, tmp_path):
+    """Prod run BioAdmin/1e887ed2bf8e (2026-10-12), end to end on the gateway side. PaperQA on HPC3
+    is configured, but the session reasons on the user's own API key: no GPU allocation, so no served
+    model for the PaperQA job to call and no literature executor. The run's roster must then leave
+    `deep_literature` out and say why, instead of offering a tool that answers
+    `dependency_missing` from the gateway process (which has no paper-qa)."""
+    import threading
+
+    from aiscientist.agents.registry import build_scientist_catalog
+    from aiscientist.gateway import app as gw
+    from aiscientist.gateway.settings import HPCSettings
+
+    monkeypatch.setenv("AISCIENTIST_PAPERQA_ON_HPC", "1")
+    monkeypatch.setenv("AISCIENTIST_PAPERQA_IMAGE", "/shared/containers/paperqa.sif")
+    monkeypatch.setitem(sys.modules, "paperqa", None)      # the prod gateway venv has no paper-qa
+    conn = types.SimpleNamespace(
+        settings=HPCSettings(), executor=types.SimpleNamespace(username="tester"), mock=False,
+        alloc=None, owner="tester", workspace=tmp_path, selected_model="claude-haiku-5-5",
+        chat_stop=threading.Event(), hpc_pysrc="/shared/pysrc/tester")
+    executor = gw._build_literature_executor(conn)
+    assert executor is None
+
+    said = []
+    roster = gw._session_roster(conn, build_scientist_catalog(literature_executor=executor),
+                                executor, lambda level, stage, message: said.append(message))
+    names = [t.name for t in roster]
+    assert "deep_literature" not in names and "literature_search" in names
+    assert len(said) == 1 and "deep_literature" in said[0] and "literature_search" in said[0]
+    assert "GPU" in said[0]                                 # the reason, in the user's terms

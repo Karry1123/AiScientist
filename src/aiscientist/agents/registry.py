@@ -144,6 +144,40 @@ def build_scientist_catalog(code_executor: Any = None, scgpt_runner: Any = None,
     return catalog
 
 
+# A tool's declared requirement (its PyPI name) -> the module it imports as, where they differ.
+_IMPORT_NAMES = {"paper-qa": "paperqa"}
+
+
+def _importable(requirement: str) -> bool:
+    import importlib.util
+
+    try:
+        return importlib.util.find_spec(_IMPORT_NAMES.get(requirement, requirement)) is not None
+    except (ImportError, ValueError):
+        return False
+
+
+def session_catalog(catalog: list["HarnessTool"],
+                    literature_executor: Any = None) -> list["HarnessTool"]:
+    """The roster ONE SESSION is offered: ``catalog`` without the HPC3 literature tools it cannot run.
+
+    ``deep_literature`` runs as a job in paperqa.sif on HPC3 and calls the session's served model
+    from there, so the gateway builds its executor only for a session with a GPU allocation. Without
+    one the tool is left unrouted and runs in the gateway process. That works on a development
+    machine with ``paper-qa`` installed and nowhere else: the prod gateway has neither the package
+    nor the /dfs3b index. Prod run BioAdmin/1e887ed2bf8e (2026-10-12) reasoned on the user's own API
+    key, so it had no GPU: the PI planned a ``deep_literature`` step, the plan review rewrote it
+    around that tool's contract, and the call answered ``dependency_missing`` in under a second.
+
+    Only the session's roster changes. ``build_scientist_catalog()`` keeps listing the tool, because
+    the System page and the step classifier (``research_lab._known_tool_names``) read that catalog as
+    the tools that exist, and ``diagnose_disease`` stays bound to the executor it was built with."""
+    if literature_executor is not None:
+        return catalog
+    return [t for t in catalog
+            if t.name not in _HPC_LITERATURE_TOOLS or all(_importable(r) for r in t.requires)]
+
+
 def _make_describe_environment_tool(hpc_shell: Any = None) -> "HarnessTool":
     """``describe_environment`` — the assets, the session's filesystem permissions, and where each
     tool is implemented. Derived from live code + settings, so it cannot drift."""

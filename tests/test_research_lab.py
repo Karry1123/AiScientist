@@ -573,6 +573,36 @@ def test_pi_plan_guard_collapses_duplicate_literature_steps():
                       "DDX41 in the retina and attach DOI-backed citations."]
 
 
+def test_pi_is_told_to_plan_the_literature_tool_the_session_has():
+    """The PI's instructions name `deep_literature` for the literature step. A session without that
+    tool (no HPC3 literature line, e.g. one that reasons on the user's own API key) must be told
+    `literature_search` instead, or the PI plans a tool the Scientist cannot call."""
+    from aiscientist.agents.research_lab import _PI_SYSTEM
+
+    def _tool(name):
+        return HarnessTool(name, f"{name}.", {"type": "object", "properties": {}},
+                           lambda _args, _ctx: {"status": "ok", "results": []}, category="literature")
+
+    def system_prompt(catalog):
+        seen = {}
+
+        def complete(messages):
+            if "Principal Investigator of a bioinformatics lab" in messages[0]["content"]:
+                seen["system"] = messages[0]["content"]
+            return json.dumps({"agenda": ["**Quality control** — Run `run_cellqc` on the library."]})
+
+        lab = ResearchLab(_ctx(), LabConfig(), complete_fn=complete,
+                          scientist=ResearchHarness(catalog=catalog))
+        lab._pi_plan("Run quality control on this library.", lambda _event: None)
+        return seen["system"]
+
+    without = system_prompt([_tool("literature_search")])
+    assert "deep_literature" not in without
+    assert "reserve one agenda step for `literature_search`" in without
+    # with the corpus tool wired, the instructions are the ones every GPU session has had
+    assert system_prompt([_tool("deep_literature"), _tool("literature_search")]) == _PI_SYSTEM
+
+
 # --- the literature guard follows what the user SAID about literature, not the words they used ---
 # Prod run 1e887ed2bf8e (2026-10-12). In plan review the user typed "only keep 1. cell QC quality
 # control ,discard all other step" and then "also discard the literature ,only first part.". The

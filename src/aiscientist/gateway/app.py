@@ -3903,6 +3903,24 @@ def _build_literature_executor(conn: "Connection", run_id: str | None = None) ->
     )
 
 
+def _session_roster(conn: "Connection", catalog: list, literature_executor: Any,
+                    emit: Callable[[str, str, str], None]) -> list:
+    """The tools this run is offered: ``catalog`` minus what the session cannot run
+    (``registry.session_catalog``), with one console line when PaperQA on HPC3 is configured but
+    this session cannot use it. The usual case is a session on the user's own API key: no GPU
+    allocation, so no served model for the PaperQA job to call."""
+    from ..agents.registry import session_catalog
+
+    roster = session_catalog(catalog, literature_executor=literature_executor)
+    if len(roster) < len(catalog) and os.environ.get("AISCIENTIST_PAPERQA_ON_HPC"):
+        no_gpu = conn.executor is not None and not conn.mock and conn.alloc is None
+        why = ("its HPC3 job calls the model a session serves on a GPU, and this session has no GPU "
+               "allocation" if no_gpu else "its HPC3 job line could not be set up")
+        emit("info", "lab", f"`deep_literature` (the indexed corpus) is not available in this run: "
+                            f"{why}. Literature steps use `literature_search` (Europe PMC).")
+    return roster
+
+
 def _active_conn_for_user(user) -> Connection | None:
     """An SSH-connected live session owned by this app user (for remote-file cleanup outside
     a per-connection request). None if the user has no connected session right now."""
@@ -8202,13 +8220,17 @@ async def _run_lab(conn: Connection, req: LabRequest, *,
         report_render_fn = _build_report_render_fn(conn, run_id)
         if getattr(report_render_fn, "remote", None) is not None:
             emit("info", "lab", "Report rendering runs on HPC3 (CPU Slurm, pandoc/xelatex).")
+        literature_executor = _build_literature_executor(conn)
         scientist = ResearchHarness(
-            catalog=build_scientist_catalog(code_executor=code_executor, scgpt_runner=scgpt_runner,
-                                            analysis_executor=analysis_executor,
-                                            variant_executor=variant_executor,
-                                            phenotype_executor=phenotype_executor,
-                                            literature_executor=_build_literature_executor(conn),
-                                            hpc_shell=_build_hpc_shell(conn, run)),
+            catalog=_session_roster(
+                conn,
+                build_scientist_catalog(code_executor=code_executor, scgpt_runner=scgpt_runner,
+                                        analysis_executor=analysis_executor,
+                                        variant_executor=variant_executor,
+                                        phenotype_executor=phenotype_executor,
+                                        literature_executor=literature_executor,
+                                        hpc_shell=_build_hpc_shell(conn, run)),
+                literature_executor, emit),
             chat_fn=scientist_chat,
             count_tokens_fn=count_tokens,   # exact server-side window sensing (vLLM /tokenize)
         )

@@ -5333,6 +5333,17 @@ class ResearchLab:
         emit({"type": "team_formed", "members": [{"title": e.name, "expertise": e.persona} for e in team]})
         return team
 
+    def _name_literature_tool(self, prompt: str) -> str:
+        """``prompt`` naming the literature tool this session has.
+
+        The PI's instructions say `deep_literature`. A session without it (no HPC3 literature line:
+        ``registry.session_catalog``) still has `literature_search`, and a PI told to reserve a step
+        for a tool that is not in its list plans that tool anyway."""
+        names = {t.name for t in getattr(self.scientist, "catalog", None) or ()}
+        if "deep_literature" in names or "literature_search" not in names:
+            return prompt
+        return prompt.replace("`deep_literature`", "`literature_search`")
+
     def _usable_tool_names(self) -> "frozenset[str] | None":
         """Tools that are in the catalog AND can actually run here, for pipeline routing.
 
@@ -6044,7 +6055,7 @@ class ResearchLab:
             parts.append("Return the ordered agenda now.")
 
         raw = self._complete([
-            {"role": "system", "content": _PI_SYSTEM},
+            {"role": "system", "content": self._name_literature_tool(_PI_SYSTEM)},
             {"role": "user", "content": "\n".join(parts)},
         ], role="plan")
         parsed = _parse_plan(raw, self.config.max_steps, allow_clarify)
@@ -6102,11 +6113,12 @@ class ResearchLab:
                     for t in self.scientist.catalog),
                 author=lambda fb: self._author_step(
                     question, _agenda_now,
-                    brief=("A literature step near the end: search the published literature with "
-                           "`deep_literature` for the key genes, cell types and pathways this "
-                           "study will surface, and attach DOI-backed citations that ground the "
-                           "biological interpretation. Name the biological subject of THIS "
-                           "question; do not restate the analysis steps."),
+                    brief=self._name_literature_tool(
+                        "A literature step near the end: search the published literature with "
+                        "`deep_literature` for the key genes, cell types and pathways this "
+                        "study will surface, and attach DOI-backed citations that ground the "
+                        "biological interpretation. Name the biological subject of THIS "
+                        "question; do not restate the analysis steps."),
                     fallback=fb),
                 prior_agenda=prior_agenda,
                 latest_feedback=request,
@@ -6418,8 +6430,15 @@ class ResearchLab:
         ok = isinstance(output, dict) and output.get("status") == "ok"
         contexts = (output.get("contexts") if isinstance(output, dict) else None) or []
         state = output.get("status") if isinstance(output, dict) else "error"
+        # A call that did not answer says why. Run BioAdmin/1e887ed2bf8e logged
+        # "dependency_missing: 0 context(s)" and no more: the fallback below replaces this step's
+        # tool calls, so the result's `dependency` and `note` were written nowhere in the run.
+        why = ""
+        if not ok and isinstance(output, dict):
+            why = " ".join(str(output.get(k) or "") for k in ("dependency", "error", "note")).strip()
         emit({"type": "tool_result", "tool": "deep_literature",
-              "summary": f"{'ok' if ok else state}: {len(contexts)} context(s)"})
+              "summary": f"{'ok' if ok else state}: {len(contexts)} context(s)"
+                         + (f" ({why[:240]})" if why else "")})
         tool_calls = [{"tool": "deep_literature", "args": args, "ok": bool(ok),
                        "summary": f"{len(contexts)} context(s)", "result": output}]
         # Build the accepted answer: the grounded cited answer, then a numbered list of the corpus
@@ -6492,7 +6511,17 @@ class ResearchLab:
                     "not on which of the two tools found them.)\n\n" + (fallback.final_answer or ""))
                 return fallback
             if lit_tool is not None:
-                return self._run_literature_step(question, step, rounds, lit_tool, specialist, emit)
+                result = self._run_literature_step(question, step, rounds, lit_tool, specialist, emit)
+                # The session has no `deep_literature` (registry.session_catalog: no HPC3
+                # literature line), but a preset or a plan drafted earlier can still name it. Same
+                # note as above, for the same reason: the tool was the platform's choice.
+                if "deep_literature" in _declared_tools(step):
+                    result.final_answer = (
+                        "(Platform note: `deep_literature`, the indexed corpus, is not available in "
+                        "this session, so the platform searched Europe PMC with literature_search. "
+                        "Judge the citations below on their relevance to the step's question, not on "
+                        "which of the two tools found them.)\n\n" + (result.final_answer or ""))
+                return result
 
         # Adopt the specialist persona for this step (multi-role, Virtual-Lab style).
         parts = [f"You are the {specialist.name}. {specialist.persona}",
