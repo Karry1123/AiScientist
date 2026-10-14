@@ -2782,7 +2782,6 @@ async function connect(e) {
     // newly-minted key on a password+Duo login.
     key_passphrase: (useKey ? $("keyPassInput").value : ($("newKeyPassInput") && $("newKeyPassInput").value)) || null,
     host: $("hostInput").value.trim(),
-    campus_network_confirmed: $("campusCheck").checked,
     mock: $("mockCheck").checked,
     // Chosen on THIS form, so the server knows before it provisions: with your own endpoint it
     // skips the GPU allocation entirely instead of queueing for a card nothing will use.

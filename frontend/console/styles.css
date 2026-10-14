@@ -116,7 +116,7 @@ body {
 .form { display: flex; flex-direction: column; gap: 13px; margin-bottom: 24px; }
 .form label { display: flex; flex-direction: column; gap: 6px; font-size: 12.5px; color: var(--text-secondary); font-weight: 500; }
 /* The connect form is the tallest thing in the left panel (host + UCInetID + auth + password +
-   Duo + Remember-me + passphrase + campus + mock + Connect). On a laptop-height viewport its
+   Duo + Remember-me + passphrase + mock + Connect). On a laptop-height viewport its
    primary action (Connect) was pushed below the fold. Tighten just THIS form's vertical rhythm so
    the whole form fits; the panel still scrolls on very short viewports. */
 #connectForm { gap: 8px; margin-bottom: 14px; }

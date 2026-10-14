@@ -156,11 +156,9 @@ files is exactly what we do not do. Raise it with Ziyao; the destination if he a
 
 `serve.sbatch` / `serve.gpu.sbatch` / `serve.free_gpu32.sbatch`, `vllm.<jobid>.port` + `vllm.port`
 and `vllm.<jobid>.spec` (how the gateway finds and steers a running vLLM), with the serve job's log
-beside it at `$HOME/bioagent-vllm-<jobid>.log`. These are the only files the application still
-writes in the home directory. The `analysis/ jobs/ ollama/ report/ runcode/ variant/` dirs there are
-left over: job files went to `Temp/<ucinetid>/scratch/` in two steps (2026-08-08, and the analysis,
-report and worker lines on 2026-10-12) and can be deleted by hand, see
-`docs/hpc3_storage_layout.md`. Small; not swept. Note `$HOME` is a separate, much smaller quota
+beside it at `$HOME/bioagent-vllm-<jobid>.log`. These are the only files the application writes in
+the home directory; every other job file goes to `Temp/<ucinetid>/scratch/` (see
+`docs/hpc3_storage_layout.md`). Small; not swept. Note `$HOME` is a separate, much smaller quota
 than dfs3b.
 
 ## Legacy per-member dirs — `/dfs3b/ruic20_lab/<ucinetid>/`

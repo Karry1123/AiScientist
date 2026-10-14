@@ -62,9 +62,10 @@ class SSHExecutor:
     on the same executor instead of failing on the first command after a network blip.
     """
 
-    # Seconds to wait before each reconnect attempt: ~2 minutes in all, long enough for a VPN or
-    # Wi-Fi hand-over to come back, short enough that a network that is really gone fails the run
-    # with a clear message instead of hanging it.
+    # Seconds to wait before each reconnect attempt: ~2 minutes in all, long enough for a network
+    # blip on the gateway host (or, on a developer's laptop, a VPN or Wi-Fi hand-over) to come
+    # back, short enough that a network that is really gone fails the run with a clear message
+    # instead of hanging it.
     _reconnect_delays: tuple[float, ...] = (0.0, 5.0, 15.0, 30.0, 60.0)
     # The key a dropped session reconnects with: the login key on key auth, or one armed after a
     # password + Duo login (:meth:`arm_reconnect_key`). None = no silent reconnect is possible.
@@ -137,8 +138,9 @@ class SSHExecutor:
             ) from exc
         except (paramiko.SSHException, socket.error, OSError) as exc:
             raise GatewayError(
-                f"Could not open an SSH connection to {host}:{port}. Confirm you "
-                "are on the UCI campus network or VPN and the host is reachable.",
+                f"The AiScientist server could not open an SSH connection to {host}:{port}. "
+                "HPC3 may be down or in maintenance: try again in a few minutes. (Only a gateway "
+                "running on your own computer needs the UCI campus network or VPN.)",
                 stage="ssh_connect",
                 detail=error_detail(exc),
             ) from exc
@@ -351,8 +353,8 @@ class SSHExecutor:
             return
         raise GatewayError(
             f"SSH session is no longer active, and {attempts} attempts to reconnect to {self.host} "
-            f"over {int(sum(self._reconnect_delays))}s failed. Check the network or VPN, then "
-            "reconnect from the login panel.",
+            f"over {int(sum(self._reconnect_delays))}s failed. The AiScientist server cannot reach "
+            "HPC3 right now: reconnect from the login panel in a few minutes.",
             stage="ssh_exec", detail=error_detail(last_error) if last_error else None)
 
     def _open_channel(self, timeout: float) -> paramiko.Channel:

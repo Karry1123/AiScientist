@@ -92,7 +92,7 @@ flowchart TB
     registry -->|"adds platform tools"| shell["hpc/shell.py"]
     lab -->|"runs each step"| harness["agents/research_harness.py"]
     lab -->|"picks a protocol"| pipelines["preset_pipelines/"]
-    harness -->|"calls, many as HPC3 jobs"| folders["tools/NAME/ (20 folders)"]
+    harness -->|"calls, many as HPC3 jobs"| folders["tools/NAME/ (one folder per tool)"]
     harness -->|"reads on demand"| skills["skills/"]
     catalog -->|"loads"| folders
     folders -->|"implement"| sdk["tools/sdk.py"]
@@ -108,8 +108,8 @@ flowchart TB
 | `skills/`, `preset_pipelines/` | Plain files: atomic CodeAct templates the Scientist adapts, and end-to-end protocols the PI picks |
 | `frontend/console/` | The web UI |
 
-Two files are large enough to deserve a warning: `gateway/app.py` (8.4k lines) and
-`agents/research_lab.py` (6.5k). Read the matching notes in `handoff/yijun/HANDOFF.md` before
+Two files are large enough to deserve a warning: `gateway/app.py` and
+`agents/research_lab.py`. Read the matching notes in `handoff/yijun/HANDOFF.md` before
 changing either; many branches that look redundant fix a specific production incident.
 
 ## Tools, skills and pipelines

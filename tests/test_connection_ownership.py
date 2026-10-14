@@ -247,8 +247,16 @@ def no_provision(monkeypatch):
 
 
 def _connect(site, **body):
-    return site.client.post("/api/connect", json={"ucinetid": "alice", "campus_network_confirmed": True,
-                                                   "auth_method": "ssh_key", **body})
+    return site.client.post("/api/connect", json={"ucinetid": "alice", "auth_method": "ssh_key", **body})
+
+
+@pytest.mark.parametrize("old_page_field", [{}, {"campus_network_confirmed": False}])
+def test_connect_asks_nothing_about_the_callers_network(site, no_provision, old_page_field):
+    """The SSH to HPC3 starts on the gateway host, so a real connect needs no "on campus / VPN"
+    confirmation; a page loaded before the checkbox was removed still sends the field, unticked."""
+    site.who["user"] = MALLORY
+    r = _connect(site, mock=False, **old_page_field)
+    assert r.status_code == 200 and len(no_provision) == 1
 
 
 def test_connect_needs_a_login(site, no_provision):

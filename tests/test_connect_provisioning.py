@@ -40,7 +40,7 @@ def _conn():
 
 
 def _req():
-    return gw_app.ConnectRequest(ucinetid="tester", mock=True, campus_network_confirmed=True)
+    return gw_app.ConnectRequest(ucinetid="tester", mock=True)
 
 
 def test_ssh_phase_never_publishes_a_usable_half_connected_session():

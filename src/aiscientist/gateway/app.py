@@ -609,7 +609,6 @@ class ConnectRequest(BaseModel):
     duo_method: str = "push"         # "push" | "phone" | "passcode" — how to answer Duo
     credential_id: str | None = None  # use a saved SSH key (auth_method="ssh_key")
     create_key: bool = True          # after a password+Duo login, mint+deploy a reusable key
-    campus_network_confirmed: bool = False
     mock: bool = False
     # Which LLM answers for this session. Chosen HERE rather than only after connecting because
     # it decides whether the connect allocates a GPU at all: with your own API endpoint there is
@@ -1391,11 +1390,8 @@ async def connect(req: ConnectRequest, request: Request) -> JSONResponse:
                                 status_code=400)
         if cluster_model is not None:
             cluster_models.apply(settings, cluster_model)
-    if not req.mock and not req.campus_network_confirmed:
-        return JSONResponse(
-            {"error": "Confirm you are on the UCI campus network or VPN before connecting.", "stage": "precheck"},
-            status_code=400,
-        )
+    # No question about the user's network: the SSH to HPC3 starts on this host, so where the
+    # browser sits (campus, VPN or neither) has no bearing on whether the connect can succeed.
     if not req.mock and req.auth_method == "password_duo" and not req.password:
         return JSONResponse(
             {"error": "Password is required for password+Duo login.", "stage": "precheck"},

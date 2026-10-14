@@ -156,56 +156,6 @@ curl -I https://<PUBLIC_HOSTNAME>/         # 200, valid cert
   (drops only currently-connected sessions). Confirm the new build via the fingerprint line in
   `journalctl -u aiscientist`.
 
-## Moving the deployment root (`/data/BioAgent` → `/data/aiscientist`, 2026-10)
-
-The eyeserver deployment lived in `/data/BioAgent` under the unit `bioagent.service`. It moves to
-`/data/aiscientist` (the directory created with the `aiscientist` service account) under
-`aiscientist.service`, with `scripts/migrate_prod_root.sh`. A bare `mv` is not enough: the venv is
-an editable install whose `.pth`, biomni finder and console-script shebangs name the old root, so
-the service could no longer import itself; Postgres `datasets.path` and the runs' `run_state.json`
-/ `result_dataset.json` keep absolute paths the app does not re-derive; and the passwordless
-restart grant in `/etc/sudoers.d` names the old unit.
-
-```
-scp scripts/migrate_prod_root.sh eyeserver-admin:/tmp/
-ssh -t eyeserver-admin 'sudo bash /tmp/migrate_prod_root.sh'           # preflight, changes nothing
-ssh -t eyeserver-admin 'sudo bash /tmp/migrate_prod_root.sh --apply'   # needs prod idle (FORCE=1 overrides)
-```
-
-`--apply` stops the service, moves the tree (same filesystem: a rename, seconds), leaves a
-compatibility symlink `/data/BioAgent → /data/aiscientist`, rewrites the old prefix in the venv,
-`.env` (`AISCIENTIST_STATE_DIR`, `AISCIENTIST_INDUCED_SKILLS_DIR`), the `datasets.path` /
-`runs.artifacts_path` rows and the runs' JSON (in place, modification times kept, so a finished
-run does not look freshly written), installs `aiscientist.service`, rewrites every
-`/etc/sudoers.d` file that names `bioagent.service` (each checked with `visudo`; `bioagent-deploy`
-becomes `aiscientist-deploy`), then starts and health-checks the service. A sudoers line that names
-the unit without `.service`, or sits in `/etc/sudoers` itself, is listed and left for a hand edit.
-Everything it edits is backed up first in `/data/aiscientist/env-backups/root-move-<stamp>/`;
-`--rollback` restores from there.
-
-The script is rehearsed in a container before it touches the host: `deploy/rehearsal/run.sh`
-(Docker; about four minutes) builds a miniature of the host and runs every mode as root with 123
-assertions. Re-run it after any change to the script.
-
-Then, by hand: log in; open an old run; continue one; check that an existing API key still lists
-its models (this resolves the stored secret — a listing alone proves nothing); connect with a saved
-SSH key; bind an old upload. Deploy from the branch that carries the new defaults
-(`scripts/sync_deploy.sh`: `APP_DIR=/data/aiscientist/app`, `SERVICE=aiscientist`) and update your
-local `.deploy.env` (`REMOTE_APP`).
-
-Afterwards:
-- Remove the symlink once nothing names the old root:
-  `grep -rl --include='*.json' -F /data/BioAgent/ /data/aiscientist/app/runs` is empty and no
-  `datasets.path` row starts with it. Old chat messages may still mention it in text; that is harmless.
-- `sudo bash /tmp/migrate_prod_root.sh --harden` drops the inherited `group:users` ACL and
-  other-access, without a restart, and leaves the directories that are already closed (`state/`,
-  `env-backups/`) closed. `users` holds nearly every account on the host, and with that ACL any of them could
-  replace a package in the venv and run code as the service account, which holds every user's HPC3
-  key and API keys. Admins keep access through `sudo -u aiscientist`.
-- The unused `bioagent` system account (uid 994, `/home/bioagent`) can go: `sudo userdel -r bioagent`
-  after checking its home. The Postgres role and database keep the name `bioagent` (renaming a role
-  needs a matching `AISCIENTIST_DATABASE_URL` change and can clear an md5 password).
-
 ## Public-exposure security checklist
 
 - [ ] `AISCIENTIST_SECRET_KEY` is strong and unique (not the dev secret).

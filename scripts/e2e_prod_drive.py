@@ -192,8 +192,7 @@ def main() -> int:
         if st != 200:
             return 1
 
-    st, r = d.post("/api/connect", {"ucinetid": a.user, "auth_method": "ssh_key",
-                                    "key_path": a.key, "campus_network_confirmed": True})
+    st, r = d.post("/api/connect", {"ucinetid": a.user, "auth_method": "ssh_key", "key_path": a.key})
     print("connect ->", st, r.get("connection_id"), r.get("error"))
     if st == 401 and not password:
         print("accounts are on: set AISCIENTIST_PASSWORD (and --account if it is not --user)")
