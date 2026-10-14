@@ -6,6 +6,7 @@ const CONN_KEY = "bioagent_connection_v1";  // last live connection id — survi
 const LASTCONN_KEY = "bioagent_lastconn_v1"; // summary of the last ready session — powers the "reattach" hint after a gateway restart
 const RUNOWNER_KEY = "bioagent_runowner_v1"; // {connId, sid}: which chat owns the in-flight run — survives a reload so results never leak to the active chat
 const LASTRUN_KEY = "bioagent_lastrun_v1";   // last COMPLETED run_id — survives a refresh so we can still recognise this conn's own run
+const PLANDRAFT_KEY = "aiscientist_plandraft_v1"; // {sid, run, base, text, open}: the plan editor's unapplied text — survives a reload while that plan is still waiting
 
 const state = {
   connectionId: null,
@@ -48,10 +49,15 @@ const state = {
   lastRunId: null,             // last completed run on this conn (used to recognise our own run after a refresh)
   leftAutoCollapsed: false,    // collapse the connect panel once, on first ready
   planPending: false,          // a PI plan/clarify is awaiting the user's decision
+  planPrompt: null,            // that prompt itself: {kind: "plan"|"clarify"|"decision", sid, run, …payload}.
+                               // Its card is drawn FROM it, so the card can be drawn again after the
+                               // chat stream is rebuilt, or wait until its chat (sid) is on screen.
   planRevisedSteps: [],        // 1-based step numbers this redraft actually changed (server-sent)
   planDoc: null,               // the plan as a document {yaml, steps} when the server sends one
   planProblems: [],            // why the last edit of that document was refused
-  planDraftYaml: "",           // the text of an edit just sent, kept so a refused edit is not lost
+  planDraftYaml: "",           // what is typed in the plan editor and not applied
+  planDraftBase: "",           // the plan document (its YAML) that text and the open editor belong to
+  planEditorOpen: false,       // the plan editor is open on the pending card
   planStatusEl: null,          // the resolved plan card's status line, updated as the PI works
 };
 
@@ -861,6 +867,8 @@ async function deleteSession(id) {
     state.runSessionId = null;
     setRunning(false);
   }
+  // A prompt that was waiting in this chat has nowhere left to be answered.
+  if (state.planPrompt && state.planPrompt.sid === id) { hidePlanPanel(); dropPlanDraft(); }
   const gone = state.sessions.find((s) => s.id === id);
   // Load this chat's messages first (server-backed chats load lazily) so we know
   // which run artifacts to clean up even if it was never opened this session.
@@ -909,15 +917,23 @@ function relTime(iso) {
   return d.toLocaleDateString(undefined, { month: "short", day: "numeric" });
 }
 
+// What the sidebar says about a chat whose prompt is waiting: the card is only on screen while
+// that chat is, so this is how a person in another chat learns that something waits for them.
+const PLAN_WAITING_LABEL = { plan: "Plan to review", clarify: "Question for you", decision: "Decision needed" };
+
 function renderSessionList() {
   const list = $("sessionList");
   if (!state.sessions.length) { list.innerHTML = '<div class="session-empty">No chats yet.</div>'; return; }
+  const waiting = state.planPrompt;
+  const waitingHtml = (s) => (waiting && waiting.sid === s.id)
+    ? `<span class="session-waiting" title="This chat is waiting for your answer">${PLAN_WAITING_LABEL[waiting.kind] || "Waiting for you"}</span>`
+    : "";
   list.innerHTML = state.sessions
     .map((s) => `
       <div class="session-item ${s.id === state.activeId ? "active" : ""}" data-id="${s.id}">
         <span class="session-text">
           <span class="session-title">${escapeHtml(s.title || "New chat")}</span>
-          <span class="session-time" title="${escapeHtml(absTime(s.updatedAt || s.createdAt))}">${escapeHtml(relTime(s.updatedAt || s.createdAt))}</span>
+          <span class="session-meta">${waitingHtml(s)}<span class="session-time" title="${escapeHtml(absTime(s.updatedAt || s.createdAt))}">${escapeHtml(relTime(s.updatedAt || s.createdAt))}</span></span>
         </span>
         <button class="session-del" data-del="${s.id}" title="Delete chat" aria-label="Delete chat">✕</button>
       </div>`)
@@ -931,13 +947,18 @@ function renderChat() {
   $("chatTitle").textContent = s ? s.title || "New chat" : "New chat";
   const stream = $("chatStream");
   stream.innerHTML = "";
+  // The plan card went with the rest of the stream. It is not a saved message: a prompt still
+  // waiting is drawn again below, from state.planPrompt.
+  state.planCardEl = null;
+  state.planStatusEl = null;
   // Always re-derive the downloads panel from the ACTIVE session — including the
   // empty-session case below, which used to early-return and leave the previous
   // session's downloads stranded in the panel.
   refreshDownloads();
   syncPresetUI();   // reflect this chat's research-path context in the controls
-  if (!s || (!s.messages.length && !ownerVisible())) {
+  if (!s || (!s.messages.length && !ownerVisible() && !planPromptVisible())) {
     stream.innerHTML = '<div class="empty-hint">Connect to a GPU-backed Qwen3 on HPC3, then ask a research question.</div>';
+    updateComposerButton();
     return;
   }
   for (const m of s.messages) stream.appendChild(messageEl(m));
@@ -945,6 +966,12 @@ function renderChat() {
   // from state — so switching back to a running chat resumes the live stream instead of
   // showing a frozen/blank bubble.
   mountStream();
+  // Same for a plan, a question or a decision point that is waiting in this chat: its card with
+  // its buttons comes back, instead of a composer that says a plan is pending and nothing to act on.
+  drawPlanPrompt();
+  // The composer follows the chat on screen: its Send/Stop button and its placeholder say whether
+  // this chat owns the run, and both were last set for the chat that was left.
+  updateComposerButton();
   stream.scrollTop = stream.scrollHeight;
 }
 
@@ -1264,6 +1291,10 @@ function hideContextMeter() { const el = $("ctxMeter"); if (el) el.classList.add
 
 function finishAssistantStream() {
   if (state.runTimer) { clearInterval(state.runTimer); state.runTimer = null; }
+  // The run is over, so nothing of it can still be waiting for an answer. A plan review that
+  // expired sends no plan_done: without this its card would be drawn again on every switch of chats.
+  if (state.planPrompt || state.planPending) { removePlanCard(); hidePlanPanel(); }
+  dropPlanDraft();
   if (!state.run) { clearRunOwner(); return; }
   const owner = state.runSessionId || state.activeId;
   const run = state.run;
@@ -1562,6 +1593,9 @@ function applyStatus(summary) {
   const showProvisionView = isProvisioning && !state.everConnected;
   const showConnected = isReady || (isProvisioning && state.everConnected);
   if (isLogin && state.running) setRunning(false);   // only a lost/failed connection kills a run
+  // Without a connection a prompt cannot be answered (submitPlan has nowhere to send it), so it is
+  // not kept to be drawn again. A session that is still alive replays it when the socket reopens.
+  if (summary.status === "disconnected" && state.planPrompt) { removePlanCard(); hidePlanPanel(); }
   // Restore the "running" UI after a reload/reconnect: the server says a run is still in
   // flight, so show Stop even before the first replayed token arrives.
   if (showConnected && summary.chat_running && !state.running) setRunning(true);
@@ -2736,7 +2770,11 @@ function handleWsMessage(msg) {
     case "lab_progress": streamProgress(msg); break;
     case "run_status": streamStatus(msg.text); break;
     case "step_code": streamCode(msg.code); break;
-    case "chat_context": renderContextMeter(msg); break;
+    // The meter describes the chat that took the turn: shown only while that chat is on screen
+    // (switching chats hides it, see selectSession), never in the chat the user switched to.
+    case "chat_context":
+      if ((msg.conversation_id || state.runSessionId || state.activeId) === state.activeId) renderContextMeter(msg);
+      break;
     case "chat_done": finishAssistantStream(); setRunning(false); break;
     case "chat_stopped":
       if (state.run && !state.run.text) state.run.text = "_⏹ Stopped._";
@@ -2751,14 +2789,13 @@ function handleWsMessage(msg) {
       break;
     case "duo_prompt": showDuoPanel(msg.prompt); break;
     case "duo_done": hideDuoPanel(); break;
+    // The three prompts that wait for the user are held in state first and drawn from there
+    // (holdPlanPrompt): only into the chat that owns the run, and again whenever that chat is rebuilt.
     case "plan_prompt":
-      state.planRevisedSteps = msg.revised || [];
-      state.planDoc = msg.plan || null;
-      state.planProblems = msg.problems || [];
-      showPlanPanel(msg.agenda);
+      holdPlanPrompt("plan", { agenda: msg.agenda || [], doc: msg.plan || null, problems: msg.problems || [] }, msg);
       break;
-    case "plan_clarify": showClarify(msg.questions); break;
-    case "decision_prompt": showDecision(msg.goal, msg.options); break;
+    case "plan_clarify": holdPlanPrompt("clarify", { questions: msg.questions || [] }, msg); break;
+    case "decision_prompt": holdPlanPrompt("decision", { goal: msg.goal || "", options: msg.options || [] }, msg); break;
     case "plan_done": hidePlanPanel(); break;
     case "plan_status": setPlanStatus(msg.text); break;
     case "plan_expiring": setPlanStatus("⏳ This plan expires in a few minutes — reply, approve, or cancel to keep it."); break;
@@ -2892,7 +2929,7 @@ async function stopGpu() {
 // Drop a stored connection the server refuses to serve to this user, without calling it.
 function forgetConnection() {
   if (state.ws) { try { state.ws.close(); } catch {} }
-  try { localStorage.removeItem(CONN_KEY); localStorage.removeItem(RUNOWNER_KEY); } catch {}
+  try { localStorage.removeItem(CONN_KEY); localStorage.removeItem(RUNOWNER_KEY); localStorage.removeItem(PLANDRAFT_KEY); } catch {}
   state.connectionId = null;
   state.lastJobId = null;
   applyStatus({ status: "disconnected", model: "" });
@@ -3080,6 +3117,137 @@ async function sendChat(e) {
 // ephemeral (buttons can't persist); on approval the plan is saved to history as text.
 const DEFAULT_PLACEHOLDER = "Ask AiScientist to plan or interpret an ocular bioinformatics analysis...";
 
+// ---- the prompt that is waiting, kept apart from its card ---------------------------------------
+// A plan, a clarify question or a decision point waits for the user in ONE chat: the one that owns
+// the run. Its card is DOM, and renderChat() empties the stream on every switch of chats, so the
+// card alone cannot be where the prompt lives: switching away and back left a composer that said a
+// plan was pending and no Run / Cancel / Edit as YAML to act on, until a full page reload made the
+// server replay it. So the prompt is held in state (state.planPrompt) from the moment it arrives
+// until it is resolved, and the card is drawn FROM it: when it arrives and its chat is on screen,
+// when that chat is rebuilt, and for the first time when it arrived while another chat was shown.
+
+// The chat a prompt belongs to. The server tags it with the run's conversation; an untagged one
+// (an older server) belongs to the chat that launched the run.
+function planPromptOwner(msg) {
+  return (msg && msg.conversation_id) || state.runSessionId || state.activeId;
+}
+
+function planPromptVisible() {
+  return !!state.planPrompt && state.planPrompt.sid === state.activeId;
+}
+
+function holdPlanPrompt(kind, payload, msg) {
+  const held = state.planPrompt;
+  const next = { kind, sid: planPromptOwner(msg), run: (msg && msg.run_id) || null, ...payload };
+  if (kind === "plan") {
+    // The server sends a pending plan again whenever a socket subscribes (a reconnect, a reload),
+    // without the `revised` marks: a plan that is repeated keeps the ones it first came with.
+    const repeated = !!held && held.kind === "plan"
+      && JSON.stringify([held.agenda, held.doc]) === JSON.stringify([next.agenda, next.doc]);
+    next.revised = msg.revised || (repeated ? held.revised : []);
+  }
+  const same = !!held && JSON.stringify(held) === JSON.stringify(next);
+  state.planPrompt = next;
+  state.planPending = true;
+  if (kind === "plan") {
+    state.planAgenda = next.agenda;
+    state.planDoc = next.doc;
+    state.planRevisedSteps = next.revised;
+    state.planProblems = next.problems;
+    keepPlanDraft(next);
+  }
+  // The prompt that is already on screen, sent again: its card stays as it is, with the caret
+  // where the person left it.
+  if (same && state.planCardEl && state.planCardEl.isConnected) return;
+  renderSessionList();
+  if (planPromptVisible()) { drawPlanPrompt(); return; }
+  // Another chat is on screen. The prompt is not drawn into it (it would be a card for a plan that
+  // chat never asked for, and the owning chat would then show none); it waits for its own chat.
+  updateComposerButton();
+  const owner = state.sessions.find((s) => s.id === next.sid);
+  if (owner && !same) toast(`“${(owner.title || "New chat").trim()}” is waiting for your answer — open that chat to reply.`);
+}
+
+function drawPlanPrompt() {
+  const p = state.planPrompt;
+  if (!p || !planPromptVisible()) return;
+  if (p.kind === "clarify") showClarify(p.questions);
+  else if (p.kind === "decision") showDecision(p.goal, p.options);
+  else showPlanPanel(p.agenda);
+}
+
+// The prompt was answered, or can no longer be: nothing is drawn for it again.
+function releasePlanPrompt() {
+  const was = !!state.planPrompt;
+  state.planPrompt = null;
+  state.planPending = false;
+  if (was) renderSessionList();
+}
+
+// What is typed in the plan editor and not applied, and whether the editor is open, belong to ONE
+// plan document (state.planDraftBase). They are kept for as long as the server keeps sending that
+// document: when the card is rebuilt, when the prompt is replayed after a reconnect or a page
+// reload (the browser's storage carries them over the reload), when the PI answers a question
+// and leaves the plan alone. A different document drops them. An edit the server refused left the
+// plan unchanged, so what was typed stays.
+function keepPlanDraft(p) {
+  const yaml = (p.doc && p.doc.yaml) || "";
+  if (yaml && !state.planDraftBase) loadPlanDraft(p);
+  const refused = p.problems.length > 0 && !!state.planDraftYaml;
+  if (!yaml || (state.planDraftBase !== yaml && !refused)) {
+    state.planDraftYaml = "";
+    state.planEditorOpen = false;
+  }
+  state.planDraftBase = yaml;
+  savePlanDraft();
+}
+
+// The editor reports each change as it happens, so there is never a card whose text exists only in
+// its textarea. Returns whether the text differs from the plan it edits.
+function notePlanDraft(text) {
+  const original = (state.planDoc && state.planDoc.yaml) || "";
+  const dirty = !!text.trim() && text.trim() !== original.trim();
+  state.planDraftYaml = dirty ? text : "";
+  state.planDraftBase = original;
+  savePlanDraft();
+  return dirty;
+}
+
+function notePlanEditorOpen(open) {
+  state.planEditorOpen = !!open;
+  savePlanDraft();
+}
+
+function savePlanDraft() {
+  const p = state.planPrompt;
+  try {
+    if (p && p.kind === "plan" && state.planDraftBase && (state.planDraftYaml || state.planEditorOpen)) {
+      localStorage.setItem(PLANDRAFT_KEY, JSON.stringify({
+        sid: p.sid, run: p.run, base: state.planDraftBase, text: state.planDraftYaml, open: state.planEditorOpen }));
+    } else {
+      localStorage.removeItem(PLANDRAFT_KEY);
+    }
+  } catch { /* private mode: the draft still survives a re-render, only not a reload */ }
+}
+
+// After a page reload: what this browser had typed for THIS run's plan. keepPlanDraft then checks
+// it against the document the server sent.
+function loadPlanDraft(p) {
+  let d = null;
+  try { d = JSON.parse(localStorage.getItem(PLANDRAFT_KEY) || "null"); } catch {}
+  if (!d || d.sid !== p.sid || (d.run || null) !== p.run) return;
+  state.planDraftBase = String(d.base || "");
+  state.planDraftYaml = String(d.text || "");
+  state.planEditorOpen = !!d.open;
+}
+
+function dropPlanDraft() {
+  state.planDraftYaml = "";
+  state.planDraftBase = "";
+  state.planEditorOpen = false;
+  try { localStorage.removeItem(PLANDRAFT_KEY); } catch {}
+}
+
 function removePlanCard() {
   if (state.planCardEl) { state.planCardEl.remove(); state.planCardEl = null; }
   state.planStatusEl = null;   // the old card's status line went with it
@@ -3200,14 +3368,21 @@ function planCardHtml(agenda, doc, revisedSteps) {
 function planEditorHtml(doc) {
   if (!doc || !doc.yaml) return "";
   const problems = state.planProblems || [];
-  // A refused edit reopens with what was typed, not with the plan it failed to change.
-  const text = (problems.length && state.planDraftYaml) ? state.planDraftYaml : doc.yaml;
+  // A refused edit reopens with what was typed, not with the plan it failed to change. So does a
+  // card that is drawn again for the same document (keepPlanDraft): the text was never applied,
+  // and the textarea is the only place it was.
+  const mine = state.planDraftBase === doc.yaml;
+  const draft = (state.planDraftYaml && (problems.length || mine)) ? state.planDraftYaml : "";
+  const text = draft || doc.yaml;
+  // Open where the person left it open, and whenever it holds text that is not applied: "Run this
+  // plan" is disabled then, and the reason has to be on screen.
+  const open = problems.length > 0 || !!draft || (mine && !!state.planEditorOpen);
   const rows = Math.max(8, Math.min(26, text.split("\n").length + 1));
   const banner = problems.length
     ? `<div class="plan-yaml-problems">${planIcon("error")}<div><strong>Your edit was not applied — the plan is unchanged.</strong>`
       + `<ul>${problems.map((x) => `<li>${escapeHtml(x)}</li>`).join("")}</ul></div></div>`
     : "";
-  return `<div class="plan-yaml${problems.length ? "" : " hidden"}">`
+  return `<div class="plan-yaml${open ? "" : " hidden"}">`
     + `<div class="plan-yaml-bar"><span class="plan-yaml-file">${planIcon("data_object")}plan.yaml</span>`
     + `<span class="plan-yaml-tip">Change a setting, reword, remove, reorder or add a step. `
     + `Your edit is applied exactly as written; nothing else in the plan changes.</span></div>`
@@ -3243,7 +3418,7 @@ function wirePlanEditor(el) {
   // While the box holds an edit that has not been applied, "Run this plan" would run the plan
   // WITHOUT it. So the edit becomes the primary action and Run waits for Apply or Reset.
   const sync = () => {
-    const dirty = !!box.value.trim() && box.value.trim() !== original.trim();
+    const dirty = notePlanDraft(box.value);
     apply.disabled = !dirty;
     apply.classList.toggle("primary", dirty);
     apply.classList.toggle("secondary", !dirty);
@@ -3252,6 +3427,7 @@ function wirePlanEditor(el) {
   };
   toggle.addEventListener("click", () => {
     panel.classList.toggle("hidden");
+    notePlanEditorOpen(!panel.classList.contains("hidden"));
     label();
     if (!panel.classList.contains("hidden")) box.focus();
   });
@@ -3266,7 +3442,6 @@ function wirePlanEditor(el) {
   apply.addEventListener("click", () => submitPlan("edit", "", box.value));
   panel.querySelector('[data-plan="reset"]').addEventListener("click", () => {
     box.value = original;
-    state.planDraftYaml = "";
     sync();
   });
   label();
@@ -3344,7 +3519,7 @@ function showDecision(goal, options) {
 async function submitDecision(choice) {
   if (!state.connectionId) return;
   finalizePlanCard(choice ? `✓ Chose: ${choice}` : "✓ Proceeding — agent decides");
-  state.planPending = false;
+  releasePlanPrompt();
   $("chatInput").placeholder = DEFAULT_PLACEHOLDER;
   mountStream();
   repaintWorking();
@@ -3389,7 +3564,7 @@ function setPlanStatus(text) {
 function hidePlanPanel() {
   // plan_done (any resolution). Card finalization happens in submitPlan; here we only
   // clear the pending state + restore the composer (idempotent).
-  state.planPending = false;
+  releasePlanPrompt();
   $("chatInput").placeholder = DEFAULT_PLACEHOLDER;
   updateComposerButton();
 }
@@ -3405,7 +3580,12 @@ async function submitPlan(action, feedback, planYaml) {
   const agendaMd = (state.planAgenda && state.planAgenda.length)
     ? "## 📋 Research plan\n\n" + state.planAgenda.map((s, i) => `${i + 1}. ${s}`).join("\n") + docMd
     : null;
-  state.planDraftYaml = action === "edit" ? (planYaml || "") : "";
+  // An edit that is sent stays as the draft until the server answers: refused, it comes back in the
+  // editor. A reply in words leaves the draft alone too — the PI may answer a question and send the
+  // same plan again. Only a plan that is run or cancelled has no use for it (keepPlanDraft drops it
+  // when the plan changes).
+  if (action === "edit") state.planDraftYaml = planYaml || "";
+  else if (action !== "revise") dropPlanDraft();
   if (action === "approve") {
     finalizePlanCard("▶ Approved — running…", agendaMd);
     // Re-anchor the live bubble below the just-approved plan so the run's activity
@@ -3419,7 +3599,7 @@ async function submitPlan(action, feedback, planYaml) {
   // untouched) or a CHANGE (re-planned). Claiming "re-planning" up front was wrong for every
   // question, and stayed wrong on screen for the whole 10-20 min the answer took.
   else finalizePlanCard("✎ Sent to the PI — reading your reply…");
-  state.planPending = false;
+  releasePlanPrompt();
   $("chatInput").placeholder = DEFAULT_PLACEHOLDER;
   updateComposerButton();
   try {
@@ -3462,7 +3642,7 @@ window.addEventListener("online", uploadsLinkBack);
 // Say what stopped an upload in words the user can act on. `where` is " at 31%" or "", `next` is
 // what continuing takes. The library's own message stays available as the card's tooltip.
 function uploadFailure(err, where, next) {
-  const res = err && err.originalResponse;
+  const res = tusResponseOf(err);
   const status = res ? res.getStatus() : 0;
   let said = "";
   if (res) { try { said = JSON.parse(res.getBody() || "{}").error || ""; } catch { /* not JSON */ } }
@@ -3472,6 +3652,11 @@ function uploadFailure(err, where, next) {
   if (status === 507) return { lost: false, detail, text: "The server's disk is too full for this file." };
   if (status >= 500) return { lost: true, detail, text: `The server did not answer (HTTP ${status})${where}. ${next}` };
   if (status === 401) return { lost: false, detail, text: "You are signed out. Sign in again, then continue the upload." };
+  if (status === 408 || status === 423) {   // the server keeps the upload: no bytes came, or no session holds it
+    return { lost: true, detail, text: /connect/i.test(said)
+      ? `Upload paused${where}: this session is not connected (the server restarted, or you disconnected). Connect to HPC3 again. ${next}`
+      : `The connection was lost${where}. ${next}` };
+  }
   if (status === 413) return { lost: false, detail, text: "The file is larger than the server accepts." };
   if (status === 460) return { lost: false, detail, text: `A piece of the file kept arriving damaged${where}. ${next}` };
   if (status === 404 && /connection/i.test(said)) {
@@ -3573,6 +3758,70 @@ function hashUploadFile(file, ctrl) {
   promise.catch(() => uploadDigestCache.delete(file));
   return promise;
 }
+// -- resuming over tus ------------------------------------------------------------------------------
+// The server's answer behind a tus error. An error raised by one of the hooks below comes back
+// wrapped by tus-js-client, with the response only on the error it wraps.
+function tusResponseOf(err) {
+  return (err && err.originalResponse) || (err && err.causingError && err.causingError.originalResponse) || null;
+}
+// Asked after every failed request while attempts are left. Everything but a refusal by the server
+// is tried again: no answer at all, a 5xx from the proxy, a request the server gave up on because
+// no bytes came (408), a chunk that arrived damaged (460), an offset the server corrects (409), an
+// upload the server is still busy with or holds for a session not connected yet (423). The
+// library's own rule also gives up at once when the browser reports itself offline, which is
+// exactly when waiting is right.
+function tusShouldRetry(err) {
+  const res = tusResponseOf(err);
+  const status = res ? res.getStatus() : 0;
+  return status !== 507 && (status < 400 || status >= 500 || [408, 409, 423, 460].includes(status));
+}
+// tus-js-client continues an upload with a HEAD, and takes any answer but 2xx or 423 for "this upload
+// cannot be continued": it creates a new one and the file starts again from byte 0. On a 5xx it also
+// keeps the old one in storage and so never stores the new one, and a reload continues the abandoned
+// upload. A 504 from the proxy did both on prod (2026-10-13). Only the server saying the upload does
+// not exist (404) or failed for good (410) may start the file again; any other answer is raised
+// here, so tusShouldRetry decides and the stored upload is kept.
+function tusResumeGuard(req, res) {
+  if (req.getMethod() !== "HEAD") return;
+  const status = res.getStatus();
+  if ((status >= 200 && status < 300) || [404, 410, 423].includes(status)) return;
+  throw new window.tus.DetailedError(`tus: the server could not say where this upload stands (HTTP ${status})`, null, req, res);
+}
+// Where the server says a stored upload stands. `offset` is -1 when it did not say: a 423 (busy
+// with an earlier request, or no session connected) carries the offset it holds, as a 200 does.
+async function probeTusUpload(url, request = fetch) {
+  try {
+    const r = await request(url, { method: "HEAD", headers: tusHeaders() });
+    const offset = Number(r.headers.get("Upload-Offset")), length = Number(r.headers.get("Upload-Length"));
+    const said = (r.status === 200 || r.status === 423) && Number.isSafeInteger(offset) && offset >= 0;
+    return { status: r.status, offset: said ? offset : -1, length: said && Number.isSafeInteger(length) ? length : -1 };
+  } catch { return { status: 0, offset: -1, length: -1 }; }
+}
+const tusGone = (status) => status === 404 || status === 410;
+// Of the uploads this browser keeps for one file, the one to continue. There is normally one; two
+// tabs that sent the same file leave two, and the first in storage need not be the one further
+// along. Each is asked where it stands and the one furthest along is taken. The others are
+// forgotten, and their partial bytes on the server deleted, only when every one answered.
+async function pickPreviousUpload(previous, storage, request = fetch) {
+  if (previous.length < 2) return previous[0] || null;
+  const seen = await Promise.all(previous.map(async (up) => ({ up, ...(await probeTusUpload(up.uploadUrl, request)) })));
+  const alive = [];
+  for (const s of seen) {
+    if (tusGone(s.status)) await storage.removeUpload(s.up.urlStorageKey);
+    else alive.push(s);
+  }
+  if (!alive.length) return null;
+  const made = (s) => Date.parse(s.up.creationTime) || 0;
+  alive.sort((a, b) => b.offset - a.offset || made(b) - made(a));
+  if (alive.every((s) => s.offset >= 0)) {
+    for (const s of alive.slice(1)) {
+      await storage.removeUpload(s.up.urlStorageKey);
+      if (s.offset < s.length) request(s.up.uploadUrl, { method: "DELETE", headers: tusHeaders() }).catch(() => {});
+    }
+  }
+  return alive[0].up;
+}
+
 // Send one file over tus; resolves with the gateway's answer for the finished upload
 // ({status: "staging", job_id, …} when a copy to HPC3 follows, {status: "complete", …} otherwise).
 function tusUpload(file, fields, ctrl, hashPromise, onProgress, onWaitingForHash, onRetrying) {
@@ -3595,19 +3844,15 @@ function tusUpload(file, fields, ctrl, hashPromise, onProgress, onWaitingForHash
       fingerprint: async (f) => `tus:${apiKeyOwner()}:${fields.rel_path || f.name}:${f.size}:${f.lastModified}`,
       headers: { "X-Connection-ID": state.connectionId },
       metadata: { filename: file.name, connection_id: state.connectionId, ...fields },
-      // Asked after every failed request while attempts are left. Everything but a refusal by the
-      // server is tried again: no answer at all, a 5xx from the proxy, a chunk that arrived damaged
-      // (460), an offset the server corrects (409). The library's own rule also gives up at once
-      // when the browser reports itself offline, which is exactly when waiting is right.
       onShouldRetry(err) {
-        const status = err.originalResponse ? err.originalResponse.getStatus() : 0;
-        const again = status !== 507 && (status < 400 || status >= 500 || status === 409 || status === 423 || status === 460);
+        const again = tusShouldRetry(err);
         if (again) {
           waiting = true;
           if (!retrying) { retrying = true; if (onRetrying) onRetrying(true); }
         }
         return again;
       },
+      onAfterResponse: tusResumeGuard,
       onChunkComplete: moving,
       async onBeforeRequest(req) {
         waiting = false;                                             // the next attempt has begun
@@ -3658,9 +3903,9 @@ function tusUpload(file, fields, ctrl, hashPromise, onProgress, onWaitingForHash
       upload.abort(true).catch(() => {});
       reject(new DOMException("cancelled", "AbortError"));
     }, { once: true });
-    upload.findPreviousUploads().then((previous) => {
+    upload.findPreviousUploads().then((previous) => pickPreviousUpload(previous, upload.options.urlStorage)).then((previous) => {
       if (ctrl.signal.aborted) return;
-      if (previous.length) upload.resumeFromPreviousUpload(previous[0]);
+      if (previous) upload.resumeFromPreviousUpload(previous);
       upload.start();
     }).catch(reject);
   });
@@ -4177,17 +4422,16 @@ async function restorePendingCards() {
       const fingerprint = String(up.urlStorageKey || "").split("::")[1] || "";
       const meta = up.metadata || {};
       if (!fingerprint.startsWith(`tus:${owner}:`) || meta.rel_path || !up.uploadUrl) continue;   // a folder's file: its folder card speaks for it
-      let offset = -1, length = up.size || 0;
-      try {
-        const h = await fetch(up.uploadUrl, { method: "HEAD", headers: tusHeaders() });
-        if (h.status === 200) { offset = Number(h.headers.get("Upload-Offset")); length = Number(h.headers.get("Upload-Length")) || length; }
-        else if (h.status >= 400 && h.status < 500) { await storage.removeUpload(up.urlStorageKey); continue; }   // gone on the server
-        else continue;
-      } catch { continue; }                                                                       // unreachable now: ask again next time
-      if (!(offset >= 0) || offset >= length) { if (offset >= length) await storage.removeUpload(up.urlStorageKey); continue; }
+      const probe = await probeTusUpload(up.uploadUrl);
+      if (tusGone(probe.status)) { await storage.removeUpload(up.urlStorageKey); continue; }       // gone on the server
+      const offset = probe.offset, length = probe.length > 0 ? probe.length : (up.size || 0);
+      if (offset < 0) continue;                                         // no answer now (5xx, 401, offline): ask again next time
+      if (offset >= length) { if (probe.status === 200) await storage.removeUpload(up.urlStorageKey); continue; }   // complete
       const name = meta.filename || "upload";
       if (state.uploads.some((u) => u.name === name && u.size === length && u.status !== "pending")) continue;   // already running again
-      upsertUpload({ id: `p${Math.abs(hashStr(fingerprint)).toString(36)}`, kind: "file", name, size: length, sent: offset,
+      const id = `p${Math.abs(hashStr(fingerprint)).toString(36)}`;
+      if (state.uploads.some((u) => u.id === id && (u.sent || 0) >= offset)) continue;   // one file stored twice: show the one further along
+      upsertUpload({ id, kind: "file", name, size: length, sent: offset,
         status: "pending", error: "", note: `Interrupted at ${Math.floor((100 * offset) / length)}% — choose the file again to continue`,
         tusUrl: up.uploadUrl, tusKey: up.urlStorageKey });
     }

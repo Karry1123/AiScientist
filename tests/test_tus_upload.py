@@ -165,6 +165,85 @@ def test_new_connection_to_same_workspace_resumes_upload(env):
         gw.CONNECTIONS.pop(next_conn.id, None)
 
 
+def test_a_stalled_patch_never_holds_up_head_or_another_patch(env, monkeypatch):
+    """Prod, 2026-10-13: the browser's network path vanished mid-PATCH with no FIN or RST. That PATCH
+    held the upload until the proxy's 300 s idle timeout, the browser's HEAD waited behind it until
+    the proxy's 15 s request timeout answered 504, and tus-js-client sent the 14.57 GiB file again
+    from byte 0. Here the body stalls (it neither finishes nor disconnects): a HEAD and a second
+    PATCH are answered 423 at once with the true offset, the stalled PATCH is given up after the idle
+    timeout without moving the offset, and the same upload then continues."""
+    import httpx
+    import time
+    from aiscientist.gateway import tus_upload
+
+    client, conn, gw = env
+    monkeypatch.setattr(tus_upload, "_IDLE_SECONDS", 1.0)
+    payload = b"0123456789"
+    url = _create(client, conn, len(payload)).headers["location"]
+    parts = conn.workspace / "uploads" / ".parts"
+    upload_id = url.rsplit("/", 1)[-1]
+    tus = {"Tus-Resumable": "1.0.0"}
+    chunk = {**tus, "Content-Type": "application/offset+octet-stream", "Upload-Offset": "0"}
+    seen = {}
+
+    async def scenario():
+        asked_again = asyncio.Event()
+
+        async def stalled_body():
+            yield payload[:4]
+            asked_again.set()                 # the server has the first block and waits for more
+            await asyncio.Event().wait()      # none comes, and the connection stays open
+
+        async with httpx.AsyncClient(transport=httpx.ASGITransport(app=gw.app), base_url="http://test") as http:
+            stuck = asyncio.create_task(http.patch(url, headers=chunk, content=stalled_body()))
+            await asyncio.wait_for(asked_again.wait(), 5)
+            started = time.monotonic()
+            seen["head"] = await http.head(url, headers=tus)
+            seen["patch"] = await http.patch(url, headers=chunk, content=payload)
+            seen["quick"] = time.monotonic() - started
+            seen["stalled"] = await asyncio.wait_for(stuck, 10)
+            seen["files"] = sorted(p.name for p in parts.iterdir())
+            seen["after"] = await http.head(url, headers=tus)
+            seen["resumed"] = await http.patch(url, headers=chunk, content=payload)
+
+    asyncio.run(scenario())
+    assert seen["head"].status_code == 423 and seen["head"].headers["upload-offset"] == "0"
+    assert seen["patch"].status_code == 423
+    assert seen["quick"] < 0.5                                  # neither waited for the stalled PATCH
+    assert seen["stalled"].status_code == 408 and seen["stalled"].headers["upload-offset"] == "0"
+    # one upload, nothing staged left over, nothing appended
+    assert seen["files"] == [f"{upload_id}.json", f"{upload_id}.part"]
+    assert seen["after"].status_code == 200 and seen["after"].headers["upload-offset"] == "0"
+    assert seen["resumed"].status_code == 204
+    assert (conn.workspace / "uploads" / "data.csv").read_bytes() == payload
+    from aiscientist.gateway import upload_log
+    events = [e["event"] for e in upload_log.tail(conn.workspace)]
+    assert events == ["created", "busy", "busy", "chunk_dropped", "received"]
+
+
+def test_an_upload_without_a_live_connection_is_kept_not_forgotten(env, monkeypatch):
+    """After a gateway restart the account has no connection until the page connects again. The
+    404 answered then made tus-js-client forget the upload and send the file again from byte 0;
+    while the server still has it, the answer is 423 and the browser asks again."""
+    client, conn, gw = env
+    monkeypatch.setattr(gw, "CONSOLE_RUNS_DIR", conn.workspace.parent / "runs")
+    conn.workspace = gw.CONSOLE_RUNS_DIR / conn.owner
+    url = _create(client, conn, 6).headers["location"]
+    assert _patch(client, url, 0, b"abc", hashlib.sha256(b"abc").digest()).status_code == 204
+    gw.CONNECTIONS.pop(conn.id)                                  # the gateway restarted
+    try:
+        head = client.head(url, headers={"Tus-Resumable": "1.0.0"})
+        assert head.status_code == 423 and head.headers["upload-offset"] == "3"
+        assert _patch(client, url, 3, b"def").status_code == 423
+        assert client.head(f"/api/tus/{'0' * 32}", headers={"Tus-Resumable": "1.0.0"}).status_code == 404
+        assert client.get(url).status_code == 423
+    finally:
+        gw.CONNECTIONS[conn.id] = conn                           # the page connected again
+    assert client.head(url, headers={"Tus-Resumable": "1.0.0"}).headers["upload-offset"] == "3"
+    assert _patch(client, url, 3, b"def", hashlib.sha256(b"def").digest()).status_code == 204
+    assert (conn.workspace / "uploads" / "data.csv").read_bytes() == b"abcdef"
+
+
 def test_head_reloads_metadata_inside_lock(env, monkeypatch):
     client, conn, _gw = env
     from aiscientist.gateway import tus_upload

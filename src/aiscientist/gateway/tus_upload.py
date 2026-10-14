@@ -3,6 +3,14 @@
 Only this module owns bytes before a file is complete. The existing staging queue owns a
 completed file afterwards. Metadata is kept beside the part file so HEAD survives a gateway
 restart; every operation checks the connection's account ownership.
+
+No request ever waits for another one on the same upload. A browser whose network path vanishes
+without a FIN leaves its PATCH open here; a HEAD queued behind it outlived the proxy's 15-second
+request timeout (504), and tus-js-client takes any answer to its resume HEAD other than 2xx or 423
+for "cannot resume" and sends the file again from byte 0 (prod, 2026-10-13). So a request for an
+upload another request holds is answered 423 Locked at once, which tus-js-client retries, and a
+PATCH body that delivers nothing for ``_IDLE_SECONDS`` is given up. Its bytes are staged in
+``.incoming`` and dropped, so the persisted offset never moves.
 """
 from __future__ import annotations
 
@@ -22,6 +30,7 @@ from uuid import uuid4
 
 from fastapi import APIRouter, Request
 from fastapi.responses import Response
+from starlette.requests import ClientDisconnect
 
 from . import upload_log
 
@@ -29,6 +38,9 @@ router = APIRouter(prefix="/api/tus")
 _VERSION = "1.0.0"
 _MAX_SIZE = 100 * 1024**3
 _HEADERS = {"Tus-Resumable": _VERSION, "Cache-Control": "no-store"}
+# A live PATCH delivers a block every fraction of a second, even at 0.6 MiB/s. Well under the
+# proxy's 300 s stream idle timeout, which is what used to end a PATCH whose browser was gone.
+_IDLE_SECONDS = 30.0
 _locks_guard = threading.Lock()
 _locks: dict[str, asyncio.Lock] = {}
 _last_cleanup: dict[str, float] = {}
@@ -79,6 +91,39 @@ def _lock(upload_id: str) -> asyncio.Lock:
         return _locks.setdefault(upload_id, asyncio.Lock())
 
 
+def _busy(conn, upload_id: str, meta: dict, method: str) -> Response | None:
+    """423 Locked when another request holds this upload, else None. Called right before
+    ``async with _lock(upload_id)`` with no ``await`` in between, so nothing waits on the lock.
+
+    The answer carries the persisted offset: a PATCH in progress moves it only when it completes."""
+    if not _lock(upload_id).locked():
+        return None
+    upload_log.record(conn.workspace, "busy", upload_id=upload_id, method=method,
+                      name=meta.get("rel_path") or meta.get("name"), offset=meta.get("offset"),
+                      error="an earlier request for this upload is still open; answered 423 Locked")
+    return _answer(423, headers={"Upload-Offset": str(meta.get("offset", 0)),
+                                 "Upload-Length": str(meta.get("length", 0))},
+                   body={"error": "the server is still closing an earlier request for this upload"})
+
+
+class _Stalled(Exception):
+    """A PATCH body that delivered nothing for ``_IDLE_SECONDS``."""
+
+
+async def _blocks(request: Request):
+    """The request body block by block, or :class:`_Stalled` once ``_IDLE_SECONDS`` pass without one.
+    A path that vanished silently gives neither more bytes nor a disconnect."""
+    stream = request.stream().__aiter__()
+    while True:
+        try:
+            block = await asyncio.wait_for(stream.__anext__(), _IDLE_SECONDS)
+        except StopAsyncIteration:
+            return
+        except asyncio.TimeoutError:
+            raise _Stalled from None
+        yield block
+
+
 def _save(path: Path, meta: dict) -> None:
     temp = path.with_suffix(".json.tmp")
     temp.write_text(json.dumps(meta), encoding="utf-8")
@@ -127,7 +172,37 @@ def _load(request: Request, upload_id: str):
             continue
         gw._owned_conn(conn.id, request)
         return conn, meta, (path, part), None
-    return None, None, None, _answer(404, body={"error": "unknown upload"})
+    return None, None, None, _unattached(request, upload_id)
+
+
+def _unattached(request: Request, upload_id: str) -> Response:
+    """The answer for an upload no live connection reaches: 423 while its sidecar is in the caller's
+    workspace, 404 when there is none.
+
+    After a gateway restart, or a disconnect, the account has no connection until the page connects
+    again. A 404 then made tus-js-client forget the upload and send the file again from byte 0; on a
+    423 it keeps the upload and asks again."""
+    gw = _gw()
+    if gw._AUTH_ENABLED:
+        user = gw._optional_user(request)
+        if user is None:
+            return _answer(401, body={"error": "Not authenticated"})
+        owners = [gw.safe_name(user.username)]
+    else:                                    # one user, no accounts: the upload id is the key
+        owners = [p.parents[2].name for p in gw.CONSOLE_RUNS_DIR.glob(f"*/uploads/.parts/{upload_id}.json")]
+    for owner in owners:
+        try:
+            path = gw.CONSOLE_RUNS_DIR / owner / "uploads" / ".parts" / f"{upload_id}.json"
+            meta = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            continue
+        if meta.get("owner") != owner or (gw._AUTH_ENABLED and meta.get("app_user_id") not in (None, user.id)):
+            continue
+        return _answer(423, headers={"Upload-Offset": str(meta.get("offset", 0)),
+                                     "Upload-Length": str(meta.get("length", 0))},
+                       body={"error": "this session is not connected: connect to HPC3 again to continue "
+                                      "this upload, the server keeps what it received"})
+    return _answer(404, body={"error": "unknown upload"})
 
 
 @router.options("")
@@ -211,9 +286,11 @@ async def result(upload_id: str, request: Request) -> Response:
 async def head(upload_id: str, request: Request) -> Response:
     if wrong := _require_version(request):
         return wrong
-    conn, _meta, paths, error = _load(request, upload_id)
+    conn, meta, paths, error = _load(request, upload_id)
     if error:
         return error
+    if busy := _busy(conn, upload_id, meta, "HEAD"):
+        return busy
     async with _lock(upload_id):
         if not paths[0].is_file():
             return _answer(404)
@@ -329,6 +406,8 @@ async def patch(upload_id: str, request: Request) -> Response:
         wanted = int(request.headers.get("Upload-Offset", ""))
     except ValueError:
         return _answer(400, body={"error": "Upload-Offset required"})
+    if busy := _busy(conn, upload_id, meta, "PATCH"):
+        return busy
     async with _lock(upload_id):
         if not path.is_file():
             return _answer(404)
@@ -360,7 +439,7 @@ async def patch(upload_id: str, request: Request) -> Response:
         count = 0
         try:
             with incoming.open("wb") as out:
-                async for block in request.stream():
+                async for block in _blocks(request):
                     count += len(block)
                     if offset + count > meta["length"]:
                         return _answer(413, headers={"Upload-Offset": str(offset)})
@@ -395,6 +474,13 @@ async def patch(upload_id: str, request: Request) -> Response:
             if meta.get("job_id"):
                 headers["Upload-Staging-Job"] = meta["job_id"]
             return _answer(204, headers=headers)
+        except (_Stalled, ClientDisconnect) as exc:       # only the body read raises these
+            stalled = isinstance(exc, _Stalled)
+            upload_log.record(conn.workspace, "chunk_dropped", upload_id=upload_id,
+                              name=meta.get("rel_path") or meta.get("name"), offset=offset, bytes=count,
+                              error=(f"no bytes for {_IDLE_SECONDS:g} s: the browser's network path is gone"
+                                     if stalled else "the browser closed the connection"))
+            return _answer(408 if stalled else 400, headers={"Upload-Offset": str(offset), "Connection": "close"})
         finally:
             incoming.unlink(missing_ok=True)
 
@@ -413,10 +499,12 @@ def _append_chunk(part: Path, incoming: Path) -> None:
 async def delete(upload_id: str, request: Request) -> Response:
     if wrong := _require_version(request):
         return wrong
-    conn, _meta, paths, error = _load(request, upload_id)
+    conn, meta, paths, error = _load(request, upload_id)
     if error:
         return error
     path, part = paths
+    if busy := _busy(conn, upload_id, meta, "DELETE"):
+        return busy
     async with _lock(upload_id):
         if not path.is_file():
             return _answer(404)

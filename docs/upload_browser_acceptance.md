@@ -6,11 +6,12 @@ The steps that check the browser → gateway half of an upload (tus), and the ca
 
 1. Start the gateway with a mock or test connection. Pick a small file, a nested folder, and a ZIP from the Data menu.
 2. The browser starts an incremental SHA-256 worker alongside 8 MiB tus PATCH chunks with per-chunk checksums. It sends the whole-file digest with the final PATCH. At most three files transfer at once. The Datasets tab shows one card per file and one per folder: uploading, copying to HPC3, verifying, unpacking, done.
-3. In DevTools, interrupt the network mid-transfer. The upload retries by itself for about a minute; after that the card offers **Resume**. Verify HEAD reports the prior offset and the file completes without restarting. Click **Cancel** on another transfer and verify the `.part` file is removed.
+3. In DevTools, interrupt the network mid-transfer. The upload retries by itself for about five minutes; after that the card offers **Resume**. Verify HEAD reports the prior offset and the file completes without restarting. Click **Cancel** on another transfer and verify the `.part` file is removed.
+   Then change the network path mid-transfer without closing the connection (turn the VPN on or off, switch Wi-Fi). The server hears nothing from the old path: it answers the browser's HEAD with 423 until it gives the stalled PATCH up, 30 s after its last byte, and the same upload continues. The card must not go back to 0 %; the account's `uploads/.upload.log` shows `busy` and `chunk_dropped` and no second `created` for the file.
 4. Reload the page in the middle of an upload and of a folder. Each comes back as an "Interrupted" card; choosing the same file or folder again continues it, **Discard** removes what the server holds. A copy that failed comes back with **Retry copy** and **Dismiss**.
 5. Compare the uploaded file's SHA-256 with the local manifest. For a folder, verify nested paths and total file count. For an archive, choose unpack and verify the card ends as a folder.
 
-Automated checks: `python -m pytest -q tests/test_tus_upload.py tests/test_upload_staging_api.py tests/test_resumable_upload.py`; syntax: `node --check frontend/console/app.js`.
+Automated checks: `python -m pytest -q tests/test_tus_upload.py tests/test_tus_resume_js.py tests/test_upload_staging_api.py tests/test_resumable_upload.py` (`test_tus_resume_js.py` runs the page's resume hooks with the real tus-js-client under node); syntax: `node --check frontend/console/app.js`.
 
 ## Large fixtures
 

@@ -177,6 +177,22 @@ def test_tus_resource_operations_require_the_upload_owner(site, method, caller, 
     assert _untouched(site.conn) == before
 
 
+def test_a_tus_upload_without_a_live_connection_answers_only_its_owner(site):
+    """After a gateway restart no connection exists until the page connects again. The upload's
+    owner is told to wait (423, so tus-js-client keeps the upload); anyone else learns nothing."""
+    metadata = "connection_id " + base64.b64encode(site.conn.id.encode()).decode()
+    made = site.client.post("/api/tus", headers={"Tus-Resumable": "1.0.0",
+                                                  "Upload-Length": "3", "Upload-Metadata": metadata})
+    assert made.status_code == 201
+    gw_app.CONNECTIONS.clear()
+    head = {"headers": {"Tus-Resumable": "1.0.0"}}
+    assert site.client.head(made.headers["location"], **head).status_code == 423
+    site.who["user"] = MALLORY
+    assert site.client.head(made.headers["location"], **head).status_code == 404
+    site.who["user"] = None
+    assert site.client.head(made.headers["location"], **head).status_code == 401
+
+
 def test_every_route_that_reads_a_connection_id_is_guarded():
     """Structural: a route added later that looks a connection up must go through the guard."""
     creates = {"/api/connect"}                 # makes connections; pinned in the connect tests below
