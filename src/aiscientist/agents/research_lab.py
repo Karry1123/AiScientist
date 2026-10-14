@@ -5150,8 +5150,8 @@ class ResearchLab:
                                                exec_roster, exec_multi, decision_review, user_notes)]
             else:
                 emit({"type": "concurrency_batch", "nodes": [n.id for n in batch]})
-                from concurrent.futures import ThreadPoolExecutor
-                with ThreadPoolExecutor(max_workers=len(batch)) as ex:
+                from .loop_utils import ContextThreadPoolExecutor
+                with ContextThreadPoolExecutor(max_workers=len(batch)) as ex:
                     futs = [ex.submit(self._run_one_node, question, n, snapshot, emit, should_cancel,
                                       exec_roster, exec_multi, decision_review, user_notes)
                             for n in batch]
@@ -5468,12 +5468,12 @@ class ResearchLab:
                 emit({"type": "expert_tools_failed", "error": f"{type(exc).__name__}: {exc}"})
                 return self._complete(messages)
 
-        from concurrent.futures import ThreadPoolExecutor
+        from .loop_utils import ContextThreadPoolExecutor
         workers = max(1, min(len(msg_lists), self.config.max_meeting_concurrency))
         labels = list(names or [])
         items = [(labels[i] if i < len(labels) else f"expert {i + 1}", m)
                  for i, m in enumerate(msg_lists)]
-        with ThreadPoolExecutor(max_workers=workers) as ex:
+        with ContextThreadPoolExecutor(max_workers=workers) as ex:
             return list(ex.map(_one, items))
 
     def _team_meeting(self, question: str, topic: str, experts: tuple[Specialist, ...],
@@ -7292,9 +7292,9 @@ class ResearchLab:
             return []
         if len(message_lists) == 1:
             return [self._complete(message_lists[0])]
-        from concurrent.futures import ThreadPoolExecutor
+        from .loop_utils import ContextThreadPoolExecutor
         workers = max(1, min(len(message_lists), self.config.max_meeting_concurrency))
-        with ThreadPoolExecutor(max_workers=workers) as ex:
+        with ContextThreadPoolExecutor(max_workers=workers) as ex:
             return list(ex.map(self._complete, message_lists))   # ex.map preserves input order
 
     def _complete(self, messages: list[dict[str, Any]], *, role: str = "reason") -> str:

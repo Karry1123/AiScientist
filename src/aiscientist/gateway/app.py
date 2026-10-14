@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextvars
 import functools
 import json
 import mimetypes
@@ -133,6 +134,25 @@ def _role_effort(role: str | None) -> str | None:
     return val if val in vllm_client.REASONING_EFFORTS else None
 
 
+def _max_runs_per_session() -> int:
+    """How many runs one HPC3 session may have in flight at once, one per chat at most.
+    ``AISCIENTIST_MAX_RUNS_PER_SESSION`` (default 3); 1 = one run at a time per session."""
+    raw = (os.environ.get("AISCIENTIST_MAX_RUNS_PER_SESSION") or "").strip()
+    try:
+        return max(1, int(raw)) if raw else 3
+    except ValueError:
+        return 3
+
+
+# The run the code on this task / thread is working for. Set by ``Connection.begin_run`` inside the
+# run's own asyncio task, so it follows the run into ``asyncio.to_thread`` workers and into the
+# tasks the run creates; thread pools inside a run copy it explicitly (``agents.loop_utils``).
+# It is what lets several runs share one Connection: an event, a Stop check or a plan wait made
+# while working for run A reaches A even when run B started after it.
+_CURRENT_RUN: contextvars.ContextVar["RunState | None"] = contextvars.ContextVar(
+    "aiscientist_current_run", default=None)
+
+
 class RunState:
     """Per-run isolation unit. One SSH/GPU ``Connection`` is shared across a user's windows /
     tabs / conversations, but each RUN (a study, an A2 continuation) gets
@@ -141,15 +161,28 @@ class RunState:
     cancel/approve in one window from reaching another window's run, and lets every streamed WS
     event be tagged so the client can demux it into the OWNING conversation bubble.
 
-    Runs on one connection are serialized (``/api/lab`` returns 409 while ``chat_running``), so at
-    most one RunState is ``active`` at a time; the ``Connection.runs`` registry keeps recent ones so
-    a late/stale approve or cancel that names a finished run resolves to a no-op instead of hitting
-    whatever run happens to be live now."""
+    Several runs may be in flight on one connection, at most one per conversation (``/api/lab``
+    refuses a second run in the same chat, and more than ``_max_runs_per_session`` in all). Each
+    keeps its own stream for a reconnecting client and its own queue of mid-run notes; the
+    ``Connection.runs`` registry keeps recent ones so a late/stale approve or cancel that names a
+    finished run resolves to a no-op instead of hitting whatever run happens to be live now."""
 
     def __init__(self, conn: "Connection", conversation_id: str | None = None,
                  run_id: str | None = None) -> None:
+        self.conn = conn
         self.conversation_id = conversation_id
         self.run_id = run_id
+        # Identifies this run's stream for a client that recovers it after a reconnect: a quick
+        # chat answer has no run_id, and without an id the same finished answer was recovered
+        # (and saved) again on every reconnect.
+        self.stream_id = uuid4().hex[:12]
+        # This run is executing (set by the run functions; ``Connection.chat_running`` is "any run").
+        self.running = False
+        # The in-flight assistant turn, rebuilt for a client that reconnects (see _track_stream).
+        self.stream: dict[str, Any] | None = None
+        # Mid-run notes for THIS run (/api/chat/inject), drained by its lab loop between steps.
+        self.injections: list[str] = []
+        self._inj_lock = threading.Lock()
         # cooperative cancel for THIS run's in-flight chat/pipeline (set by /api/chat/stop for this
         # run, or by deleting its owning chat); the streaming loops + step callback check it.
         self.chat_stop = threading.Event()
@@ -163,7 +196,7 @@ class RunState:
         # model-written narrative.
         self.hard_stop = threading.Event()
         # A user-requested context compaction for THIS run (POST /api/lab/compact). A control flag
-        # rather than a note queued into conn.injections on purpose: mid-run steering notes are
+        # rather than a note queued into the run's injections on purpose: mid-run steering notes are
         # PROSE the model reads and may or may not act on, whereas "compact now" must be an
         # instruction to the loop itself. The loop consumes and clears it at the next step boundary.
         self.compact_request = threading.Event()
@@ -181,8 +214,7 @@ class RunState:
         self.pending_confirm: Any = None     # buffered for a late WS subscriber
         # Which ENGINE this run is: "research" (the lab) or "chat" (the answer-first fast path).
         # Endpoints that only make sense against the lab (mid-run steering via /api/chat/inject)
-        # check this — a note queued during a chat turn has nothing to consume it and would
-        # otherwise sit in conn.injections and leak into the NEXT research run's guidance.
+        # check this — a note queued during a chat turn has nothing to consume it.
         self.kind = "research"
         # The earlier run this one continues, when it starts from that run's processed dataset: it
         # reads a file inside the EARLIER run's HPC3 folder for as long as it runs, so the session
@@ -196,6 +228,17 @@ class RunState:
         if self.conversation_id is not None:
             payload.setdefault("conversation_id", self.conversation_id)
         return payload
+
+    def add_injection(self, text: str) -> None:
+        with self._inj_lock:
+            self.injections.append(text)
+
+    def pull_injections(self) -> list[str]:
+        """Drain the notes queued for this run since the last call (thread-safe)."""
+        with self._inj_lock:
+            drained = self.injections[:]
+            self.injections.clear()
+            return drained
 
 
 class Connection:
@@ -215,6 +258,9 @@ class Connection:
         self.worker_alloc: Any = None
         self.gpu_lock = threading.Lock()   # serializes GPU/vLLM work (mid-run heal vs the provisioning thread)
         self.hpc_pysrc: str | None = None  # dfs3b dir the live AiScientist source is synced to (bind for analysis jobs)
+        # Two runs starting together would each find hpc_pysrc unset and rewrite the tree the
+        # other's jobs are importing from; the second waits for the first sync instead.
+        self.pysrc_lock = threading.Lock()
         # <shared_root> exists and this user's dirs under it are ready (see _prepare_shared_storage).
         # False also gates the periodic Temp sweep, so it never runs against an unprepared root.
         self.shared_root_ok = False
@@ -231,6 +277,7 @@ class Connection:
         # ``server-data/<session>`` folder to remove.
         self.server_data_synced = False
         self.tunnel_port: int | None = None
+        self.hpc_login = ""   # the HPC3 login this session was asked for (the SSH user once it is up)
         self.llm_info: dict[str, Any] = {"installed": False, "version": None}
         self.available_models: list[str] = []
         self.selected_model: str = settings.serving_model()
@@ -264,13 +311,21 @@ class Connection:
         # Per-run isolation. The cancel + plan-review events used to live directly on the
         # Connection (one shared ``chat_stop`` / ``plan_event`` for the whole SSH session), so a
         # cancel/approve from one window hit whatever run was live. They now live on a per-run
-        # :class:`RunState`: ``active_run`` is the one currently streaming, ``runs`` keeps recent
-        # ones by run_id so a stale approve/cancel resolves to the right (or no) run, and the legacy
-        # ``conn.chat_stop`` / ``conn.plan_event`` / ``conn.plan_value`` / ``conn.pending_plan``
-        # attributes are now thin properties that proxy to ``active_run`` (see below).
-        self.active_run: RunState | None = None
+        # :class:`RunState`. ``live_runs`` holds every run begun and not yet ended (several chats
+        # may each have one in flight), ``runs`` keeps recent ones by run_id so a stale
+        # approve/cancel resolves to the right (or no) run, and the legacy ``conn.chat_stop`` /
+        # ``conn.plan_event`` / ``conn.plan_value`` / ``conn.pending_plan`` / ``conn.chat_running``
+        # attributes are thin properties over ``active_run`` — the run the calling code works for
+        # (see ``_CURRENT_RUN``), else the newest live one.
+        self.live_runs: list[RunState] = []
         self.runs: dict[str, RunState] = {}
-        self.chat_running = False
+        # A run made on demand by a legacy accessor when no run is live (see _ensure_run).
+        self._bare_run: RunState | None = None
+        # ``chat_running = True`` said with no run at all (older call sites and tests).
+        self._loose_running = False
+        # The last finished stream of each conversation, replayed once (``recover``) to a client
+        # that reconnects having missed its completion. Bounded: only the newest few are kept.
+        self.finished_streams: dict[str, dict[str, Any]] = {}
         # Per-CONVERSATION last completed run, so a follow-up ("revise the report") routes to the
         # run its OWN chat produced — and a fresh window/thread never inherits another conversation's
         # run as a stale "replan". ``last_run_id`` (below) stays as the connection-wide fallback for
@@ -288,13 +343,9 @@ class Connection:
         # In-flight assistant turn, captured from pushed chat messages so a client that
         # refreshes / navigates back / briefly drops its socket can RE-SUBSCRIBE and see
         # the run continue (the asyncio run task + this Connection both survive a client
-        # reload). Reset on each chat_start; replayed by the WS endpoint while a run is live.
+        # reload). Each run keeps its own (``RunState.stream``); this is the most recently
+        # started one, and the slot for a stream pushed with no run at all.
         self.stream: dict[str, Any] | None = None
-        # Mid-run prompt injection: text the user submits WHILE a run is executing. The
-        # lab loop drains these between steps and folds them into the remaining steps'
-        # guidance (so a researcher can steer a run without stopping + restarting it).
-        self.injections: list[str] = []
-        self._inj_lock = threading.Lock()
         # The last COMPLETED run on this connection, so a follow-up can be aimed at it —
         # re-run a step, or start fresh from its dataset — without the user re-identifying it.
         # (Report regeneration used to be the main consumer; it was removed with the run-lifecycle
@@ -304,26 +355,55 @@ class Connection:
 
     # -- per-run scoping ----------------------------------------------------
 
+    def _context_run(self) -> RunState | None:
+        """The run of this connection the calling task / thread works for, if any."""
+        cur = _CURRENT_RUN.get()
+        return cur if cur is not None and cur.conn is self else None
+
+    @property
+    def active_run(self) -> RunState | None:
+        """The run the calling code works for (while it is live), else the newest live run, else
+        the bare run a legacy accessor made. None when nothing is in flight."""
+        cur = self._context_run()
+        if cur is not None and cur in self.live_runs:
+            return cur
+        if self.live_runs:
+            return self.live_runs[-1]
+        return self._bare_run
+
     def _ensure_run(self) -> RunState:
         """The active run, creating a bare one on demand. Lets the legacy ``conn.chat_stop`` /
         ``conn.plan_event`` accessors + the pre-run follow-up clarify work before a run_id exists."""
-        if self.active_run is None:
-            self.active_run = RunState(self)
-        return self.active_run
+        run = self.active_run
+        if run is None:
+            run = self._bare_run = RunState(self)
+        return run
 
     def begin_run(self, conversation_id: str | None = None,
                   run_id: str | None = None) -> RunState:
-        """Open a new run scope and make it active. ``run_id`` is usually assigned later (a fresh
+        """Open a new run scope and make it the calling task's run (``_CURRENT_RUN``). Runs already
+        live keep going: each chat may have its own. ``run_id`` is usually assigned later (a fresh
         study mints it inside ``_run_lab``); a resume knows it up front."""
         run = RunState(self, conversation_id=conversation_id, run_id=run_id)
-        self.active_run = run
+        if self._bare_run is not None or self._loose_running:
+            # The bare run / the loose flag stood in for "the active run" before any run existed;
+            # this run takes their place.
+            run.running = self._loose_running or bool(self._bare_run and self._bare_run.running)
+            self._bare_run = None
+            self._loose_running = False
+        self.live_runs.append(run)
+        _CURRENT_RUN.set(run)
         self._register_run(run)
         return run
 
     def bind_run_id(self, run: RunState, run_id: str) -> None:
         """Assign the final run_id to a run (fresh mint or resume) and index it."""
         run.run_id = run_id
-        self.active_run = run
+        if run not in self.live_runs:
+            if self._bare_run is run:
+                self._bare_run = None
+            self.live_runs.append(run)
+        _CURRENT_RUN.set(run)
         self._register_run(run)
 
     def _register_run(self, run: RunState) -> None:
@@ -337,36 +417,74 @@ class Connection:
                 self.runs.pop(k, None)
 
     def end_run(self, run: RunState | None) -> None:
-        """Close a run scope: stop treating it as active (so a post-run WS reconnect doesn't see a
-        stale pending plan), but keep it in ``runs`` so a late approve/cancel resolves to a no-op."""
-        if run is not None and self.active_run is run:
-            self.active_run = None
+        """Close a run scope: stop treating it as live (so a post-run WS reconnect doesn't see a
+        stale pending plan), but keep it in ``runs`` so a late approve/cancel resolves to a no-op.
+        Idempotent."""
+        if run is None:
+            return
+        run.running = False
+        if run in self.live_runs:
+            self.live_runs.remove(run)
+        if self._bare_run is run:
+            self._bare_run = None
+        if run.stream is not None:
+            key = run.conversation_id or ""
+            self.finished_streams.pop(key, None)
+            self.finished_streams[key] = run.stream
+            while len(self.finished_streams) > 16:
+                self.finished_streams.pop(next(iter(self.finished_streams)))
+
+    def live_run_for(self, conversation_id: str | None) -> RunState | None:
+        """This conversation's run in flight, if any (what the per-chat 409 guard checks). A run
+        holds its chat from ``begin_run`` on — through the follow-up classifier and a clarify card,
+        before it is ``running`` — so a second message cannot start a second run under it."""
+        if not conversation_id:
+            return None
+        return next((r for r in reversed(self.live_runs)
+                     if r.conversation_id == conversation_id), None)
+
+    def running_runs(self) -> list[RunState]:
+        return [r for r in self.live_runs if r.running]
 
     def resolve_run(self, run_id: str | None = None,
                     conversation_id: str | None = None) -> RunState | None:
         """The run a targeted interaction (cancel / plan approve) should hit. A request that names a
-        run_id or conversation_id ONLY matches when it is the currently active run — so an interaction
-        meant for a finished run never lands on whatever run is live now. No identifiers → the active
-        run (back-compat for older clients)."""
-        ar = self.active_run
-        if ar is None:
-            return None
+        run_id or conversation_id ONLY matches a run that is still live — so an interaction meant for
+        a finished run never lands on whatever run is live now, and one chat's Stop never reaches
+        another chat's run. No identifiers → the active run (back-compat for older clients)."""
+        candidates = list(reversed(self.live_runs))
+        if self._bare_run is not None:
+            candidates.append(self._bare_run)
         if run_id:
-            return ar if ar.run_id == run_id else None
+            return next((r for r in candidates if r.run_id == run_id), None)
         if conversation_id:
-            return ar if ar.conversation_id == conversation_id else None
-        return ar
+            return next((r for r in candidates if r.conversation_id == conversation_id), None)
+        return self.active_run
 
-    def _tag(self, payload: dict[str, Any]) -> dict[str, Any]:
-        """Stamp a streamed payload with the active run's run_id + conversation_id, so the client can
-        demux it into the owning conversation bubble. No-op when there is no active run (connect-time
-        status/duo events) or when the payload already carries a tag."""
-        ar = self.active_run
-        return ar.tag(payload) if ar is not None else payload
+    def _tag_run(self) -> RunState | None:
+        """The run an untagged event belongs to: the one the calling code works for, else the only
+        run in flight. With several in flight and no context the event stays untagged rather than
+        being stamped with a run it may not belong to."""
+        cur = self._context_run()
+        if cur is not None:
+            return cur
+        if len(self.live_runs) == 1:
+            return self.live_runs[0]
+        if not self.live_runs:
+            return self._bare_run
+        return None
+
+    def _tag(self, payload: dict[str, Any], run: RunState | None = None) -> dict[str, Any]:
+        """Stamp a streamed payload with its run's run_id + conversation_id, so the client can demux
+        it into the owning conversation bubble. No-op when there is no run (connect-time status/duo
+        events) or when the payload already carries a tag."""
+        run = run or self._tag_run()
+        return run.tag(payload) if run is not None else payload
 
     # -- event pub/sub ------------------------------------------------------
 
-    def emit(self, level: str, stage: str, message: str, detail: Any = None) -> None:
+    def emit(self, level: str, stage: str, message: str, detail: Any = None, *,
+             run: RunState | None = None) -> None:
         event = {
             "type": "event",
             "level": level,
@@ -376,14 +494,16 @@ class Connection:
         }
         if detail is not None:
             event["detail"] = detail
-        self._tag(event)
+        self._tag(event, run)
         self.log.append(event)
         self._publish(event)
 
-    def push(self, payload: dict[str, Any]) -> None:
-        """Publish a non-log message (chat token, status, gpu health snapshot)."""
-        self._tag(payload)
-        self._track_stream(payload)
+    def push(self, payload: dict[str, Any], *, run: RunState | None = None) -> None:
+        """Publish a non-log message (chat token, status, gpu health snapshot). ``run`` names the run
+        it belongs to when the caller is not working for that run (a route answering for it)."""
+        run = run or self._tag_run()
+        self._tag(payload, run)
+        self._track_stream(payload, run)
         self._publish(payload)
 
     # -- legacy per-run accessors (proxy to the active run) -----------------
@@ -413,22 +533,47 @@ class Connection:
 
     @property
     def pending_plan(self) -> Any:
-        return self.active_run.pending_plan if self.active_run is not None else None
+        ar = self.active_run
+        return ar.pending_plan if ar is not None else None
 
     @pending_plan.setter
     def pending_plan(self, value: Any) -> None:
         self._ensure_run().pending_plan = value
 
-    def _track_stream(self, payload: dict[str, Any]) -> None:
+    @property
+    def chat_running(self) -> bool:
+        """Any run on this connection is executing — what session-wide actions (switching the
+        model, releasing the GPU, the idle health poll, the cleanup) wait for."""
+        return self._loose_running or any(r.running for r in self.live_runs) or bool(
+            self._bare_run is not None and self._bare_run.running)
+
+    @chat_running.setter
+    def chat_running(self, value: bool) -> None:
+        # Sets the flag of the run the caller works for. With no run at all it is a connection
+        # flag, which is how older call sites and tests say "a run is in progress".
+        run = self.active_run
+        if run is None:
+            self._loose_running = bool(value)
+        else:
+            run.running = bool(value)
+            if not value:
+                self._loose_running = False
+
+    def _track_stream(self, payload: dict[str, Any], run: RunState | None = None) -> None:
         """Accumulate the in-flight assistant turn so a reconnecting client can replay it."""
         t = payload.get("type")
         if t == "chat_start":
+            if run is not None:
+                payload.setdefault("stream_id", run.stream_id)
             self.stream = {"text": "", "thinking": "", "progress": [], "status": "running",
                            "artifacts": None, "error": "", "status_label": "",
                            "run_id": payload.get("run_id"),
-                           "conversation_id": payload.get("conversation_id"), "run_complete": None}
+                           "conversation_id": payload.get("conversation_id"),
+                           "stream_id": payload.get("stream_id"), "run_complete": None}
+            if run is not None:
+                run.stream = self.stream
             return
-        s = self.stream
+        s = run.stream if run is not None and run.stream is not None else self.stream
         if s is None:
             return
         if t == "chat_token":
@@ -462,11 +607,11 @@ class Connection:
         elif t == "run_status":
             s["status_label"] = payload.get("text", "")
 
-    def stream_replay_payloads(self) -> list[dict[str, Any]]:
-        """Rebuild the in-flight assistant turn as an ordered list of WS payloads, so a
-        (re)subscribing client restores the live centre bubble (thinking + key progress +
-        text). Only meaningful while a run is in flight — see the WS endpoint's guard."""
-        s = self.stream
+    def stream_replay_payloads(self, stream: dict[str, Any] | None = None) -> list[dict[str, Any]]:
+        """Rebuild an assistant turn (by default the most recently started one) as an ordered list
+        of WS payloads, so a (re)subscribing client restores the live centre bubble (thinking + key
+        progress + text)."""
+        s = stream if stream is not None else self.stream
         if not s:
             return []
         start: dict[str, Any] = {"type": "chat_start"}
@@ -474,6 +619,8 @@ class Connection:
             start["run_id"] = s["run_id"]
         if s.get("conversation_id"):
             start["conversation_id"] = s["conversation_id"]
+        if s.get("stream_id"):
+            start["stream_id"] = s["stream_id"]
         out: list[dict[str, Any]] = [start]
         if s["thinking"]:
             out.append({"type": "chat_thinking", "token": s["thinking"]})
@@ -497,6 +644,41 @@ class Connection:
             out.append(s["artifacts"])
         if s.get("run_complete"):
             out.append(s["run_complete"])
+        # Every replayed event names its conversation, so a client demuxes a replay exactly like
+        # the live events that follow it.
+        tag = {k: s[k] for k in ("run_id", "conversation_id") if s.get(k)}
+        for p in out[1:]:
+            for k, v in tag.items():
+                p.setdefault(k, v)
+        return out
+
+    def replays(self) -> list[list[dict[str, Any]]]:
+        """Every stream a (re)subscribing client may need: each run still in flight, then the last
+        finished stream of each conversation, marked ``recover`` (the client keeps it only when it
+        missed the live completion). Oldest first."""
+        out: list[list[dict[str, Any]]] = []
+        live = {id(r.stream) for r in self.live_runs if r.stream is not None}
+        for r in self.live_runs:
+            if r.stream is not None:
+                p = self.stream_replay_payloads(r.stream)
+                if p and not r.running:
+                    p[0] = {**p[0], "recover": True}
+                if p:
+                    out.append(p)
+        for s in self.finished_streams.values():
+            if id(s) in live:
+                continue
+            p = self.stream_replay_payloads(s)
+            if p:
+                p[0] = {**p[0], "recover": True}
+                out.append(p)
+        if self.stream is not None and not out:
+            # A stream pushed with no run at all (older call sites): replayed as before.
+            p = self.stream_replay_payloads(self.stream)
+            if p and not self.chat_running:
+                p[0] = {**p[0], "recover": True}
+            if p:
+                out.append(p)
         return out
 
     def _publish(self, payload: dict[str, Any]) -> None:
@@ -509,20 +691,21 @@ class Connection:
         return _emit
 
     # -- mid-run prompt injection -------------------------------------------
+    # Text the user submits WHILE a run is executing. The lab loop drains it between steps and
+    # folds it into the remaining steps' guidance (so a researcher can steer a run without
+    # stopping + restarting it). Queued per run, so a note never reaches another chat's run.
 
-    def add_injection(self, text: str) -> None:
-        with self._inj_lock:
-            self.injections.append(text)
+    @property
+    def injections(self) -> list[str]:
+        return self._ensure_run().injections
+
+    def add_injection(self, text: str, run: RunState | None = None) -> None:
+        (run or self._ensure_run()).add_injection(text)
 
     def pull_injections(self) -> list[str]:
-        """Drain any notes the user submitted since the last call (thread-safe). Called by
+        """Drain the notes queued for the caller's run since the last call (thread-safe). Called by
         the lab loop between steps; returns [] when there is nothing new."""
-        with self._inj_lock:
-            if not self.injections:
-                return []
-            drained = self.injections[:]
-            self.injections.clear()
-            return drained
+        return self._ensure_run().pull_injections()
 
     # -- snapshot -----------------------------------------------------------
 
@@ -549,13 +732,18 @@ class Connection:
             "tunnel_port": self.tunnel_port,
             "created_at": self.created_at,
             "chat_running": self.chat_running,
-            # Identity of the run currently in flight, so a reconnecting/reloading client can re-adopt
-            # it as the run OWNER (state.runSessionId) and the Stop button POSTs the matching
-            # conversation_id. Without this, a WS reconnect wipes the client's owner id and Stop
-            # silently no-ops (resolve_run can't match) while the job runs to its Slurm --time.
+            # Identity of the newest run in flight (older clients follow only this one), and every
+            # run in flight, so a reconnecting/reloading client re-adopts each as the OWNER of its
+            # chat and that chat's Stop button POSTs the matching conversation_id. Without this, a WS
+            # reconnect wipes the client's owner id and Stop silently no-ops (resolve_run can't
+            # match) while the job runs to its Slurm --time.
             "active_run": ({"run_id": self.active_run.run_id,
                             "conversation_id": self.active_run.conversation_id}
                            if self.active_run is not None else None),
+            "live_runs": [{"run_id": r.run_id, "conversation_id": r.conversation_id,
+                           "kind": r.kind, "running": r.running}
+                          for r in self.live_runs],
+            "max_runs": _max_runs_per_session(),
             "new_credential": self.new_credential,
             # Which LLM answers, and — because a user's own API endpoint means prompts leave
             # UCI — whether that is off-host. The UI keeps a banner up whenever it is, so the
@@ -807,8 +995,7 @@ def _session_cleanup_targets(conn: Connection) -> dict[str, Any]:
     busy: set[str] = set()
     shared: set[str] = set()
     for other in list(CONNECTIONS.values()):
-        run = other.active_run
-        if other.chat_running and run is not None:
+        for run in other.running_runs():
             busy.update(r for r in (run.run_id, run.continues) if r)
         if other is not conn and other.status != "disconnected":
             shared.update(other.hpc_run_ids)
@@ -1259,6 +1446,24 @@ def _stop_shared_llm() -> None:
 
 
 @app.on_event("startup")
+async def _size_worker_threads() -> None:
+    """Give ``asyncio.to_thread`` a pool sized for long runs. Each run holds one of its threads
+    for as long as it executes, and the default pool is ``min(32, cpus + 4)`` threads for the whole
+    process; with several runs per session (``AISCIENTIST_MAX_RUNS_PER_SESSION``) a busy gateway
+    would otherwise queue every short SSH or file call behind them. ``AISCIENTIST_WORKER_THREADS``
+    (default 128)."""
+    from concurrent.futures import ThreadPoolExecutor
+
+    raw = (os.environ.get("AISCIENTIST_WORKER_THREADS") or "").strip()
+    try:
+        n = max(8, int(raw)) if raw else 128
+    except ValueError:
+        n = 128
+    asyncio.get_running_loop().set_default_executor(
+        ThreadPoolExecutor(max_workers=n, thread_name_prefix="aiscientist-worker"))
+
+
+@app.on_event("startup")
 async def _start_checkpoint_gc() -> None:
     """Launch the two housekeeping sweeps: stale A2 analysis checkpoints in the eyeserver's local
     run bundles (default 7 days), and cold per-run process files in each live session's HPC3
@@ -1354,6 +1559,44 @@ def _owner_dir_error(owner: str, request: Request) -> "JSONResponse | None":
     return None
 
 
+_LIVE_STATUSES = ("connecting", "provisioning", "ready")
+
+
+def _account_session(user: Any) -> "Connection | None":
+    """The account's session that is open (coming up or ready), newest first; None if it has none."""
+    live = [c for c in CONNECTIONS.values()
+            if c.app_user_id is not None and c.app_user_id == getattr(user, "id", None)
+            and c.status in _LIVE_STATUSES]
+    return max(live, key=lambda c: c.created_at) if live else None
+
+
+def _join_refusal(existing: "Connection", req: "ConnectRequest") -> JSONResponse | None:
+    """Why a connect may not simply join the account's open session — it asks for a different kind
+    of session — as the 409 to answer, or None."""
+    if bool(existing.mock) != bool(req.mock):
+        kind = "a mock session" if existing.mock else "an HPC3 session"
+        return JSONResponse({"error": f"Your account already has {kind} open in another window. "
+                                      "Disconnect it there first to start a different one.",
+                             "connection_id": existing.id}, status_code=409)
+    want = (req.ucinetid or "").strip()
+    have = (getattr(existing.executor, "username", "") or getattr(existing, "hpc_login", "") or "").strip()
+    if not req.mock and want and have and want != have:
+        return JSONResponse({"error": f"Your account already has a session open as HPC3 user {have}. "
+                                      f"Disconnect it there first to connect as {want}.",
+                             "connection_id": existing.id}, status_code=409)
+    return None
+
+
+@app.get("/api/session")
+async def account_session(request: Request) -> JSONResponse:
+    """The session this account has open, so a new browser or tab joins it on load."""
+    user = _optional_user(request)
+    conn = _account_session(user) if (_AUTH_ENABLED and user is not None) else None
+    if conn is None:
+        return JSONResponse({"connection_id": None})
+    return JSONResponse({"connection_id": conn.id, "status": conn.status, "mock": conn.mock})
+
+
 @app.post("/api/connect")
 async def connect(req: ConnectRequest, request: Request) -> JSONResponse:
     # Two-layer identity: the AiScientist account owns the workspace/history; req.ucinetid
@@ -1422,8 +1665,23 @@ async def connect(req: ConnectRequest, request: Request) -> JSONResponse:
                 }, status_code=409)
             llm_credentials.record_egress_consent(safe_name(owner_name), cred_id)
 
+    # One session per account. A second browser or tab of the same account joins the session that
+    # is already open instead of starting another SSH login on the same HPC3 account: two sessions
+    # of one HPC3 user share its worker node, serve job, source tree and Slurm jobs, so either one's
+    # Disconnect, Stop GPU or model switch pulled them from under the other's runs. Chats in one
+    # session are isolated from each other, so two windows on it do not collide.
+    existing = _account_session(app_user) if app_user is not None else None
+    if existing is not None:
+        refused = _join_refusal(existing, req)
+        if refused is not None:
+            return refused
+        existing.emit("info", "connect", "Another window joined this session.")
+        return JSONResponse({"connection_id": existing.id, "status": existing.status,
+                             "mock": existing.mock, "joined": True})
+
     conn = Connection(settings, mock=req.mock, loop=loop, username=owner_name)
     conn.app_user_id = app_user.id if app_user else None
+    conn.hpc_login = (req.ucinetid or "").strip()
     conn.cluster_model_id = cluster_model.id if cluster_model else ""
     if cred_id:
         conn.llm_choice = {"credential_id": cred_id}
@@ -2384,15 +2642,17 @@ async def stop_gpu(payload: dict, request: Request) -> JSONResponse:
     # A research run still executing would keep calling the endpoint we are about to kill and die
     # slowly, one timed-out call at a time. Stop it first — same path as the Stop button, including
     # waking a run parked at a plan/decision card.
-    if conn.chat_running and conn.active_run is not None:
-        run = conn.active_run
-        run.chat_stop.set()
-        if run.pending_plan is not None:
-            run.plan_value = {"action": "cancel"}
-            run.pending_plan = None
-            run.plan_event.set()
-            conn.push({"type": "plan_done"})
-        conn.emit("info", "gpu_alloc", "Stopping the in-flight run before releasing the GPU.")
+    if conn.chat_running and conn.live_runs:
+        for run in list(conn.live_runs):
+            run.chat_stop.set()
+            if run.pending_plan is not None:
+                run.plan_value = {"action": "cancel"}
+                run.pending_plan = None
+                run.plan_event.set()
+                conn.push({"type": "plan_done"}, run=run)
+        conn.emit("info", "gpu_alloc", "Stopping the in-flight run before releasing the GPU."
+                  if len(conn.live_runs) == 1 else
+                  f"Stopping the {len(conn.live_runs)} runs in flight before releasing the GPU.")
     prev_status = conn.status
     # Stop the health monitor FIRST so a poll already in flight can't emit a spurious
     # dead-port / vanished-job error after we cancel; flip status so the loop exits.
@@ -2459,13 +2719,19 @@ def _temp_base(conn: Connection) -> str:
     return _shared_dir(conn, "Temp")
 
 
-def _scratch_dir(conn: Connection, kind: str) -> str:
+def _scratch_dir(conn: Connection, kind: str, *, run_id: str | None = None) -> str:
     """Where one HPC3 job line (``analysis``, ``runcode``, ``report``, ``worker`` ...) writes its
     per-job files: the sbatch script, the args/result JSON, the Slurm log and the tool's stderr
-    log — ``<shared_root>/Temp/<user>/scratch/<kind>``. Every job line takes its directory from
-    here, so none of it lands in the user's home directory; the path is absolute because Slurm
-    does not expand ``$HOME`` in ``#SBATCH --output``."""
-    return f"{_temp_base(conn)}/scratch/{kind}"
+    log — ``<shared_root>/Temp/<user>/scratch/<kind>``, and ``…/<kind>/<run_id>`` for a run's own
+    jobs. Every job line takes its directory from here, so none of it lands in the user's home
+    directory; the path is absolute because Slurm does not expand ``$HOME`` in ``#SBATCH --output``.
+
+    The run's own folder matters because the executors name their files by a counter that starts
+    at 1 in each executor: two runs in flight at once (two chats of one session, or two sessions of
+    one HPC3 account) wrote ``bioagent_python_1.out`` into the same folder and read each other's
+    results."""
+    base = f"{_temp_base(conn)}/scratch/{kind}"
+    return f"{base}/{safe_name(run_id)}" if run_id else base
 
 
 def _keep_for(days: Any, until_disconnect: bool) -> str:
@@ -3754,6 +4020,15 @@ def _sync_aiscientist_source_to_hpc(conn: Connection) -> str:
     (the dir that contains ``aiscientist/``). Raises on transport failure — caller falls back."""
     if conn.hpc_pysrc:
         return conn.hpc_pysrc
+    import contextlib
+
+    with getattr(conn, "pysrc_lock", None) or contextlib.nullcontext():
+        if conn.hpc_pysrc:
+            return conn.hpc_pysrc
+        return _sync_aiscientist_source_locked(conn)
+
+
+def _sync_aiscientist_source_locked(conn: Connection) -> str:
     import tempfile
 
     # Deliberately NOT under Temp/: jobs bind this read-only for their whole lifetime, and it is
@@ -4023,7 +4298,7 @@ def _build_literature_executor(conn: "Connection", run_id: str | None = None) ->
             if retigene else f"python3 -m {_tools_api.LITERATURE_ENTRYPOINT}"
         ),
         job_prefix="bioagent_paperqa",
-        scratch_dir=_scratch_dir(conn, "paperqa"),
+        scratch_dir=_scratch_dir(conn, "paperqa", run_id=run_id),
         extra_ro_binds=ro_binds,
         extra_rw_binds=(index_dir,) if index_dir else (),
         # Deploy config the model never sends — merged into the tool-call args before the job runs, so
@@ -4326,7 +4601,9 @@ async def chat_stop(req: StopRequest, request: Request) -> JSONResponse:
     """Cancel the connection's in-flight chat/pipeline run so GPU + compute are
     released — used by the Stop button and by deleting the chat that owns the run."""
     conn = _owned_conn(req.connection_id, request)
-    if not conn.chat_running:
+    # A run holds its chat from begin_run on: before it is "running" it may be waiting at a clarify
+    # card, and Stop must answer that too.
+    if not conn.chat_running and not conn.live_runs:
         return JSONResponse({"status": "idle"})
     # Target the run named by this request (its own chat/run) — not just "whatever run is live". A
     # Stop from a window whose run already finished must not cancel a DIFFERENT window's run that
@@ -4339,10 +4616,9 @@ async def chat_stop(req: StopRequest, request: Request) -> JSONResponse:
         # that drifted from the active run's (e.g. state.runSessionId lost across a WS reconnect). The
         # client now re-adopts the owner id from summary.active_run, but log the miss so any recurrence
         # is visible in journald rather than silent.
-        ar = conn.active_run
+        live = [(r.run_id, r.conversation_id) for r in conn.live_runs]
         print(f"[chat_stop] no-op: req(run_id={req.run_id!r}, conversation_id={req.conversation_id!r}) "
-              f"did not match the active run "
-              f"({getattr(ar, 'run_id', None)!r}/{getattr(ar, 'conversation_id', None)!r}).")
+              f"matched none of the runs in flight {live!r}.")
         return JSONResponse({"status": "idle"})
     # Pressing Stop on a run that is ALREADY stopping means the write-up too. The first Stop only
     # ends the analysis loop; everything after it (report, self-review, render, post-render
@@ -4359,19 +4635,21 @@ async def chat_stop(req: StopRequest, request: Request) -> JSONResponse:
         target.plan_value = {"action": "cancel"}
         target.pending_plan = None
         target.plan_event.set()
-        conn.push({"type": "plan_done"})
+        conn.push({"type": "plan_done"}, run=target)
     if escalated:
         conn.emit("warning", "chat",
                   "Stop again — skipping the report write-up. The analysis results already "
-                  "written to disk are kept.")
+                  "written to disk are kept.", run=target)
         return JSONResponse({"status": "abandoning"})
-    conn.emit("info", "chat", "Stop requested — ending the current run.")
+    conn.emit("info", "chat", "Stop requested — ending the current run.", run=target)
     return JSONResponse({"status": "stopping"})
 
 
 class InjectRequest(BaseModel):
     connection_id: str
     text: str
+    conversation_id: str | None = None  # steer only THIS chat's run; no ids → the active run
+    run_id: str | None = None
 
 
 @app.post("/api/chat/inject")
@@ -4385,15 +4663,17 @@ async def chat_inject(req: InjectRequest, request: Request) -> JSONResponse:
         return JSONResponse({"error": "Empty note."}, status_code=400)
     if not conn.chat_running:
         return JSONResponse({"error": "No run in progress to steer."}, status_code=409)
+    target = conn.resolve_run(req.run_id, req.conversation_id)
+    if target is None or not target.running:
+        return JSONResponse({"error": "This chat has no run in progress to steer."}, status_code=409)
     # Only the lab drains injections (between steps). A chat turn has no steps, so accepting one
-    # here would queue a note nothing consumes — and it would then be picked up by the NEXT research
-    # run, silently steering a study with a sentence the user aimed at a chat message.
-    if conn.active_run is not None and conn.active_run.kind in ("chat", "corpus"):
+    # here would queue a note nothing consumes.
+    if target.kind in ("chat", "corpus"):
         return JSONResponse(
             {"error": "Chat answers and corpus scans can't be steered mid-run — wait for it to "
                       "finish, then ask a follow-up."}, status_code=409)
-    conn.add_injection(text)
-    conn.emit("step", "lab", f"Your note is queued for the next step: {text[:80]}")
+    conn.add_injection(text, run=target)
+    conn.emit("step", "lab", f"Your note is queued for the next step: {text[:80]}", run=target)
     return JSONResponse({"status": "queued"})
 
 
@@ -4422,7 +4702,8 @@ async def lab_compact(req: CompactRequest, request: Request) -> JSONResponse:
         return JSONResponse({"error": "Only a research run carries a history worth compacting."},
                             status_code=409)
     target.compact_request.set()
-    conn.emit("step", "lab", "Compaction requested — it will run at the next step boundary.")
+    conn.emit("step", "lab", "Compaction requested — it will run at the next step boundary.",
+              run=target)
     return JSONResponse({"status": "requested"})
 
 
@@ -5485,7 +5766,17 @@ async def _dispatch_lab(conn: Connection, req: LabRequest) -> None:
     # OTHER window's run on the shared session, and the pre-run follow-up clarify uses this run's
     # plan_event (not a connection-wide one). The run_id is bound later (a fresh study mints it; a
     # resume/edit reuses the prior one). Downstream _run_lab reads conn.active_run.
-    conn.begin_run(req.conversation_id)
+    run = conn.begin_run(req.conversation_id)
+    try:
+        await _dispatch_lab_run(conn, req)
+    finally:
+        # The run functions end their own scope; this closes the ones that never started a run
+        # (a reply that starts no study, a clarify left unanswered), which would otherwise stay in
+        # ``live_runs`` — and keep their chat looking busy — for the life of the session.
+        conn.end_run(run)
+
+
+async def _dispatch_lab_run(conn: Connection, req: LabRequest) -> None:
     # Axis B, checked FIRST: the fast path is a different engine, not a lab variant. In particular it
     # must skip the follow-up router below — that router only knows three intents, all of which
     # ("edit the report", "re-run a step", "new study") are research-path outcomes, so letting a chat
@@ -5730,8 +6021,7 @@ async def _run_corpus_scan(conn: Connection, req: LabRequest) -> None:
     conn.bind_run_id(run, run_id)
     run.chat_stop.clear()
     run.hard_stop.clear()
-    conn.pull_injections()
-    conn.chat_running = True
+    run.running = True
     conn.push({"type": "chat_start"})
     emit = conn.emit_fn()
 
@@ -5815,7 +6105,7 @@ async def _run_corpus_scan(conn: Connection, req: LabRequest) -> None:
         conn.push({"type": "chat_error", "message": str(exc)})
         _finish_run_record(conn, run_id, "failed", str(art), str(exc))
     finally:
-        conn.chat_running = False
+        run.running = False
         conn.end_run(run)
 
 
@@ -5866,19 +6156,45 @@ def _quickchat_stream_fn(conn: Connection, model: str, base_url: str | None, api
     as a chat error instead; the user retypes, which costs seconds here (the whole premise of this
     path) rather than the minutes a lab re-run would."""
     def _stream(messages: list[dict], schemas: list[dict]):
+        started = time.monotonic()
         if native_anthropic:
             from . import anthropic_client
-            return anthropic_client.chat_tools_stream(model, messages, schemas, api_key=api_key or "",
+            turn = anthropic_client.chat_tools_stream(model, messages, schemas, api_key=api_key or "",
                                                       base_url=base_url,
                                                       effort=anthropic_client.role_effort("chat"))
-        port = 0 if base_url else (conn.tunnel_port or 0)
-        # Bump the output cap from the 2048 default: a long enumeration answer plus its
-        # reference list was truncating mid-references (and then the citation-check footer
-        # never got appended). 4096 fits these answers with headroom.
-        return vllm_client.chat_tools_stream(port, model, messages, schemas,
-                                             base_url=base_url, api_key=api_key, think=False,
-                                             max_tokens=4096)
+        else:
+            port = 0 if base_url else (conn.tunnel_port or 0)
+            # Bump the output cap from the 2048 default: a long enumeration answer plus its
+            # reference list was truncating mid-references (and then the citation-check footer
+            # never got appended). 4096 fits these answers with headroom.
+            turn = vllm_client.chat_tools_stream(port, model, messages, schemas,
+                                                 base_url=base_url, api_key=api_key, think=False,
+                                                 max_tokens=4096)
+        for kind, chunk in turn:
+            if kind == "usage":           # what the turn cost: recorded here, not shown
+                _record_chat_usage(conn, role="chat", model=model, base_url=base_url,
+                                   native_anthropic=native_anthropic, usage=chunk,
+                                   duration_ms=int((time.monotonic() - started) * 1000))
+                continue
+            yield kind, chunk
     return _stream
+
+
+def _record_chat_usage(conn: Connection, *, role: str, model: str, base_url: str | None,
+                       native_anthropic: bool, usage: dict | None, duration_ms: int) -> None:
+    """Record one fast-chat model call. A chat turn is not a run, so the row has no run_id —
+    ``_record_lab_usage`` would fall back to the connection's last research run and bill that run
+    for a chat answer. Best-effort, like every accounting write."""
+    try:
+        from . import auth_routes
+        remote = bool(native_anthropic or base_url)
+        auth_routes.record_llm_call(run_id=None, user_id=getattr(conn, "app_user_id", None),
+                                    role=role, model=model,
+                                    endpoint=(base_url or "session vLLM") if not native_anthropic
+                                    else "anthropic", remote=remote, usage=usage,
+                                    max_tokens=None, duration_ms=duration_ms)
+    except Exception as exc:  # noqa: BLE001 - accounting never breaks a chat turn
+        print(f"[llm-usage] chat call not recorded: {exc}")
 
 
 def _quickchat_context_fns(conn: Connection, model: str, base_url: str | None, api_key: str | None,
@@ -5910,15 +6226,21 @@ def _quickchat_context_fns(conn: Connection, model: str, base_url: str | None, a
         # return EMPTY content (the map_phenotype_to_hpo failure mode). The timeout is short —
         # this runs before the user's first token, so a hung summarizer must fail fast and let
         # the compactor degrade to dropping the oldest turns.
+        started = time.monotonic()
         if native_anthropic:
             from . import anthropic_client
-            text, _ = anthropic_client.complete_ex(model, messages, api_key=api_key or "",
-                                                   base_url=base_url, timeout=90.0,
-                                                   max_tokens=max(4096, 4 * max_tokens), effort="low")
-            return text
-        port = 0 if base_url else (conn.tunnel_port or 0)
-        return vllm_client.complete(port, model, messages, timeout=90.0, max_tokens=max_tokens,
-                                    base_url=base_url, api_key=api_key, think=False)
+            text, usage = anthropic_client.complete_ex(model, messages, api_key=api_key or "",
+                                                       base_url=base_url, timeout=90.0,
+                                                       max_tokens=max(4096, 4 * max_tokens), effort="low")
+        else:
+            port = 0 if base_url else (conn.tunnel_port or 0)
+            text, usage = vllm_client.complete_ex(port, model, messages, timeout=90.0,
+                                                  max_tokens=max_tokens, base_url=base_url,
+                                                  api_key=api_key, think=False)
+        _record_chat_usage(conn, role="chat:summary", model=model, base_url=base_url,
+                           native_anthropic=native_anthropic, usage=usage,
+                           duration_ms=int((time.monotonic() - started) * 1000))
+        return text
 
     return count_tokens, summarize
 
@@ -5938,8 +6260,7 @@ async def _run_quick_chat(conn: Connection, req: LabRequest) -> None:
     run.kind = "chat"               # /api/chat/inject refuses to queue a note against this run
     run.chat_stop.clear()
     run.hard_stop.clear()
-    conn.pull_injections()          # drop any note left queued by a prior run — see RunState.kind
-    conn.chat_running = True
+    run.running = True
     conn.push({"type": "chat_start"})
     emit = conn.emit_fn()
     # NB run_quick_chat runs in a worker thread (urllib is blocking), and every push below happens
@@ -6060,7 +6381,7 @@ async def _run_quick_chat(conn: Connection, req: LabRequest) -> None:
         conn.emit("error", "chat", f"Chat failed: {exc}", detail=error_detail(exc))
         conn.push({"type": "chat_error", "message": str(exc)})
     finally:
-        conn.chat_running = False
+        run.running = False
         conn.end_run(run)
 
 
@@ -6087,16 +6408,34 @@ async def lab(req: LabRequest, request: Request) -> JSONResponse:
     # connecting/provisioning, errored, disconnected) is rejected rather than silently waiting.
     if conn.status != "ready" or conn.executor is None:
         return JSONResponse({"error": f"Connection is not ready (status={conn.status})."}, status_code=409)
-    # A run's state (chat_stop / plan_event / last_run_id / the event stream) is single-valued per
-    # Connection, so a SECOND run started while one is in-flight (e.g. from another browser tab/window
-    # that bypasses the client-side guard) collides with the first: two plans in one window, and a
-    # cancel/approve in one hits the other. Reject it, exactly like /api/lab/continue
-    # already does. (A typed follow-up AFTER a run completes has chat_running=False and
-    # is allowed; steering an executing run goes through a different endpoint.)
-    if conn.chat_running:
-        return JSONResponse({"error": "A run is already in progress on this session."}, status_code=409)
+    refused = _run_slot_refusal(conn, req.conversation_id)
+    if refused is not None:
+        return refused
     asyncio.create_task(_dispatch_lab(conn, req))
     return JSONResponse({"status": "running"})
+
+
+def _run_slot_refusal(conn: Connection, conversation_id: str | None) -> JSONResponse | None:
+    """Why a new run may not start on this session now, as the 409 to answer — or None.
+
+    Each chat has its own run state (cancel, plan review, stream, mid-run notes), so different chats
+    may run at once. What stays refused: a second run in the SAME chat (its messages would be read
+    as feedback on one run and a new study at once; steering an executing run goes through
+    /api/chat/inject), a run that names no chat while another is executing (an older client, which
+    could not tell the two apart), and more runs than ``AISCIENTIST_MAX_RUNS_PER_SESSION``."""
+    busy = len(conn.live_runs) + (1 if conn._loose_running else 0)
+    if not busy and not conn.chat_running:
+        return None
+    if not conversation_id or conn.live_run_for(conversation_id) is not None:
+        return JSONResponse({"error": "A run is already in progress in this chat."}, status_code=409)
+    limit = _max_runs_per_session()
+    if busy >= limit:
+        return JSONResponse(
+            {"error": (f"{busy} run{'s are' if busy > 1 else ' is'} already in progress on this "
+                       f"session (at most {limit} at once). Wait for one to finish, or stop one, "
+                       "then send this again."),
+             "limit": limit}, status_code=409)
+    return None
 
 
 def _default_run_id(conn: Connection, explicit: str | None, conversation_id: str | None) -> str:
@@ -6122,9 +6461,12 @@ async def lab_continue(req: ContinueRunRequest, request: Request) -> JSONRespons
     conn = _owned_conn(req.connection_id, request)
     if conn.status != "ready" or conn.executor is None:
         return JSONResponse({"error": f"Connection is not ready (status={conn.status})."}, status_code=409)
-    if conn.chat_running:
-        return JSONResponse({"error": "A run is already in progress."}, status_code=409)
+    refused = _run_slot_refusal(conn, req.conversation_id)
+    if refused is not None:
+        return refused
     run_id = _default_run_id(conn, req.run_id, req.conversation_id)
+    if any(r.run_id == run_id and r.running for r in conn.live_runs):
+        return JSONResponse({"error": "That run is still in progress."}, status_code=409)
     if not run_id:
         return JSONResponse({"error": "No previous run to continue."}, status_code=409)
     art = conn.workspace / safe_name(run_id) / "artifacts"
@@ -6259,7 +6601,7 @@ async def lab_plan_review(req: PlanReviewRequest, request: Request) -> JSONRespo
     target.plan_value = {"action": action, "feedback": (req.feedback or "").strip()}
     target.pending_plan = None
     target.plan_event.set()
-    conn.push({"type": "plan_done"})
+    conn.push({"type": "plan_done"}, run=target)
     return JSONResponse({"status": "ok", "action": action})
 
 
@@ -7302,7 +7644,7 @@ async def _build_code_executor(conn: Connection, run: "RunState | None", run_id:
         local_artifacts=str(art),   # mirror artifacts back for the still-local report bundler
         # dfs3b scratch, OFF $HOME — Slurm does not expand $HOME in #SBATCH --output, which
         # would misdirect the job log (matches the variant line's scratch).
-        scratch_dir=_scratch_dir(conn, "runcode"),
+        scratch_dir=_scratch_dir(conn, "runcode", run_id=run_id),
         mem_gb=st.run_code_mem_gb, cpus=st.run_code_cpus, partition=st.cpu_partition,
         account=st.cpu_account or "", time_limit=st.run_code_time_limit,
         container_module=st.container_module, container_bin=st.container_bin,
@@ -7365,7 +7707,7 @@ def _build_report_render_fn(conn: "Connection", run_id: str = ""):
         return SlurmReportRenderer(
             remote=conn.executor, container_image=st.report_image,
             remote_base=f"{_temp_base(conn)}/reports" + (f"/{run_id}" if run_id else ""),
-            scratch_dir=_scratch_dir(conn, "report"),
+            scratch_dir=_scratch_dir(conn, "report", run_id=run_id),
             partition=st.cpu_partition, account=st.cpu_account or "",
             container_module=st.container_module, container_bin=st.container_bin,
             local_fallback=local,
@@ -7667,8 +8009,7 @@ async def _run_lab(conn: Connection, req: LabRequest, *,
 
     run.chat_stop.clear()
     run.hard_stop.clear()
-    conn.pull_injections()          # drop any stale notes from a prior run
-    conn.chat_running = True
+    run.running = True
     conn.push({"type": "chat_start"})
     emit = conn.emit_fn()
 
@@ -7956,7 +8297,7 @@ async def _run_lab(conn: Connection, req: LabRequest, *,
                     local_workspace=conn.workspace / run_id, source_dir=pysrc,
                     # Job scripts, args/result JSON and logs: the application's Temp area, not the
                     # user's home directory (where this line wrote them until 2026-10-12).
-                    scratch_dir=_scratch_dir(conn, "analysis"),
+                    scratch_dir=_scratch_dir(conn, "analysis", run_id=run_id),
                     # Shared dfs3b dir with pure-Python deps the analysis image lacks (pydeseq2).
                     # Unset -> run_pseudobulk_de degrades loudly to its Welch fallback.
                     deps_dir=os.environ.get("AISCIENTIST_HPC_PYDEPS") or None,
@@ -8246,7 +8587,7 @@ async def _run_lab(conn: Connection, req: LabRequest, *,
                     # what silently killed every offline annotate_variants job. A /dfs3b path has no
                     # such symlink so the tmpfs overlay creates it cleanly (same as the workspace bind).
                     job_prefix="bioagent_variant",
-                    scratch_dir=_scratch_dir(conn, "variant"),
+                    scratch_dir=_scratch_dir(conn, "variant", run_id=run_id),
                     # Bind the ClinVar .tbi index alongside its .vcf.gz: VEP's --custom does a Tabix
                     # lookup that needs the index right next to the bgzip, and --containall hides every
                     # host path that isn't an explicit bind — without this VEP dies with "Couldn't find
@@ -8366,7 +8707,7 @@ async def _run_lab(conn: Connection, req: LabRequest, *,
                         local_workspace=conn.workspace / run_id, source_dir=p_pysrc,
                         entrypoint=f"python3 -m {_tools_api.PHENOTYPE_ENTRYPOINT}",   # lirical.sif has python3
                         job_prefix="bioagent_phenotype",
-                        scratch_dir=_scratch_dir(conn, "phenotype"),
+                        scratch_dir=_scratch_dir(conn, "phenotype", run_id=run_id),
                         # Bind the LIRICAL data dir + the Exomiser data dir(s) read-only (--containall hides
                         # everything not bound); a dir bind exposes the .mv.db / .ser files inside.
                         extra_ro_binds=tuple(dict.fromkeys((st.lirical_data_dir, *_exo_binds))),
@@ -8633,6 +8974,12 @@ async def _run_lab(conn: Connection, req: LabRequest, *,
             warned_at = max(60.0, _PLAN_REVIEW_TIMEOUT * 0.75)
             if not conn.plan_event.wait(timeout=warned_at):
                 left = int((_PLAN_REVIEW_TIMEOUT - warned_at) / 60)
+                # The warning is kept on the prompt it is about, so a browser that subscribes after
+                # it (a reload, a reconnect) is told too: the WS replay sends it after the prompt.
+                # In place, so a Stop that has just cleared pending_plan is not undone.
+                pending = conn.pending_plan
+                if isinstance(pending, dict):
+                    pending["expires_at"] = time.monotonic() + (_PLAN_REVIEW_TIMEOUT - warned_at)
                 conn.push({"type": "plan_expiring", "seconds_left": int(_PLAN_REVIEW_TIMEOUT - warned_at)})
                 emit("warning", "lab",
                      f"Plan review has been idle for {int(warned_at / 60)} min — it expires in "
@@ -8683,7 +9030,7 @@ async def _run_lab(conn: Connection, req: LabRequest, *,
         result = await asyncio.to_thread(
             lab_obj.run, req.question, on_event,
             plan_review if want_plan_review else None,
-            should_cancel=run.chat_stop.is_set, pull_injections=conn.pull_injections,
+            should_cancel=run.chat_stop.is_set, pull_injections=run.pull_injections,
             resume=resume,
             decision_review=(decision_review if want_decisions else None),
             should_compact=take_compact_request,
@@ -9113,7 +9460,7 @@ async def _run_lab(conn: Connection, req: LabRequest, *,
         conn.push({"type": "chat_error", "message": str(exc)})
         _finish_run_record(conn, locals().get("run_id"), "error", None, str(exc))
     finally:
-        conn.chat_running = False
+        run.running = False
         # Close the run scope so a post-run WS reconnect doesn't see a stale pending plan; the run
         # stays in conn.runs so a late approve/cancel that names it resolves to a no-op.
         conn.end_run(run)
@@ -11885,30 +12232,33 @@ async def ws_endpoint(websocket: WebSocket, connection_id: str) -> None:
         # if a Duo prompt is currently pending, make sure a late subscriber sees it
         if conn.pending_duo and not conn.duo_event.is_set():
             await websocket.send_json({"type": "duo_prompt", "prompt": conn.pending_duo})
-        # same for a pending Plan-mode review (reconnect mid-review still shows the plan
-        # or the clarify question). pending_plan is {"kind", "payload"}. Tag the replayed prompt
-        # with the active run's identity so a client demuxes it into the owning conversation.
-        if conn.pending_plan and not conn.plan_event.is_set():
-            _pp = conn.pending_plan
-            _tag = conn._tag
+        # same for every pending Plan-mode review (reconnect mid-review still shows the plan
+        # or the clarify question). pending_plan is {"kind", "payload"}. Tag each replayed prompt
+        # with its own run's identity so a client demuxes it into the owning conversation.
+        for _run in list(conn.live_runs) + ([conn._bare_run] if conn._bare_run else []):
+            _pp = _run.pending_plan
+            if not _pp or _run.plan_event.is_set():
+                continue
             if isinstance(_pp, dict) and _pp.get("kind") == "clarify":
-                await websocket.send_json(_tag({"type": "plan_clarify", "questions": _pp.get("payload")}))
+                await websocket.send_json(_run.tag({"type": "plan_clarify", "questions": _pp.get("payload")}))
             elif isinstance(_pp, dict) and _pp.get("kind") == "decision":
                 _dp = _pp.get("payload") or {}
-                await websocket.send_json(_tag({"type": "decision_prompt",
-                                                "goal": _dp.get("goal", ""), "options": _dp.get("options", [])}))
+                await websocket.send_json(_run.tag({"type": "decision_prompt",
+                                                    "goal": _dp.get("goal", ""), "options": _dp.get("options", [])}))
             elif isinstance(_pp, dict):
-                await websocket.send_json(_tag({"type": "plan_prompt", "agenda": _pp.get("payload")}))
+                await websocket.send_json(_run.tag({"type": "plan_prompt", "agenda": _pp.get("payload")}))
+            # Its expiry warning, if it was given, after it, with the time actually left.
+            _expires = _pp.get("expires_at") if isinstance(_pp, dict) else None
+            if isinstance(_expires, (int, float)):
+                await websocket.send_json(_run.tag({"type": "plan_expiring",
+                                                    "seconds_left": max(0, int(_expires - time.monotonic()))}))
         # Rebuild the centre bubble for a client that refreshed / navigated back.
         #  • Run still in flight → replay so the live bubble keeps streaming to this queue.
         #  • Run already FINISHED → replay ONCE more, tagged `recover`, so a client that
         #    MISSED the live completion (WS dropped before chat_done/artifacts) can still
         #    recover the report + recap + downloads. The client dedupes by run_id, so a
         #    client that already persisted this run ignores the replay (no duplicate bubble).
-        replay = conn.stream_replay_payloads()
-        if replay:
-            if not conn.chat_running:
-                replay[0] = {**replay[0], "recover": True}
+        for replay in conn.replays():
             for payload in replay:
                 await websocket.send_json(payload)
         while True:

@@ -87,10 +87,10 @@ def test_quickchat_summarizer_runs_with_thinking_off_and_a_small_budget(monkeypa
     whole max_tokens budget and return EMPTY content — exactly how map_phenotype_to_hpo was
     silently getting zero terms. An empty summary here would throw away the chat's memory."""
     cap: dict = {}
-    monkeypatch.setattr(vllm_client, "complete",
+    monkeypatch.setattr(vllm_client, "complete_ex",
                         lambda port, model, messages, **kw:
                         cap.update(port=port, think=kw.get("think"), max_tokens=kw.get("max_tokens"),
-                                   timeout=kw.get("timeout")) or "a briefing")
+                                   timeout=kw.get("timeout")) or ("a briefing", {}))
 
     _count, summarize = gw_app._quickchat_context_fns(_FakeConn(), "M", None, None)
     assert summarize([{"role": "user", "content": "fold this"}], 512) == "a briefing"
@@ -330,6 +330,45 @@ def test_lab_plan_review_sets_decision_event(tmp_path):
         conn.plan_event.clear()
         r3 = _client().post("/api/lab/plan", json={"connection_id": conn.id, "approved": False})
         assert r3.json()["action"] == "cancel" and conn.plan_value["action"] == "cancel"
+    finally:
+        gw_app.CONNECTIONS.pop(conn.id, None)
+        loop.close()
+
+
+def test_a_browser_that_subscribes_after_the_expiry_warning_is_warned_again():
+    """plan_expiring is pushed once, live. A reload after it used to get the waiting prompt back and
+    no warning: the replay now sends it after the prompt, with the time actually left."""
+    import asyncio
+    import time
+
+    from aiscientist.gateway.settings import HPCSettings
+
+    loop = asyncio.new_event_loop()
+    conn = gw_app.Connection(HPCSettings(), mock=True, loop=loop, username="tester")
+    conn._track_stream({"type": "chat_start", "run_id": "r1"})   # a run in flight: its replay follows
+    gw_app.CONNECTIONS[conn.id] = conn
+
+    def replayed() -> list[dict]:
+        with _client().websocket_connect(f"/ws/{conn.id}") as ws:
+            got = [ws.receive_json()]
+            while got[-1]["type"] != "chat_start":
+                got.append(ws.receive_json())
+        return got[1:]
+
+    try:
+        conn.pending_plan = {"kind": "agenda", "payload": ["a", "b"]}
+        assert [m["type"] for m in replayed()] == ["plan_prompt", "chat_start"]
+
+        conn.pending_plan["expires_at"] = time.monotonic() + 300
+        prompt, warning, _start = replayed()
+        assert prompt["type"] == "plan_prompt" and warning["type"] == "plan_expiring"
+        assert 290 <= warning["seconds_left"] <= 300
+
+        conn.pending_plan = {"kind": "clarify", "payload": [{"question": "q", "options": []}],
+                             "expires_at": time.monotonic() - 5}
+        prompt, warning, _start = replayed()
+        assert prompt["type"] == "plan_clarify"
+        assert (warning["type"], warning["seconds_left"]) == ("plan_expiring", 0)
     finally:
         gw_app.CONNECTIONS.pop(conn.id, None)
         loop.close()
@@ -1006,3 +1045,24 @@ def test_a_loopback_lab_endpoint_is_not_reported_as_egress(monkeypatch):
     monkeypatch.setenv("AISCIENTIST_LAB_LLM_BASE_URL", "http://127.0.0.1:8001/v1")
     r = gw_app._lab_llm(_FakeConn())
     assert r.lab_role_remote is False
+
+
+def test_a_fast_chat_turn_records_its_usage_without_a_run(monkeypatch):
+    """A chat turn is not a run: billing its tokens to the conversation's last research run (what
+    the lab's recorder falls back to) would put a chat answer on that run's bill."""
+    from aiscientist.gateway import auth_routes
+    rows: list = []
+    monkeypatch.setattr(auth_routes, "record_llm_call", lambda **kw: rows.append(kw))
+
+    def stream(port, model, messages, schemas, **kw):
+        yield ("content", "hello")
+        yield ("usage", {"prompt_tokens": 7, "completion_tokens": 2, "total_tokens": 9})
+
+    monkeypatch.setattr(vllm_client, "chat_tools_stream", stream)
+    conn = _FakeConn()
+    conn.app_user_id = 5
+    conn.last_run_id = "earlier-research-run"
+    out = list(gw_app._quickchat_stream_fn(conn, "M", None, None)([{"role": "user", "content": "q"}], []))
+    assert out == [("content", "hello")]                  # the usage is recorded, not shown
+    assert len(rows) == 1 and rows[0]["run_id"] is None and rows[0]["user_id"] == 5
+    assert rows[0]["role"] == "chat" and rows[0]["usage"]["total_tokens"] == 9

@@ -56,10 +56,22 @@ def _safe_owner(owner: str) -> str:
     return cleaned or "guest"
 
 
-def _owner_dir(owner: str) -> Path:
-    d = _root() / _safe_owner(owner)
+def _private_dir(d: Path) -> Path:
+    """Create ``d`` and keep it 0700. A folder made with the default mode took the state dir's
+    default ACL instead (group and other could list it, and read ``index.json``); the store was
+    then closed only by the state dir's own permissions — one chmod away from open."""
     d.mkdir(parents=True, exist_ok=True)
+    try:
+        if stat.S_IMODE(d.stat().st_mode) != 0o700:
+            d.chmod(0o700)
+    except OSError:
+        pass
     return d
+
+
+def _owner_dir(owner: str) -> Path:
+    _private_dir(_root())
+    return _private_dir(_root() / _safe_owner(owner))
 
 
 def _index_path(owner: str) -> Path:

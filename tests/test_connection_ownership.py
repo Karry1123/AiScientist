@@ -196,12 +196,14 @@ def test_a_tus_upload_without_a_live_connection_answers_only_its_owner(site):
 def test_every_route_that_reads_a_connection_id_is_guarded():
     """Structural: a route added later that looks a connection up must go through the guard."""
     creates = {"/api/connect"}                 # makes connections; pinned in the connect tests below
+    # finds the CALLER's own session by account, never one a request names; pinned below
+    by_account = {"/api/session"}
     unguarded = []
     for route in gw_app.app.routes:
         endpoint = getattr(route, "endpoint", None)
         if endpoint is None or not getattr(route, "path", "").startswith(("/api/", "/ws/")):
             continue
-        if route.path in creates:
+        if route.path in creates or route.path in by_account:
             continue
         src = inspect.getsource(endpoint)
         if "CONNECTIONS" in src or "connection_id" in src:
@@ -429,3 +431,40 @@ def test_cluster_models_never_scan_over_someone_elses_session(site, monkeypatch)
     site.who["user"] = ALICE
     assert site.client.get("/api/cluster-models",
                            params={"connection_id": site.conn.id}).json()["scanned"] is True
+
+
+# --- one session per account ------------------------------------------------------------------------
+
+
+def test_a_second_window_joins_the_accounts_open_session(site, no_provision):
+    """Two sessions of one HPC3 user share its worker node, serve job, source tree and Slurm jobs;
+    a second browser joins the open one instead of starting another."""
+    site.who["user"] = ALICE
+    site.conn.mock = False
+    site.conn.hpc_login = "alice"
+    r = _connect(site, mock=False)
+    assert r.status_code == 200 and r.json()["joined"] is True
+    assert r.json()["connection_id"] == site.conn.id and no_provision == []
+    assert site.client.get("/api/session").json()["connection_id"] == site.conn.id
+    site.who["user"] = MALLORY                                  # another account: its own session
+    assert site.client.get("/api/session").json()["connection_id"] is None
+    r = _connect(site, mock=False)
+    assert r.status_code == 200 and "joined" not in r.json() and len(no_provision) == 1
+
+
+def test_a_connect_for_a_different_kind_of_session_is_refused_not_joined(site, no_provision):
+    site.who["user"] = ALICE
+    r = _connect(site, mock=False)                              # alice's open session is a mock one
+    assert r.status_code == 409 and r.json()["connection_id"] == site.conn.id
+    site.conn.mock = False
+    site.conn.hpc_login = "alice"
+    r = _connect(site, mock=False, ucinetid="alice2")
+    assert r.status_code == 409 and "alice" in r.json()["error"]
+    assert no_provision == []
+
+
+def test_a_session_that_ended_is_not_joined(site, no_provision):
+    site.who["user"] = ALICE
+    site.conn.status = "error"
+    r = _connect(site, mock=False)
+    assert r.status_code == 200 and r.json()["connection_id"] != site.conn.id and len(no_provision) == 1

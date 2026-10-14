@@ -456,6 +456,16 @@ button.small { padding: 6px 12px; font-size: 12px; }
 .plan-actions-row button.primary { padding: 8px 17px 8px 15px; }
 .plan-actions-hint { margin-left: 6px; font-size: 12px; color: var(--text-tertiary); }
 .plan-actions-status { font-size: 12.5px; font-weight: 600; color: var(--text-secondary); }
+/* The waiting card's review window is about to close (plan_expiring). Amber like the revision note:
+   it asks for attention, it is not an error. On a plan it heads the actions band, on its own line;
+   on a question or a decision point it closes the card. */
+.plan-expiry {
+  display: flex; align-items: center; gap: 7px; flex-basis: 100%;
+  font-size: 12.5px; font-weight: 550; line-height: 1.4; color: #7a4a05;
+}
+.plan-expiry .msym { flex: none; font-size: 16px; color: var(--amber); }
+.plan-actions-row .plan-expiry { margin-bottom: 2px; }
+.plan-card > .plan-expiry { margin-top: 12px; }
 
 /* The plan document's editor: a file pane inside the card. */
 .plan-yaml { border-top: 1px solid var(--border); padding: 14px 20px 16px; background: rgba(242, 235, 220, 0.45); }
@@ -877,6 +887,16 @@ button.full { width: 100%; margin-top: 6px; }
   font-size: 11px; font-weight: 500; color: var(--accent);
 }
 .session-waiting::before { content: ""; width: 6px; height: 6px; border-radius: 50%; background: var(--accent); }
+/* This chat's run is in flight — several chats may each have one. */
+.session-running {
+  display: inline-flex; align-items: center; gap: 5px; flex: none;
+  font-size: 11px; font-weight: 500; color: var(--text-secondary);
+}
+.session-running::before {
+  content: ""; width: 6px; height: 6px; border-radius: 50%; background: var(--accent);
+  animation: session-pulse 1.4s ease-in-out infinite;
+}
+@keyframes session-pulse { 50% { opacity: 0.35; } }
 .session-del {
   width: 22px; height: 22px; padding: 0; border-radius: 6px; font-size: 12px; flex: none;
   background: transparent; color: var(--text-tertiary); opacity: 0; transition: opacity 0.12s, background 0.12s;

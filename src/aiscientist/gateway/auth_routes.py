@@ -639,6 +639,20 @@ def add_message(cid: int, req: MessageCreate, request: Request) -> dict:
         raise HTTPException(status_code=400, detail="role must be user|assistant|system")
     with session_scope() as s:
         conv = _owned_conversation(s, cid, user.id)
+        # An answer is saved by every window that showed it: two windows of one account share a
+        # session, and a reconnect replays a finished answer to a window that may not have seen it.
+        # The answer's stream id makes the second save return the first instead of a duplicate.
+        stream_id = (req.meta or {}).get("stream_id") if isinstance(req.meta, dict) else None
+        if stream_id:
+            recent = s.scalars(select(Message).where(Message.conversation_id == cid)
+                               .order_by(Message.seq.desc()).limit(50)).all()
+            for m in recent:
+                try:
+                    if (m.kind == (req.kind or "text") and m.meta
+                            and _json.loads(m.meta).get("stream_id") == stream_id):
+                        return {"message": m.public(), "duplicate": True}
+                except (ValueError, AttributeError):
+                    continue
         next_seq = (s.scalar(select(func.max(Message.seq)).where(Message.conversation_id == cid)) or 0) + 1
         msg = Message(
             conversation_id=cid, role=req.role, content=req.content or "",

@@ -4,9 +4,10 @@ const SESSIONS_KEY = "bioagent_sessions_v1";
 const UI_KEY = "bioagent_ui_v1";
 const CONN_KEY = "bioagent_connection_v1";  // last live connection id — survives a reload so we can re-subscribe
 const LASTCONN_KEY = "bioagent_lastconn_v1"; // summary of the last ready session — powers the "reattach" hint after a gateway restart
-const RUNOWNER_KEY = "bioagent_runowner_v1"; // {connId, sid}: which chat owns the in-flight run — survives a reload so results never leak to the active chat
+const RUNOWNER_KEY = "bioagent_runowner_v1"; // {connId, sids}: the chats whose run is in flight — survives a reload so results never leak to the active chat
 const LASTRUN_KEY = "bioagent_lastrun_v1";   // last COMPLETED run_id — survives a refresh so we can still recognise this conn's own run
-const PLANDRAFT_KEY = "aiscientist_plandraft_v1"; // {sid, run, base, text, open}: the plan editor's unapplied text — survives a reload while that plan is still waiting
+const STREAMS_KEY = "aiscientist_streams_v1"; // stream ids of answers this browser already saved — a reconnect replay of one is dropped
+const PLANDRAFT_KEY = "aiscientist_plandraft_v1"; // {<chat id>: {run, base, text, open}}: each plan editor's unapplied text — survives a reload while that plan is still waiting
 
 const state = {
   connectionId: null,
@@ -17,15 +18,9 @@ const state = {
   lastGres: null,
   sessions: [],
   activeId: null,
-  runSessionId: null,   // the chat that launched the in-flight pipeline run (its OWNER)
-  running: false,       // a chat/pipeline run is in flight
-  deadRunTimer: null,   // grace timer that stops a "running" UI whose backend run died silently
-  // In-flight run stream, kept DECOUPLED from the DOM so switching chats (or a reload)
-  // never detaches it. The live bubble is (re)mounted only while the owner chat is
-  // visible — see mountStream()/repaintStream(). `feed` is an ordered list of
-  // {kind:"line",text,level} milestones and {kind:"code",code} step-code blocks.
-  run: null,            // {text, thinking, feed:[], status} or null when idle
-  streamDom: null,      // {body, think, thinkBody, feed} DOM refs while owner chat visible
+  // Each chat's run and dialog live in its own record (see chatOf below), not here. What stays
+  // here is the one visible chat's DOM: the live bubble of its run and its plan card.
+  streamDom: null,      // {body, think, thinkBody, feed} DOM refs of the visible chat's live bubble
   presets: {},                 // key -> {key, label, prompt, tools} from /api/presets (preset pipelines)
   presetOrder: [],             // preset-pipeline keys in load order (for the Pipelines & skills picker)
   skills: {},                  // name -> {name, summary} from /api/skills (atomic skills)
@@ -34,34 +29,125 @@ const state = {
   serverRoots: [],             // server folders a dataset can be bound from by path (empty = off)
   serverOfferDismissed: new Set(),   // pasted server paths the user said "Not now" to
   serverBoundTyped: new Set(),       // pasted server paths already bound (as typed, before resolving)
-  uploads: [],                 // upload cards of the Datasets tab: {id,kind,name,size,sent,status,error,note,file,ctrl,jobId,serverFolder,…}
-  boundPaths: [],              // the BIND-SET (feature ②): the server paths of every data file attached
-                               // for the next run (a VCF + a BED panel + a 2nd VCF). Ordered by attach;
-                               // the server re-ranks to pick the primary. Posted as `datasets`.
-  boundRoles: {},              // path -> role the user set on a bound file ("reference" = comparison
-                               // data such as a cell-type atlas; never picked as the primary).
-  datasetPath: null,           // the PRIMARY of the bind-set (highest-ranked) — mirrored into the hidden
-                               // datasetInput and posted as the legacy `dataset_path` for back-compat.
-  caseNote: null,              // the attached clinical description: {name, text} — the SECOND
-                               // attachment. Held as TEXT, not uploaded: a run binds exactly one
-                               // dataset (which must be the VCF), and the note's only consumer
-                               // (map_phenotype_to_hpo) runs on the gateway, not in a Slurm job.
+  uploads: [],                 // upload cards of the Datasets tab: {id,kind,name,size,sent,status,error,note,file,ctrl,jobId,serverFolder,chat,…}
   lastRunId: null,             // last completed run on this conn (used to recognise our own run after a refresh)
   leftAutoCollapsed: false,    // collapse the connect panel once, on first ready
-  planPending: false,          // a PI plan/clarify is awaiting the user's decision
-  planPrompt: null,            // that prompt itself: {kind: "plan"|"clarify"|"decision", sid, run, …payload}.
-                               // Its card is drawn FROM it, so the card can be drawn again after the
-                               // chat stream is rebuilt, or wait until its chat (sid) is on screen.
-  planRevisedSteps: [],        // 1-based step numbers this redraft actually changed (server-sent)
-  planDoc: null,               // the plan as a document {yaml, steps} when the server sends one
-  planProblems: [],            // why the last edit of that document was refused
-  planDraftYaml: "",           // what is typed in the plan editor and not applied
-  planDraftBase: "",           // the plan document (its YAML) that text and the open editor belong to
-  planEditorOpen: false,       // the plan editor is open on the pending card
+  planCardEl: null,            // the visible chat's live plan / clarify / decision card
   planStatusEl: null,          // the resolved plan card's status line, updated as the PI works
 };
 
 const $ = (id) => document.getElementById(id);
+
+// ---- one dialog per chat ------------------------------------------------------------------------
+// Each chat has its own dialog and its own run. The dialog: the data files attached for its next
+// run, the case note, the draft in the composer, its context meter. The run: the live stream, the
+// plan / clarify / decision card waiting for an answer, Stop and mid-run notes. None of it is shared
+// between chats, so a chat opened while another one uploads or runs starts empty, and both can run
+// at once — the server runs one run per chat, up to its per-session limit.
+//
+// `owned` = this window launched (or, after a reload, re-adopted) the chat's run. Only the owning
+// window handles that run's events, so two windows open on one account never both save the answer.
+const chats = new Map();   // session id -> chat record
+
+function newChatRecord(sid) {
+  return {
+    sid,
+    owned: false,          // this window handles this chat's run events
+    running: false,        // the chat's run is in flight
+    run: null,             // the live stream, DECOUPLED from the DOM so switching chats (or a reload)
+                           // never detaches it: {text, thinking, feed:[], status, statusLabel,
+                           // startedAt, runId, streamId}; `feed` is an ordered list of
+                           // {kind:"line",text,level} milestones and {kind:"code",code} step code.
+    suppress: false,       // the stream being replayed is one this browser already saved
+    deadRunTimer: null,    // grace timer that stops a "running" chat whose backend run died silently
+    planPending: false,    // a PI plan / clarify / decision is waiting for the user
+    plan: null,            // that prompt: {kind: "plan"|"clarify"|"decision", sid, run, agenda, doc,
+                           // revised, problems, questions, goal, options, expiry}. Its card is drawn
+                           // FROM it (drawPlanPrompt), so it survives a rebuild of the chat stream.
+    planDraftYaml: "",     // what is typed in the plan editor and not applied (or an edit just sent)
+    planDraftBase: "",     // the plan document (its YAML) that text and the open editor belong to
+    planEditorOpen: false, // the plan editor is open on the waiting card
+    bound: [],             // the BIND-SET (feature ②): the server paths of every data file attached
+                           // for the next run (a VCF + a BED panel + a 2nd VCF). Ordered by attach;
+                           // the server re-ranks to pick the primary. Posted as `datasets`.
+    roles: {},             // path -> role the user set on a bound file ("reference" = comparison
+                           // data such as a cell-type atlas; never picked as the primary).
+    primary: null,         // the PRIMARY of the bind-set (highest-ranked), posted as `dataset_path`
+    caseNote: null,        // the attached clinical description: {name, text} — held as TEXT, not
+                           // uploaded: its only consumer (map_phenotype_to_hpo) runs on the gateway.
+    draft: "",             // what was typed in the composer and not sent yet
+    ctx: null,             // the last context-occupancy report of this chat's fast-chat turn
+  };
+}
+
+function chatOf(sid) {
+  if (!sid) return null;
+  sid = String(sid);
+  let c = chats.get(sid);
+  if (!c) { c = newChatRecord(sid); chats.set(sid, c); }
+  return c;
+}
+function activeChat() { return chatOf(state.activeId); }
+function chatVisible(c) { return !!c && c.sid === String(state.activeId); }
+function chatTitle(sid) {
+  const s = state.sessions.find((x) => String(x.id) === String(sid));
+  return (s && s.title) || "New chat";
+}
+
+// The dialog code and the plan card read these off `state`: they are the ACTIVE chat's fields.
+function emptyChatField(field) {
+  return { bound: [], roles: {}, revised: [], problems: [], agenda: [] }[field] ??
+    (field === "running" || field === "planPending" || field === "planEditorOpen" ? false
+      : field === "planDraftYaml" || field === "planDraftBase" ? "" : null);
+}
+for (const [key, field] of Object.entries({ boundPaths: "bound", boundRoles: "roles", datasetPath: "primary",
+  caseNote: "caseNote", running: "running", planPending: "planPending", planPrompt: "plan",
+  planDraftYaml: "planDraftYaml", planDraftBase: "planDraftBase", planEditorOpen: "planEditorOpen" })) {
+  Object.defineProperty(state, key, {
+    enumerable: true,
+    get() { const c = activeChat(); return c ? c[field] : emptyChatField(field); },
+    set(v) { const c = activeChat(); if (c) c[field] = v; },
+  });
+}
+for (const [key, field] of Object.entries({ planDoc: "doc", planProblems: "problems",
+  planRevisedSteps: "revised", planAgenda: "agenda" })) {
+  Object.defineProperty(state, key, {
+    enumerable: true,
+    get() { const c = activeChat(); const v = c && c.plan ? c.plan[field] : undefined; return v === undefined ? emptyChatField(field) : v; },
+    set(v) { const c = activeChat(); if (c) { c.plan = c.plan || {}; c.plan[field] = v; } },
+  });
+}
+
+// The chats whose run is in flight, kept across a reload so their replayed results land in them.
+function saveRunOwners() {
+  const sids = [...chats.values()].filter((c) => c.owned && (c.running || c.planPending)).map((c) => c.sid);
+  try {
+    if (sids.length && state.connectionId) localStorage.setItem(RUNOWNER_KEY, JSON.stringify({ connId: state.connectionId, sids }));
+    else localStorage.removeItem(RUNOWNER_KEY);
+  } catch { /* private mode: a reload then loses only the live bubble */ }
+}
+function loadRunOwners(connId) {
+  try {
+    const ro = JSON.parse(localStorage.getItem(RUNOWNER_KEY) || "null");
+    if (!ro || ro.connId !== connId) return [];
+    return Array.isArray(ro.sids) ? ro.sids.map(String) : ro.sid ? [String(ro.sid)] : [];   // older pages stored one {sid}
+  } catch { return []; }
+}
+
+// Stream ids of the answers this browser saved. A quick-chat answer has no run_id, so without them
+// a reconnect replayed (and saved) the same finished answer once more each time.
+function seenStream(id) {
+  if (!id) return false;
+  try { return (JSON.parse(localStorage.getItem(STREAMS_KEY) || "[]") || []).includes(id); } catch { return false; }
+}
+function rememberStream(id) {
+  if (!id) return;
+  try {
+    const ids = (JSON.parse(localStorage.getItem(STREAMS_KEY) || "[]") || []).filter((x) => x !== id);
+    ids.push(id);
+    localStorage.setItem(STREAMS_KEY, JSON.stringify(ids.slice(-100)));
+  } catch { /* private mode */ }
+}
 
 function toast(message) {
   const t = $("toast");
@@ -380,12 +466,14 @@ async function api(method, url, body) {
 function msgFromServer(m) {
   if (m.kind === "artifacts") {
     const meta = m.meta || {};
-    return { role: m.role || "assistant", kind: "artifacts", items: meta.items || [], bundleUrl: meta.bundleUrl };
+    return { role: m.role || "assistant", kind: "artifacts", items: meta.items || [], bundleUrl: meta.bundleUrl,
+             streamId: meta.stream_id || null };
   }
   const msg = { role: m.role, content: m.content };
   // Restore the collapsed run recap (thinking + steps/code) so a finished run stays
   // reviewable after a reload / on another device — not only in a downloaded log.
   const meta = m.meta || {};
+  if (meta.stream_id) msg.streamId = meta.stream_id;
   if (meta.thinking || (meta.feed && meta.feed.length)) {
     msg.thinking = meta.thinking || "";
     msg.feed = meta.feed || [];
@@ -395,15 +483,17 @@ function msgFromServer(m) {
 
 // The payload to persist a message server-side (artifacts: text empty, blobs by URL in meta).
 function serverMsgPayload(msg) {
+  // stream_id: the server keeps one copy of an answer that several windows save (see add_message).
   if (msg.kind === "artifacts") {
     return { role: msg.role || "assistant", content: "", kind: "artifacts",
-             meta: { items: msg.items || [], bundleUrl: msg.bundleUrl } };
+             meta: { items: msg.items || [], bundleUrl: msg.bundleUrl, ...(msg.streamId ? { stream_id: msg.streamId } : {}) } };
   }
   const payload = { role: msg.role, content: msg.content || "" };
   if (msg.thinking || (msg.feed && msg.feed.length)) {
     payload.kind = "text";
     payload.meta = { thinking: msg.thinking || "", feed: msg.feed || [] };
   }
+  if (msg.streamId) { payload.kind = "text"; payload.meta = { ...(payload.meta || {}), stream_id: msg.streamId }; }
   return payload;
 }
 
@@ -463,35 +553,52 @@ function activeSession() {
 }
 
 async function newSession() {
+  leaveDialog();
   if (authed()) {
     try {
       const c = (await api("POST", "/api/conversations", {})).conversation;
       state.sessions.unshift({ id: String(c.id), cid: c.id, title: c.title, messages: [], loaded: true,
       createdAt: c.created_at, updatedAt: c.updated_at || c.created_at });
       state.activeId = String(c.id);
-      hideContextMeter();
       renderSessionList();
       renderChat();
+      showDialog();
       return;
     } catch { /* fall through to a local-only session */ }
   }
   const s = { id: rid(), title: "New chat", messages: [], loaded: true, createdAt: Date.now() };
   state.sessions.unshift(s);
   state.activeId = s.id;
-  hideContextMeter();
   persistSessions();
   renderSessionList();
   renderChat();
+  showDialog();
 }
 
 async function selectSession(id) {
+  leaveDialog();
   state.activeId = id;
-  // Occupancy is per-conversation and only known once THIS chat takes a turn — leaving the
-  // previous conversation's number up would be worse than showing nothing.
-  hideContextMeter();
   renderSessionList();
+  showDialog();
   await ensureMessages(activeSession());
   renderChat();
+}
+
+// Keep what was typed in the chat being left; show the dialog of the chat being entered — its
+// attachments, case note, draft and context meter, never the previous chat's.
+function leaveDialog() {
+  const c = activeChat(), input = $("chatInput");
+  if (c && input) c.draft = input.value;
+}
+function showDialog() {
+  const c = activeChat(), input = $("chatInput");
+  if (input) input.value = (c && c.draft) || "";
+  syncDatasetSelection();
+  renderCaseNoteChip();
+  // Occupancy is per conversation and only known once THIS chat takes a turn — the previous
+  // conversation's number would be worse than showing nothing.
+  if (c && c.ctx) renderContextMeter(c.ctx); else hideContextMeter();
+  updateComposerButton();
 }
 
 // ---- research path / methodology context ----------------------------------
@@ -860,15 +967,15 @@ function alreadyHaveRun(runId) {
 }
 
 async function deleteSession(id) {
-  // If this chat owns the in-flight run, stop it first so the GPU/compute it's
-  // holding is released — a run left orphaned by a deleted chat keeps consuming.
-  if (state.running && state.runSessionId === id) {
-    stopRun();
-    state.runSessionId = null;
-    setRunning(false);
+  // If this chat has a run in flight, stop it first so the GPU/compute it's holding is
+  // released — a run left orphaned by a deleted chat keeps consuming.
+  const chat = chats.get(String(id));
+  if (chat && (chat.running || chat.planPending)) {
+    stopRun(chat);
+    setChatRunning(chat, false);
   }
   // A prompt that was waiting in this chat has nowhere left to be answered.
-  if (state.planPrompt && state.planPrompt.sid === id) { hidePlanPanel(); dropPlanDraft(); }
+  if (chat) { if (chatVisible(chat)) removePlanCard(); releasePlanPrompt(chat); dropPlanDraft(chat); }
   const gone = state.sessions.find((s) => s.id === id);
   // Load this chat's messages first (server-backed chats load lazily) so we know
   // which run artifacts to clean up even if it was never opened this session.
@@ -886,8 +993,10 @@ async function deleteSession(id) {
   // Remove the conversation record server-side (cascades its messages).
   if (authed() && gone && gone.cid) api("DELETE", `/api/conversations/${gone.cid}`).catch(() => {});
   state.sessions = state.sessions.filter((s) => s.id !== id);
+  chats.delete(String(id));
+  saveRunOwners();
   if (state.activeId === id) {
-    if (state.sessions.length) { state.activeId = state.sessions[0].id; await ensureMessages(activeSession()); }
+    if (state.sessions.length) { state.activeId = state.sessions[0].id; showDialog(); await ensureMessages(activeSession()); }
     else { await newSession(); return; }
   }
   persistSessions();
@@ -924,31 +1033,39 @@ const PLAN_WAITING_LABEL = { plan: "Plan to review", clarify: "Question for you"
 function renderSessionList() {
   const list = $("sessionList");
   if (!state.sessions.length) { list.innerHTML = '<div class="session-empty">No chats yet.</div>'; return; }
-  const waiting = state.planPrompt;
-  const waitingHtml = (s) => (waiting && waiting.sid === s.id)
-    ? `<span class="session-waiting" title="This chat is waiting for your answer">${PLAN_WAITING_LABEL[waiting.kind] || "Waiting for you"}</span>`
-    : "";
   list.innerHTML = state.sessions
     .map((s) => `
       <div class="session-item ${s.id === state.activeId ? "active" : ""}" data-id="${s.id}">
         <span class="session-text">
           <span class="session-title">${escapeHtml(s.title || "New chat")}</span>
-          <span class="session-meta">${waitingHtml(s)}<span class="session-time" title="${escapeHtml(absTime(s.updatedAt || s.createdAt))}">${escapeHtml(relTime(s.updatedAt || s.createdAt))}</span></span>
+          <span class="session-meta">${sessionBadge(s.id)}<span class="session-time" title="${escapeHtml(absTime(s.updatedAt || s.createdAt))}">${escapeHtml(relTime(s.updatedAt || s.createdAt))}</span></span>
         </span>
         <button class="session-del" data-del="${s.id}" title="Delete chat" aria-label="Delete chat">✕</button>
       </div>`)
     .join("");
 }
 
+// A chat that waits for an answer says what it waits for; a chat whose run is in flight says so.
+// Several chats may be either at once.
+function sessionBadge(sid) {
+  const c = chats.get(String(sid));
+  if (!c) return "";
+  if (c.plan) return `<span class="session-waiting" title="This chat is waiting for your answer">${PLAN_WAITING_LABEL[c.plan.kind] || "Waiting for you"}</span>`;
+  if (c.running) return '<span class="session-running" title="A run is in progress in this chat">Running</span>';
+  return "";
+}
+
 // ---- chat rendering -------------------------------------------------------
 
 function renderChat() {
   const s = activeSession();
+  const c = activeChat();
   $("chatTitle").textContent = s ? s.title || "New chat" : "New chat";
   const stream = $("chatStream");
   stream.innerHTML = "";
+  state.streamDom = null;
   // The plan card went with the rest of the stream. It is not a saved message: a prompt still
-  // waiting is drawn again below, from state.planPrompt.
+  // waiting in this chat is drawn again below, from the chat's record.
   state.planCardEl = null;
   state.planStatusEl = null;
   // Always re-derive the downloads panel from the ACTIVE session — including the
@@ -962,15 +1079,15 @@ function renderChat() {
     return;
   }
   for (const m of s.messages) stream.appendChild(messageEl(m));
-  // If an in-flight run belongs to THIS chat, (re)mount its live bubble and repaint it
-  // from state — so switching back to a running chat resumes the live stream instead of
-  // showing a frozen/blank bubble.
+  // If this chat has a run in flight, (re)mount its live bubble and repaint it from its record —
+  // so switching back to a running chat resumes the live stream instead of showing a
+  // frozen/blank bubble — and bring back the card it is waiting on.
   mountStream();
   // Same for a plan, a question or a decision point that is waiting in this chat: its card with
   // its buttons comes back, instead of a composer that says a plan is pending and nothing to act on.
   drawPlanPrompt();
-  // The composer follows the chat on screen: its Send/Stop button and its placeholder say whether
-  // this chat owns the run, and both were last set for the chat that was left.
+  // The composer follows the chat on screen: its Send/Stop button and its placeholder are this
+  // chat's, and both were last set for the chat that was left.
   updateComposerButton();
   stream.scrollTop = stream.scrollHeight;
 }
@@ -1081,6 +1198,8 @@ function pushMessage(msg) {
 function pushToSession(sessionId, msg) {
   const s = state.sessions.find((x) => x.id === sessionId);
   if (!s) return;
+  // A replayed answer this chat already shows (saved here, or loaded from the server) is not added again.
+  if (msg.streamId && s.messages.some((m) => m.streamId === msg.streamId && (m.kind || "") === (msg.kind || ""))) return;
   s.messages.push(msg);
   syncMessage(s, msg);
   persistSessions();
@@ -1096,20 +1215,23 @@ function appendUserMessage(text) {
   stream.scrollTop = stream.scrollHeight;
 }
 
-// The in-flight run OWNS a session id (state.runSessionId). We only ever paint its live
-// bubble into the DOM while that owner chat is the visible one — so switching to another
-// chat can never see (or steal) another chat's run, and switching BACK re-mounts and
-// repaints from state (fixes the "frozen stream" + the cross-chat result leak).
-function ownerVisible() { return state.run && state.runSessionId && state.runSessionId === state.activeId; }
+// Each chat's run stream lives in its record. Its live bubble is painted into the DOM only while
+// that chat is the visible one — so switching to another chat can never see (or steal) another
+// chat's run, and switching BACK re-mounts and repaints from the record.
+function ownerVisible() { const c = activeChat(); return !!(c && c.run); }
 
-function startAssistantStream() {
-  state.run = { text: "", thinking: "", feed: [], status: "running", startedAt: Date.now() };
-  state.streamDom = null;
-  mountStream();
-  // Heartbeat: keep the "Working…" timer ticking even when no events arrive for a
-  // while (long HPC3 compute steps are silent), so the run never looks frozen.
-  if (state.runTimer) clearInterval(state.runTimer);
-  state.runTimer = setInterval(() => { if (ownerVisible()) repaintWorking(); }, 1000);
+let runTicker = null;
+function startAssistantStream(c) {
+  c.run = { text: "", thinking: "", feed: [], status: "running", statusLabel: "", startedAt: Date.now(), runId: null, streamId: null };
+  if (chatVisible(c)) { state.streamDom = null; mountStream(); }
+  // Heartbeat: keep the "Working…" timer ticking even when no events arrive for a while (long
+  // HPC3 compute steps are silent), so a run never looks frozen. One ticker serves every chat.
+  if (!runTicker) {
+    runTicker = setInterval(() => {
+      if (ownerVisible()) repaintWorking();
+      if (![...chats.values()].some((x) => x.run)) { clearInterval(runTicker); runTicker = null; }
+    }, 1000);
+  }
 }
 
 // Human elapsed like "8s", "1m 20s", "12m 03s".
@@ -1207,10 +1329,11 @@ function stickToBottom() {
   if (s && state.stickBottom !== false) s.scrollTop = s.scrollHeight;
 }
 
-// Repaint the live bubble from state.run (idempotent full render — cheap; feeds are short).
+// Repaint the visible chat's live bubble from its run (idempotent full render — cheap; feeds are short).
 function repaintStream() {
   const dom = state.streamDom;
-  const run = state.run;
+  const c = activeChat();
+  const run = c && c.run;
   if (!dom || !run) return;
   if (run.thinking) { dom.think.style.display = ""; dom.thinkBody.textContent = run.thinking; }
   else dom.think.style.display = "none";
@@ -1227,7 +1350,7 @@ function repaintStream() {
 // Live "Working…" liveness line — pulsing dot + latest activity + elapsed timer.
 // Kept ticking by the 1s heartbeat so a silent compute step never looks frozen.
 function repaintWorking() {
-  const dom = state.streamDom, run = state.run;
+  const dom = state.streamDom, c = activeChat(), run = c && c.run;
   if (!dom || !dom.working || !run) return;
   if (run.status !== "running") { dom.working.style.display = "none"; return; }
   const secs = Math.floor((Date.now() - (run.startedAt || Date.now())) / 1000);
@@ -1239,20 +1362,20 @@ function repaintWorking() {
   dom.workingText.textContent = `${label} · ${fmtElapsed(secs * 1000)}${hint}`;
 }
 
-// ---- stream event ingest (DOM-independent; always updates state) -----------
-function streamToken(token) { if (state.run) { state.run.text += token; if (ownerVisible()) scheduleRepaint(); } }
-function streamThinking(token) { if (state.run) { state.run.thinking += token; if (ownerVisible()) scheduleRepaint(); } }
-function streamProgress(msg) { if (state.run) { state.run.feed.push({ kind: "line", text: msg.text || "", level: msg.level || "info" }); if (ownerVisible()) scheduleRepaint(); } }
+// ---- stream event ingest (DOM-independent; always updates the chat's record) -----------
+function streamToken(c, token) { if (c.run) { c.run.text += token; if (chatVisible(c)) scheduleRepaint(); } }
+function streamThinking(c, token) { if (c.run) { c.run.thinking += token; if (chatVisible(c)) scheduleRepaint(); } }
+function streamProgress(c, msg) { if (c.run) { c.run.feed.push({ kind: "line", text: msg.text || "", level: msg.level || "info" }); if (chatVisible(c)) scheduleRepaint(); } }
 // Transient "what's happening right now" label from the backend (model_call / tool_start).
 // Drives the live working line so it shows real activity, not a generic "Working…".
-function streamStatus(text) { if (state.run) { state.run.statusLabel = text || ""; if (ownerVisible()) repaintWorking(); } }
-function streamCode(code) {
-  if (!state.run) return;
+function streamStatus(c, text) { if (c.run) { c.run.statusLabel = text || ""; if (chatVisible(c)) repaintWorking(); } }
+function streamCode(c, code) {
+  if (!c.run) return;
   // The last successful run_code of a step wins: drop the previous trailing code block.
-  const f = state.run.feed;
+  const f = c.run.feed;
   if (f.length && f[f.length - 1].kind === "code") f.pop();
   f.push({ kind: "code", code: code || "" });
-  if (ownerVisible()) scheduleRepaint();
+  if (chatVisible(c)) scheduleRepaint();
 }
 
 // ---- chat context occupancy -----------------------------------------------
@@ -1289,46 +1412,43 @@ function renderContextMeter(msg) {
 
 function hideContextMeter() { const el = $("ctxMeter"); if (el) el.classList.add("hidden"); }
 
-function finishAssistantStream() {
-  if (state.runTimer) { clearInterval(state.runTimer); state.runTimer = null; }
+function finishAssistantStream(c) {
   // The run is over, so nothing of it can still be waiting for an answer. A plan review that
   // expired sends no plan_done: without this its card would be drawn again on every switch of chats.
-  if (state.planPrompt || state.planPending) { removePlanCard(); hidePlanPanel(); }
-  dropPlanDraft();
-  if (!state.run) { clearRunOwner(); return; }
-  const owner = state.runSessionId || state.activeId;
-  const run = state.run;
-  // Persist the finished report to the OWNER chat (which may no longer be active), and
+  if (c.plan || c.planPending) { if (chatVisible(c)) removePlanCard(); hidePlanPanel(c); }
+  dropPlanDraft(c);
+  if (!c.run) { saveRunOwners(); return; }
+  const run = c.run;
+  // Persist the finished report to the chat that ran it (which may no longer be active), and
   // KEEP the run recap with it (thinking + steps/code) — collapsed, for later review —
   // instead of discarding it when the live bubble is replaced.
   if (run.text || run.thinking || run.feed.length) {
-    pushToSession(owner, {
+    pushToSession(c.sid, {
       role: "assistant",
       content: run.text || "",
       thinking: run.thinking || "",
       feed: run.feed.slice(),
+      streamId: run.streamId || null,
     });
   }
-  const wasVisible = ownerVisible();
-  state.run = null;
-  state.streamDom = null;
-  clearRunOwner();
-  // If the owner chat is on screen, rebuild it from persisted messages so the live
+  rememberStream(run.streamId);
+  const wasVisible = chatVisible(c);
+  c.run = null;
+  saveRunOwners();
+  // If that chat is on screen, rebuild it from persisted messages so the live
   // (ephemeral) bubble is replaced by the saved final message cleanly.
-  if (wasVisible) renderChat();
+  if (wasVisible) { state.streamDom = null; renderChat(); }
 }
 
-function clearRunOwner() { try { localStorage.removeItem(RUNOWNER_KEY); } catch {} }
-
-function appendArtifacts(items, bundleUrl) {
+function appendArtifacts(c, items, bundleUrl) {
   if (!items || !items.length) return;
-  const owner = state.runSessionId || state.activeId;
-  const msg = { role: "assistant", kind: "artifacts", items, bundleUrl };
+  // Artifacts arrive after chat_done, when the live stream is gone: they carry its id from chat_start.
+  const msg = { role: "assistant", kind: "artifacts", items, bundleUrl, streamId: c.lastStreamId || null };
   resultHandoffs = null;                // this run may have handed something on: ask again
-  pushToSession(owner, msg);
+  pushToSession(c.sid, msg);
   // Only touch the visible chat + downloads panel if the run's own chat is the one
   // on screen — otherwise these would bleed into whatever chat the user switched to.
-  if (owner === state.activeId) {
+  if (chatVisible(c)) {
     $("chatStream").appendChild(messageEl(msg));
     stickToBottom();
     renderDownloads(items, bundleUrl);
@@ -1572,6 +1692,52 @@ function updatePipelineFromEvent(event) {
 
 // ---- connection status / left-panel state ---------------------------------
 
+// The server's runs in flight. A newer gateway lists every one (`live_runs`); an older one names
+// only the newest (`active_run` + `chat_running`).
+function liveRunsOf(summary) {
+  if (Array.isArray(summary.live_runs)) return summary.live_runs;
+  return summary.chat_running && summary.active_run ? [{ ...summary.active_run, running: true }] : [];
+}
+
+// Reload/reconnect restore of each chat's run, and silent-death reconciliation; the server is the
+// source of truth for which chats have a run in flight. A listed run is re-adopted only by a chat
+// this window owns (its owners survive a reload in storage) or by the chat on screen — so Stop
+// targets it — never by a chat another window started. A chat that still shows a run the server
+// no longer lists either gets its terminal event replayed (which clears it) or its run DIED with no
+// terminal event (backend restarted, job reclaimed): after a grace period and a fresh look at the
+// server, say so instead of spinning forever.
+function reconcileRuns(summary) {
+  if (summary.max_runs) state.maxRuns = summary.max_runs;
+  const live = liveRunsOf(summary);
+  const listed = new Set(live.map((r) => String(r.conversation_id || "")));
+  for (const r of live) {
+    if (!r.conversation_id) continue;
+    const sid = String(r.conversation_id);
+    const known = chats.get(sid);
+    if (known && known.deadRunTimer) { clearTimeout(known.deadRunTimer); known.deadRunTimer = null; }
+    if (r.running === false || !((known && known.owned) || sid === String(state.activeId))) continue;
+    const c = chatOf(sid);
+    if (!c.owned) c.owned = true;
+    if (!c.running) setChatRunning(c, true);
+  }
+  for (const c of chats.values()) {
+    if (!c.running || listed.has(c.sid) || c.deadRunTimer) continue;
+    c.deadRunTimer = setTimeout(async () => {
+      c.deadRunTimer = null;
+      if (!c.running || !state.connectionId) return;
+      let again = null;
+      try {
+        const res = await fetch(`/api/connections/${state.connectionId}`);
+        if (res.ok) again = await res.json();
+      } catch { return; }   // cannot look: leave the chat as it is
+      if (!again || !c.running || liveRunsOf(again).some((r) => String(r.conversation_id) === c.sid)) return;
+      finishAssistantStream(c);
+      setChatRunning(c, false);
+      toast(`The run in “${chatTitle(c.sid)}” ended with no result — the backend restarted or the job was reclaimed.`);
+    }, 2500);
+  }
+}
+
 function applyStatus(summary) {
   const prevStatus = state.status;
   state.status = summary.status;
@@ -1592,41 +1758,14 @@ function applyStatus(summary) {
   // has been live, keep the chat on screen and report progress inline instead.
   const showProvisionView = isProvisioning && !state.everConnected;
   const showConnected = isReady || (isProvisioning && state.everConnected);
-  if (isLogin && state.running) setRunning(false);   // only a lost/failed connection kills a run
+  // only a lost/failed connection kills a run — every chat's
+  if (isLogin) for (const c of chats.values()) if (c.running) setChatRunning(c, false);
   // Without a connection a prompt cannot be answered (submitPlan has nowhere to send it), so it is
   // not kept to be drawn again. A session that is still alive replays it when the socket reopens.
-  if (summary.status === "disconnected" && state.planPrompt) { removePlanCard(); hidePlanPanel(); }
-  // Restore the "running" UI after a reload/reconnect: the server says a run is still in
-  // flight, so show Stop even before the first replayed token arrives.
-  if (showConnected && summary.chat_running && !state.running) setRunning(true);
-  // Reconnect/reload restore of the run OWNER. The server is the source of truth for which
-  // conversation owns the in-flight run (summary.active_run). A WS reconnect / page reload wipes
-  // state.runSessionId, after which the Stop button POSTs the wrong conversation_id and the server
-  // (correctly, for cross-window isolation) no-ops it — the run then runs on to its Slurm --time. If
-  // THIS window is viewing the owner conversation, re-adopt it so Stop targets the right run. Gated on
-  // activeId === the run's conversation so only the owner window claims it — another window never does.
-  if (showConnected && summary.chat_running && summary.active_run &&
-      summary.active_run.conversation_id &&
-      state.activeId === summary.active_run.conversation_id &&
-      state.runSessionId !== summary.active_run.conversation_id) {
-    state.runSessionId = summary.active_run.conversation_id;
+  if (summary.status === "disconnected") {
+    for (const c of chats.values()) if (c.plan) { if (chatVisible(c)) removePlanCard(); hidePlanPanel(c); }
   }
-  // Silent-death reconciliation: the frontend still thinks a run is live but the server reports NO
-  // active run (chat_running=false). A run that FINISHED replays its terminal event (run_complete /
-  // chat_error) which clears `running`; a run that DIED (backend restarted / GPU job reclaimed) leaves
-  // no terminal event, so the UI would spin forever. Arm a short grace timer — if a replayed terminal
-  // event clears `running` first it cancels the timer (via setRunning); otherwise the run died, so stop
-  // waiting and say so instead of hanging.
-  else if (showConnected && !summary.chat_running && state.running && !state.deadRunTimer) {
-    state.deadRunTimer = setTimeout(() => {
-      state.deadRunTimer = null;
-      if (state.running) {
-        finishAssistantStream();
-        setRunning(false);
-        toast("The previous run ended with no result — the backend restarted or the job was reclaimed.");
-      }
-    }, 2500);
-  }
+  if (showConnected) reconcileRuns(summary);
   // Panel ergonomics: once live, collapse the connect panel to give the chat room
   // (once only — don't fight the user if they reopen it); reopen it when disconnected
   // so the connect form is reachable again.
@@ -2455,10 +2594,11 @@ function editApiKey(cred) {
 }
 
 function apiKeyError(msg, cause) {
-  // The four causes have four different fixes, so name the fix rather than repeating the error.
+  // Each cause has its own fix, so name the fix rather than repeating the error.
   const fix = {
     auth: "Check the key was copied whole, and that it belongs to this provider.",
-    credit: "The key works but the account is out of credit or rate-limited.",
+    credit: "The key works but the account is out of credit.",
+    rate: "The key works but is rate-limited — wait a minute, or raise the account's limits with the provider.",
     model: "That model id isn't served here — press ↻ to list what is.",
     endpoint: "Check the base URL. It should end in /v1 for most providers.",
     network: "The server could not reach that host.",
@@ -2718,88 +2858,104 @@ function openWs(id) {
   state.ws = ws;
 }
 
-// Stream-family events that belong to the in-flight (or recovering) assistant turn.
-// When we suppress a duplicate finished-run replay, every one of these is a no-op
-// until the next chat_start clears the flag.
+// Stream-family events that belong to a chat's in-flight (or recovering) assistant turn. When a
+// duplicate finished-run replay is suppressed, every one of these is a no-op for that chat until
+// its next chat_start clears the flag.
 const STREAM_TYPES = new Set([
   "chat_token", "chat_thinking", "lab_progress", "run_status", "step_code",
   "chat_done", "chat_stopped", "chat_error", "artifacts", "run_complete",
 ]);
 
 // Run-SCOPED events (a specific run's bubble, plan card, or decision prompt). One SSH/GPU
-// Connection is shared across a user's windows/tabs, so the server tags every one of these with
-// the conversation that OWNS the run. A window only processes the run IT launched
-// (state.runSessionId) and drops the rest — so another window's run never streams into, cancels,
-// or shows a plan card in this one.
+// Connection is shared across a user's chats, windows and tabs, and several chats may each have a
+// run in flight, so the server tags every one of these with the conversation that OWNS the run.
+// Each goes to that chat's record — and only if this window owns the chat's run, so another
+// window's run never streams into, cancels, or shows a plan card in this one.
 const RUN_SCOPED = new Set([...STREAM_TYPES,
-  "plan_prompt", "plan_clarify", "decision_prompt", "plan_done",
+  "chat_start", "plan_prompt", "plan_clarify", "decision_prompt", "plan_done",
   "plan_status", "plan_expiring",
-  // Context occupancy belongs to the conversation that asked, so another window's chat turn
-  // never rewrites this one's meter. Deliberately NOT in STREAM_TYPES: it is a standing
-  // status, not part of the assistant bubble being replayed.
+  // Context occupancy belongs to the conversation that asked, so another chat's turn never
+  // rewrites this one's meter. Deliberately NOT in STREAM_TYPES: it is a standing status, not
+  // part of the assistant bubble being replayed.
   "chat_context"]);
 
-// A tagged event for a conversation this client did NOT launch a run for. Untagged legacy events
-// (no conversation_id) are never foreign, so a single-window session behaves exactly as before.
-function foreignRun(msg) {
-  return !!msg.conversation_id && msg.conversation_id !== state.runSessionId;
+// The chat a run event is for. An untagged event (an older gateway) goes to this window's one chat
+// with a run in flight — or, with none in flight, to the only chat that launched a run here (a
+// follow-up question comes before its run starts).
+function chatForEvent(msg) {
+  if (msg.conversation_id) {
+    const c = chats.get(String(msg.conversation_id));
+    return c && c.owned ? c : null;
+  }
+  const owned = [...chats.values()].filter((c) => c.owned);
+  const live = owned.filter((c) => c.running || c.planPending || c.run);
+  if (live.length === 1) return live[0];
+  return !live.length && owned.length === 1 ? owned[0] : null;
 }
 
 function handleWsMessage(msg) {
-  if (msg.type === "chat_start") {
-    // Ignore a run another window started on this shared session (foreignRun). Also drop a
-    // duplicate replay of a run we already have: `recover` = the server is replaying a run that
-    // already FINISHED, for a client that may have missed its live completion; if we already have
-    // it, drop the whole replay so we don't duplicate the persisted report/recap. Otherwise open
-    // the live bubble for OUR run (or recover a missed one into its owner chat + downloads).
-    state.suppressStream = foreignRun(msg) || !!(msg.recover && alreadyHaveRun(msg.run_id));
-    if (state.suppressStream) return;
-    setRunning(true); startAssistantStream();
-    if (state.run) state.run.conversationId = msg.conversation_id || state.runSessionId;
+  if (RUN_SCOPED.has(msg.type)) {
+    const c = chatForEvent(msg);
+    if (c) handleRunEvent(c, msg);
     return;
   }
-  // Never let another window's run-scoped events touch our bubble / plan card / composer.
-  if (foreignRun(msg) && RUN_SCOPED.has(msg.type)) return;
-  if (state.suppressStream && STREAM_TYPES.has(msg.type)) return;
   switch (msg.type) {
     case "status": applyStatus(msg.connection); break;
     case "event": appendLog(msg); updatePipelineFromEvent(msg); updateBoot(msg); break;
     case "gpu_health": renderGpu({ gpu: { health: msg.health, job_id: state.lastJobId, node: state.lastNode, gres: state.lastGres } }); break;
-    case "chat_token": streamToken(msg.token); break;
-    case "chat_thinking": streamThinking(msg.token); break;
-    case "lab_progress": streamProgress(msg); break;
-    case "run_status": streamStatus(msg.text); break;
-    case "step_code": streamCode(msg.code); break;
-    // The meter describes the chat that took the turn: shown only while that chat is on screen
-    // (switching chats hides it, see selectSession), never in the chat the user switched to.
-    case "chat_context":
-      if ((msg.conversation_id || state.runSessionId || state.activeId) === state.activeId) renderContextMeter(msg);
-      break;
-    case "chat_done": finishAssistantStream(); setRunning(false); break;
-    case "chat_stopped":
-      if (state.run && !state.run.text) state.run.text = "_⏹ Stopped._";
-      finishAssistantStream(); setRunning(false); toast("Run stopped — compute released."); break;
-    case "chat_error":
-      if (state.run) state.run.text = `**Chat error:** ${msg.message || ""}`;
-      finishAssistantStream(); setRunning(false); toast("Chat error"); break;
-    case "artifacts": appendArtifacts(msg.items || [], msg.bundle_url); break;
     case "upload_staging": onStagingEvent(msg.job); break;       // a copy to HPC3 moved on
-    case "run_complete":
-      if (msg.run_id) { state.lastRunId = msg.run_id; try { localStorage.setItem(LASTRUN_KEY, msg.run_id); } catch {} }
-      break;
     case "duo_prompt": showDuoPanel(msg.prompt); break;
     case "duo_done": hideDuoPanel(); break;
-    // The three prompts that wait for the user are held in state first and drawn from there
-    // (holdPlanPrompt): only into the chat that owns the run, and again whenever that chat is rebuilt.
-    case "plan_prompt":
-      holdPlanPrompt("plan", { agenda: msg.agenda || [], doc: msg.plan || null, problems: msg.problems || [] }, msg);
-      break;
-    case "plan_clarify": holdPlanPrompt("clarify", { questions: msg.questions || [] }, msg); break;
-    case "decision_prompt": holdPlanPrompt("decision", { goal: msg.goal || "", options: msg.options || [] }, msg); break;
-    case "plan_done": hidePlanPanel(); break;
-    case "plan_status": setPlanStatus(msg.text); break;
-    case "plan_expiring": setPlanStatus("⏳ This plan expires in a few minutes — reply, approve, or cancel to keep it."); break;
     case "error": toast(msg.message); break;
+  }
+}
+
+function handleRunEvent(c, msg) {
+  if (msg.type === "chat_start") {
+    // Drop a duplicate replay of a turn this browser already saved: `recover` = the server is
+    // replaying a turn that already FINISHED, for a client that may have missed its live
+    // completion. Otherwise open the live bubble for the chat's run (or recover a missed one into
+    // that chat + downloads).
+    c.suppress = !!(msg.recover && (alreadyHaveRun(msg.run_id) || seenStream(msg.stream_id)));
+    if (c.suppress) return;
+    setChatRunning(c, true);
+    startAssistantStream(c);
+    c.run.runId = msg.run_id || null;
+    c.run.streamId = c.lastStreamId = msg.stream_id || null;
+    return;
+  }
+  if (c.suppress && STREAM_TYPES.has(msg.type)) return;
+  switch (msg.type) {
+    case "chat_token": streamToken(c, msg.token); break;
+    case "chat_thinking": streamThinking(c, msg.token); break;
+    case "lab_progress": streamProgress(c, msg); break;
+    case "run_status": streamStatus(c, msg.text); break;
+    case "step_code": streamCode(c, msg.code); break;
+    case "chat_context": c.ctx = msg; if (chatVisible(c)) renderContextMeter(msg); break;
+    case "chat_done": finishAssistantStream(c); setChatRunning(c, false); break;
+    case "chat_stopped":
+      if (c.run && !c.run.text) c.run.text = "_⏹ Stopped._";
+      finishAssistantStream(c); setChatRunning(c, false);
+      toast(chatVisible(c) ? "Run stopped — compute released." : `Run stopped in “${chatTitle(c.sid)}”.`); break;
+    case "chat_error":
+      if (c.run) c.run.text = `**Chat error:** ${msg.message || ""}`;
+      finishAssistantStream(c); setChatRunning(c, false);
+      toast(chatVisible(c) ? "Chat error" : `Chat error in “${chatTitle(c.sid)}”`); break;
+    case "artifacts": appendArtifacts(c, msg.items || [], msg.bundle_url); break;
+    case "run_complete":
+      if (msg.run_id) { state.lastRunId = msg.run_id; try { localStorage.setItem(LASTRUN_KEY, msg.run_id); } catch {} }
+      if (!chatVisible(c)) toast(`“${chatTitle(c.sid)}” finished.`);
+      break;
+    // The three prompts that wait for the user are held in the chat's record first and drawn from
+    // there (holdPlanPrompt): only into their own chat, and again whenever that chat is rebuilt.
+    case "plan_prompt":
+      holdPlanPrompt(c, "plan", { agenda: msg.agenda || [], doc: msg.plan || null, problems: msg.problems || [] }, msg);
+      break;
+    case "plan_clarify": holdPlanPrompt(c, "clarify", { questions: msg.questions || [] }, msg); break;
+    case "decision_prompt": holdPlanPrompt(c, "decision", { goal: msg.goal || "", options: msg.options || [] }, msg); break;
+    case "plan_done": hidePlanPanel(c); break;
+    case "plan_status": if (chatVisible(c)) setPlanStatus(msg.text); break;
+    case "plan_expiring": notePlanExpiring(c, msg); break;
   }
 }
 
@@ -2847,6 +3003,8 @@ async function connect(e) {
       data = await res.json();
     }
     if (!res.ok) { toast(data.error || "Connect failed"); $("connectBtn").disabled = false; return; }
+    // One session per account: a second window joins the one already open (same chats, same model).
+    if (data.joined) toast("Joined your session that is already open in another window.");
     state.connectionId = data.connection_id;
     try { localStorage.setItem(CONN_KEY, data.connection_id); } catch {}
     openWs(data.connection_id);
@@ -2954,61 +3112,64 @@ async function disconnect() {
   applyStatus({ status: "disconnected", model: "" });
 }
 
-function setRunning(running) {
-  state.running = running;
+function setChatRunning(c, running) {
+  c.running = running;
   // Any legit terminal event (chat_done / chat_error / run_complete) clears `running` and so cancels
   // the silent-death watchdog — only a run that ended with NO terminal event lets the timer fire.
-  if (!running && state.deadRunTimer) { clearTimeout(state.deadRunTimer); state.deadRunTimer = null; }
-  const stop = $("chatStop");
-  if (stop) { stop.disabled = false; stop.textContent = "■ Stop"; }
+  if (!running && c.deadRunTimer) { clearTimeout(c.deadRunTimer); c.deadRunTimer = null; }
+  if (chatVisible(c)) {
+    const stop = $("chatStop");
+    if (stop) { stop.disabled = false; stop.textContent = "■ Stop"; }
+  }
+  saveRunOwners();
   updateComposerButton();
+  renderSessionList();
 }
+function setRunning(running) { const c = activeChat(); if (c) setChatRunning(c, running); }
 
-// The composer has ONE primary action that swaps between Send and Stop:
+// The composer has ONE primary action that swaps between Send and Stop, for the chat on screen:
 //  • idle (no run, no plan)              → Send  (starts a new run)
 //  • plan review / executing + has text  → Send  (refine the plan, or inject mid-run)
 //  • plan review / executing + empty box → Stop  (cancel the pending plan / the run)
 // So the moment the user types during a plan review OR a running analysis, Stop becomes
-// Send and they can submit — without the giant Stop button hiding the input.
+// Send and they can submit — without the giant Stop button hiding the input. Another chat's run
+// changes nothing here: this chat can start its own.
 function updateComposerButton() {
   const send = $("chatSend"), stop = $("chatStop"), input = $("chatInput");
   if (!send || !stop || !input) return;
   const hasText = input.value.trim().length > 0;
-  const ownsRun = !state.runSessionId || state.runSessionId === state.activeId;
-  const busy = (state.planPending || state.running) && ownsRun;
+  const c = activeChat();
+  const busy = !!c && (c.planPending || c.running);
   const showSend = !busy || hasText;             // idle → Send; busy → Send only once typing
-  if (!ownsRun && (state.planPending || state.running)) {
-    input.placeholder = "Another chat's run is in progress — switch to it to refine or stop it.";
-  } else if (!state.planPending && !state.running && input.placeholder.startsWith("Another chat")) {
-    input.placeholder = "Ask a research question…";
-  }
   send.classList.toggle("hidden", !showSend);
   stop.classList.toggle("hidden", showSend);
   renderServerPathOffer();   // a server path in the text → offer to bind it; gone once the box clears
 }
 
-// Cancel the in-flight run so the GPU + compute are released. Used by the Stop
+// Cancel a chat's in-flight run so the GPU + compute are released. Used by the Stop
 // button and by deleting the chat that owns the run.
-async function stopRun() {
-  if (!state.connectionId) return;
-  const stop = $("chatStop");
-  if (stop) { stop.disabled = true; stop.textContent = "■ Stopping…"; }
+async function stopRun(c = activeChat()) {
+  if (!state.connectionId || !c) return;
+  if (chatVisible(c)) {
+    const stop = $("chatStop");
+    if (stop) { stop.disabled = true; stop.textContent = "■ Stopping…"; }
+  }
   try {
     await fetch("/api/chat/stop", {
       method: "POST", headers: { "Content-Type": "application/json" },
-      // Stop only the run THIS window launched — not whatever run is live on the shared session.
-      body: JSON.stringify({ connection_id: state.connectionId, conversation_id: state.runSessionId || state.activeId }),
+      // Stop only THIS chat's run — never another chat's run on the shared session.
+      body: JSON.stringify({ connection_id: state.connectionId, conversation_id: c.sid }),
     });
   } catch { /* the chat_stopped event (or next render) will settle the UI */ }
 }
 
-// Steer an executing run without stopping it — the note is folded into the remaining
+// Steer a chat's executing run without stopping it — the note is folded into the remaining
 // steps by the lab loop (see /api/chat/inject).
-async function injectPrompt(text) {
+async function injectPrompt(c, text) {
   try {
     const res = await fetch("/api/chat/inject", {
       method: "POST", headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ connection_id: state.connectionId, conversation_id: state.runSessionId || state.activeId, text }),
+      body: JSON.stringify({ connection_id: state.connectionId, conversation_id: c.sid, text }),
     });
     const d = await res.json().catch(() => ({}));
     if (!res.ok) { toast(d.error || "Couldn't add your note to the run."); return; }
@@ -3022,57 +3183,59 @@ async function sendChat(e) {
   // The corpus scan takes no question: an empty composer sends a default label for the run.
   const text = input.value.trim() || (activeRoute() === "corpus" ? "Corpus scan: haploinsufficient genes in retinal disease" : "");
   if (!text) return;
-  // The plan-review / mid-run channels belong to the chat that OWNS the in-flight run. A message
-  // typed in a DIFFERENT chat is a new question, never feedback on someone else's plan: a tester
-  // opened a fresh chat with "+", typed "Analyze this dataset", and it was sent to the PI as a
-  // change request for the previous chat's plan (planPending is global; the ownership test below
-  // is what was missing).
-  const ownsRun = !state.runSessionId || state.runSessionId === state.activeId;
-  // While a PI plan/clarify is awaiting a decision, the composer is the "refine the
-  // plan" channel — the message is natural-language feedback that re-plans (it does NOT
-  // start a new run).
-  if (state.planPending && ownsRun) {
+  // Everything below is about THIS chat: its plan, its run, its attachments. A message typed in a
+  // chat is never feedback on another chat's plan, never a note for another chat's run — a tester
+  // opened a fresh chat with "+", typed "Analyze this dataset", and it used to be sent to the PI as
+  // a change request for the previous chat's plan.
+  const c = activeChat();
+  if (!c) return;
+  // While a PI plan/clarify is awaiting a decision, the composer is the "refine the plan" channel —
+  // the message is natural-language feedback that re-plans (it does NOT start a new run).
+  if (c.planPending) {
     appendUserMessage(text);
     input.value = "";
+    c.draft = "";
     updateComposerButton();
-    submitPlan("revise", text);
+    submitPlan("revise", text, undefined, c);
     return;
   }
-  if ((state.planPending || state.running) && !ownsRun) {
-    // Another chat's run is live on this shared HPC session (one run at a time). Say so instead
-    // of silently steering it — and instead of silently launching a second run.
-    toast("Another chat's run is in progress — finish or stop it there before starting a new one.");
-    return;
-  }
-  // A run is already executing (post-plan): the message is mid-run steering — queue it for
-  // the lab loop to fold into the remaining steps, rather than launching a 2nd run.
-  if (state.running) {
+  // A run is already executing in this chat (post-plan): the message is mid-run steering — queue it
+  // for the lab loop to fold into the remaining steps, rather than launching a 2nd run.
+  if (c.running) {
     appendUserMessage(text);
     input.value = "";
+    c.draft = "";
     updateComposerButton();
-    injectPrompt(text);
+    injectPrompt(c, text);
     return;
   }
   // A run needs a served model, and the session only has one at "ready" — mirrors the /api/lab guard.
   if (state.status !== "ready") { toast("Connect to HPC3 first."); return; }
+  // The session's limit on runs at once, checked here before the question is saved to the chat: the
+  // server refuses it anyway (and has the last word — runs started from another window count too).
+  const inFlight = [...chats.values()].filter((x) => x.running || x.planPending).length;
+  if (state.maxRuns && inFlight >= state.maxRuns) {
+    toast(`${inFlight} chats already have a run in progress on this session (at most ${state.maxRuns} at once). Wait for one to finish, or stop one, then send this again.`);
+    return;
+  }
   appendUserMessage(text);
-  // Bind this run to the session that launched it, so its streamed report and
-  // artifacts land here even if the user switches chats while it runs (pipelines
-  // take minutes). Persist it too, so a reload/reconnect (which replays the live run)
-  // re-binds the owner instead of falling back to whatever chat is active — the
-  // cross-conversation leak.
-  state.runSessionId = state.activeId;
-  try { localStorage.setItem(RUNOWNER_KEY, JSON.stringify({ connId: state.connectionId, sid: state.activeId })); } catch {}
+  // This chat owns its run, so its streamed report and artifacts land here even if the user
+  // switches chats while it runs (pipelines take minutes). Persisted too (saveRunOwners), so a
+  // reload/reconnect (which replays the live run) re-binds it to this chat instead of falling back
+  // to whatever chat is active — the cross-conversation leak.
+  c.owned = true;
   input.value = "";
-  setRunning(true);
-  const history = activeSession().messages.filter((m) => !m.kind && (m.role === "user" || m.role === "assistant")).slice(0, -1).map((m) => ({ role: m.role, content: m.content }));
-  const dataset_path = $("datasetInput").value.trim() || null;
-  // The BIND-SET (feature ②): every attached data file, ordered as attached (the server re-ranks to
-  // pick the primary). Legacy single-file runs still send `dataset_path`; both together stay
-  // backward-compatible (the server treats `dataset_path` as the primary when `datasets` is absent).
-  const datasets = state.boundPaths.map((p) => {
+  c.draft = "";
+  setChatRunning(c, true);
+  const sess = activeSession();
+  const history = sess.messages.filter((m) => !m.kind && (m.role === "user" || m.role === "assistant")).slice(0, -1).map((m) => ({ role: m.role, content: m.content }));
+  const dataset_path = c.primary || null;
+  // The BIND-SET (feature ②): every data file attached to THIS chat, ordered as attached (the server
+  // re-ranks to pick the primary). Legacy single-file runs still send `dataset_path`; both together
+  // stay backward-compatible (the server treats `dataset_path` as the primary when `datasets` is absent).
+  const datasets = c.bound.map((p) => {
     const d = state.datasets.find((x) => x.path === p) || {};
-    return { path: p, name: d.name || p.split("/").pop(), role: state.boundRoles[p] || null };
+    return { path: p, name: d.name || p.split("/").pop(), role: c.roles[p] || null };
   });
   const autonomous = !!($("autonomousMode") && $("autonomousMode").checked);
   // Bypass mode overrides plan review — don't also send plan_mode=true (avoids a stale plan card).
@@ -3080,34 +3243,43 @@ async function sendChat(e) {
   // DAG is the default execution model now (dependency-graph + Coordinator; no UI toggle). The
   // classic linear order is still reachable server-side via AISCIENTIST_PLANNER=linear.
   const planner = "dag";
+  // A refused send leaves the chat idle and gives the text back, so it can be sent again.
+  const giveBack = () => {
+    setChatRunning(c, false);
+    if (chatVisible(c) && !input.value.trim()) { input.value = text; updateComposerButton(); }
+    else if (!c.draft) c.draft = text;
+  };
   try {
     // The research lab (PI→Scientist→Critic + real scanpy/gseapy tools) is the one execution path.
     // Manual (default): plan review + DAG decision-point pauses. Bypass (autonomous): no gates.
-    const sess = activeSession();
     // Axis B. `route: "chat"` takes the answer-first fast path (agents/quick_chat.py) — no plan, no
     // report; `history` gives that loop the conversation it is continuing (the research path ignores
     // it and scopes a study by question + dataset instead). An older client omitting `route` still
     // gets today's research behaviour, because the server defaults it.
     const route = activeRoute();
-    const res = await fetch("/api/lab", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ connection_id: state.connectionId, conversation_id: state.activeId, question: text, dataset_path, datasets, case_note: (state.caseNote && state.caseNote.text) || null, plan_mode, autonomous, save_results: !!($("saveResults") && $("saveResults").checked), planner, route, history, mode: ($("modeSelect") && $("modeSelect").value) || "auto", presets: (sess && sess.presetKeys) || [], skills: (sess && sess.skillKeys) || [], preset_prompt: null }) });
+    const res = await fetch("/api/lab", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ connection_id: state.connectionId, conversation_id: c.sid, question: text, dataset_path, datasets, case_note: (c.caseNote && c.caseNote.text) || null, plan_mode, autonomous, save_results: !!($("saveResults") && $("saveResults").checked), planner, route, history, mode: ($("modeSelect") && $("modeSelect").value) || "auto", presets: (sess && sess.presetKeys) || [], skills: (sess && sess.skillKeys) || [], preset_prompt: null }) });
     if (!res.ok) {
-      const d = await res.json();
+      const d = await res.json().catch(() => ({}));
       if (res.status === 404 && /unknown connection/i.test(d.error || "")) {
         // The server no longer knows this connection: it restarted under us. A bare "Unknown
         // connection id" toast read as "the question did nothing" — say what happened and what to
         // do, and drop the dead connection so the connect button comes back.
         toast("The server restarted and this session ended — reconnect to HPC3 to continue (your GPU job may still be running and will reattach).");
         state.connectionId = null;
-        setRunning(false);
+        setChatRunning(c, false);
         try { showReattachHint(); } catch { /* banner is best-effort */ }
         try { renderConnectState && renderConnectState(); } catch { /* optional */ }
         return;
       }
+      giveBack();
       toast(d.error || "Run failed");
     } else if (route === "corpus") {
       leaveCorpusRoute(sess);     // accepted: one pick is one scan (a refused send keeps the pick)
     }
-  } catch (err) { toast(isUnreachable(err) ? "Can't reach the local server." : "Run failed: " + err.message); }
+  } catch (err) {
+    giveBack();
+    toast(isUnreachable(err) ? "Can't reach the local server." : "Run failed: " + err.message);
+  }
 }
 
 // ---- plan-mode review: the plan/clarify render AS chat messages (plan.md style) -------
@@ -3119,26 +3291,21 @@ const DEFAULT_PLACEHOLDER = "Ask AiScientist to plan or interpret an ocular bioi
 
 // ---- the prompt that is waiting, kept apart from its card ---------------------------------------
 // A plan, a clarify question or a decision point waits for the user in ONE chat: the one that owns
-// the run. Its card is DOM, and renderChat() empties the stream on every switch of chats, so the
-// card alone cannot be where the prompt lives: switching away and back left a composer that said a
-// plan was pending and no Run / Cancel / Edit as YAML to act on, until a full page reload made the
-// server replay it. So the prompt is held in state (state.planPrompt) from the moment it arrives
-// until it is resolved, and the card is drawn FROM it: when it arrives and its chat is on screen,
-// when that chat is rebuilt, and for the first time when it arrived while another chat was shown.
+// the run. Several chats may each have one waiting. Its card is DOM, and renderChat() empties the
+// stream on every switch of chats, so the card alone cannot be where the prompt lives: switching
+// away and back left a composer that said a plan was pending and no Run / Cancel / Edit as YAML to
+// act on, until a full page reload made the server replay it. So the prompt is held in its chat's
+// record (``c.plan``) from the moment it arrives until it is resolved, and the card is drawn FROM
+// it: when it arrives and its chat is on screen, when that chat is rebuilt, and for the first time
+// when it arrived while another chat was shown.
 
-// The chat a prompt belongs to. The server tags it with the run's conversation; an untagged one
-// (an older server) belongs to the chat that launched the run.
-function planPromptOwner(msg) {
-  return (msg && msg.conversation_id) || state.runSessionId || state.activeId;
+function planPromptVisible(c = activeChat()) {
+  return !!c && !!c.plan && chatVisible(c);
 }
 
-function planPromptVisible() {
-  return !!state.planPrompt && state.planPrompt.sid === state.activeId;
-}
-
-function holdPlanPrompt(kind, payload, msg) {
-  const held = state.planPrompt;
-  const next = { kind, sid: planPromptOwner(msg), run: (msg && msg.run_id) || null, ...payload };
+function holdPlanPrompt(c, kind, payload, msg) {
+  const held = c.plan;
+  const next = { kind, sid: c.sid, run: (msg && msg.run_id) || null, ...payload };
   if (kind === "plan") {
     // The server sends a pending plan again whenever a socket subscribes (a reconnect, a reload),
     // without the `revised` marks: a plan that is repeated keeps the ones it first came with.
@@ -3146,106 +3313,126 @@ function holdPlanPrompt(kind, payload, msg) {
       && JSON.stringify([held.agenda, held.doc]) === JSON.stringify([next.agenda, next.doc]);
     next.revised = msg.revised || (repeated ? held.revised : []);
   }
-  const same = !!held && JSON.stringify(held) === JSON.stringify(next);
-  state.planPrompt = next;
-  state.planPending = true;
-  if (kind === "plan") {
-    state.planAgenda = next.agenda;
-    state.planDoc = next.doc;
-    state.planRevisedSteps = next.revised;
-    state.planProblems = next.problems;
-    keepPlanDraft(next);
-  }
+  // A warning that this prompt expires (notePlanExpiring) stays with it when the same prompt is sent
+  // again; a different one starts a review window of its own.
+  const { expiry, ...heldBody } = held || {};
+  const same = !!held && JSON.stringify(heldBody) === JSON.stringify(next);
+  if (same && expiry) next.expiry = expiry;
+  c.plan = next;
+  c.planPending = true;
+  if (kind === "plan") keepPlanDraft(c, next);
+  saveRunOwners();
   // The prompt that is already on screen, sent again: its card stays as it is, with the caret
   // where the person left it.
-  if (same && state.planCardEl && state.planCardEl.isConnected) return;
+  if (same && chatVisible(c) && state.planCardEl && state.planCardEl.isConnected) return;
   renderSessionList();
-  if (planPromptVisible()) { drawPlanPrompt(); return; }
+  if (chatVisible(c)) { drawPlanPrompt(c); return; }
   // Another chat is on screen. The prompt is not drawn into it (it would be a card for a plan that
   // chat never asked for, and the owning chat would then show none); it waits for its own chat.
   updateComposerButton();
-  const owner = state.sessions.find((s) => s.id === next.sid);
-  if (owner && !same) toast(`“${(owner.title || "New chat").trim()}” is waiting for your answer — open that chat to reply.`);
+  if (!same) toast(`“${chatTitle(c.sid).trim()}” is waiting for your answer — open that chat to reply.`);
 }
 
-function drawPlanPrompt() {
-  const p = state.planPrompt;
-  if (!p || !planPromptVisible()) return;
+function drawPlanPrompt(c = activeChat()) {
+  const p = c && c.plan;
+  if (!p || !chatVisible(c)) return;
   if (p.kind === "clarify") showClarify(p.questions);
   else if (p.kind === "decision") showDecision(p.goal, p.options);
   else showPlanPanel(p.agenda);
 }
 
 // The prompt was answered, or can no longer be: nothing is drawn for it again.
-function releasePlanPrompt() {
-  const was = !!state.planPrompt;
-  state.planPrompt = null;
-  state.planPending = false;
+function releasePlanPrompt(c = activeChat()) {
+  if (!c) return;
+  const was = !!c.plan || c.planPending;
+  c.plan = null;
+  c.planPending = false;
+  if (chatVisible(c)) dropPlanExpiry();
+  saveRunOwners();
   if (was) renderSessionList();
 }
 
-// What is typed in the plan editor and not applied, and whether the editor is open, belong to ONE
-// plan document (state.planDraftBase). They are kept for as long as the server keeps sending that
-// document: when the card is rebuilt, when the prompt is replayed after a reconnect or a page
-// reload (the browser's storage carries them over the reload), when the PI answers a question
-// and leaves the plan alone. A different document drops them. An edit the server refused left the
-// plan unchanged, so what was typed stays.
-function keepPlanDraft(p) {
+// What is typed in a plan editor and not applied, and whether the editor is open, belong to ONE plan
+// document (``c.planDraftBase``) of one chat. They are kept for as long as the server keeps sending
+// that document: when the card is rebuilt, when the prompt is replayed after a reconnect or a page
+// reload (the browser's storage carries them over the reload), when the PI answers a question and
+// leaves the plan alone. A different document drops them. An edit the server refused left the plan
+// unchanged, so what was typed stays.
+function keepPlanDraft(c, p) {
   const yaml = (p.doc && p.doc.yaml) || "";
-  if (yaml && !state.planDraftBase) loadPlanDraft(p);
-  const refused = p.problems.length > 0 && !!state.planDraftYaml;
-  if (!yaml || (state.planDraftBase !== yaml && !refused)) {
-    state.planDraftYaml = "";
-    state.planEditorOpen = false;
+  if (yaml && !c.planDraftBase) loadPlanDraft(c, p);
+  const refused = (p.problems || []).length > 0 && !!c.planDraftYaml;
+  if (!yaml || (c.planDraftBase !== yaml && !refused)) {
+    c.planDraftYaml = "";
+    c.planEditorOpen = false;
   }
-  state.planDraftBase = yaml;
-  savePlanDraft();
+  c.planDraftBase = yaml;
+  savePlanDraft(c);
 }
 
 // The editor reports each change as it happens, so there is never a card whose text exists only in
 // its textarea. Returns whether the text differs from the plan it edits.
-function notePlanDraft(text) {
-  const original = (state.planDoc && state.planDoc.yaml) || "";
+function notePlanDraft(text, c = activeChat()) {
+  if (!c) return false;
+  const original = (c.plan && c.plan.doc && c.plan.doc.yaml) || "";
   const dirty = !!text.trim() && text.trim() !== original.trim();
-  state.planDraftYaml = dirty ? text : "";
-  state.planDraftBase = original;
-  savePlanDraft();
+  c.planDraftYaml = dirty ? text : "";
+  c.planDraftBase = original;
+  savePlanDraft(c);
   return dirty;
 }
 
-function notePlanEditorOpen(open) {
-  state.planEditorOpen = !!open;
-  savePlanDraft();
+function notePlanEditorOpen(open, c = activeChat()) {
+  if (!c) return;
+  c.planEditorOpen = !!open;
+  savePlanDraft(c);
 }
 
-function savePlanDraft() {
-  const p = state.planPrompt;
+// Every chat's draft, in one storage entry keyed by chat. An older page stored a single
+// {sid, run, base, text, open}; it is read as that one chat's.
+function readPlanDrafts() {
+  let d = null;
+  try { d = JSON.parse(localStorage.getItem(PLANDRAFT_KEY) || "null"); } catch {}
+  if (!d || typeof d !== "object") return {};
+  if (typeof d.sid === "string") return { [d.sid]: d };
+  return d;
+}
+
+function writePlanDrafts(all) {
   try {
-    if (p && p.kind === "plan" && state.planDraftBase && (state.planDraftYaml || state.planEditorOpen)) {
-      localStorage.setItem(PLANDRAFT_KEY, JSON.stringify({
-        sid: p.sid, run: p.run, base: state.planDraftBase, text: state.planDraftYaml, open: state.planEditorOpen }));
-    } else {
-      localStorage.removeItem(PLANDRAFT_KEY);
-    }
+    if (Object.keys(all).length) localStorage.setItem(PLANDRAFT_KEY, JSON.stringify(all));
+    else localStorage.removeItem(PLANDRAFT_KEY);
   } catch { /* private mode: the draft still survives a re-render, only not a reload */ }
+}
+
+function savePlanDraft(c) {
+  const p = c.plan;
+  const all = readPlanDrafts();
+  if (p && p.kind === "plan" && c.planDraftBase && (c.planDraftYaml || c.planEditorOpen)) {
+    all[c.sid] = { run: p.run, base: c.planDraftBase, text: c.planDraftYaml, open: c.planEditorOpen };
+  } else {
+    delete all[c.sid];
+  }
+  writePlanDrafts(all);
 }
 
 // After a page reload: what this browser had typed for THIS run's plan. keepPlanDraft then checks
 // it against the document the server sent.
-function loadPlanDraft(p) {
-  let d = null;
-  try { d = JSON.parse(localStorage.getItem(PLANDRAFT_KEY) || "null"); } catch {}
-  if (!d || d.sid !== p.sid || (d.run || null) !== p.run) return;
-  state.planDraftBase = String(d.base || "");
-  state.planDraftYaml = String(d.text || "");
-  state.planEditorOpen = !!d.open;
+function loadPlanDraft(c, p) {
+  const d = readPlanDrafts()[c.sid];
+  if (!d || (d.run || null) !== p.run) return;
+  c.planDraftBase = String(d.base || "");
+  c.planDraftYaml = String(d.text || "");
+  c.planEditorOpen = !!d.open;
 }
 
-function dropPlanDraft() {
-  state.planDraftYaml = "";
-  state.planDraftBase = "";
-  state.planEditorOpen = false;
-  try { localStorage.removeItem(PLANDRAFT_KEY); } catch {}
+function dropPlanDraft(c = activeChat()) {
+  if (!c) return;
+  c.planDraftYaml = "";
+  c.planDraftBase = "";
+  c.planEditorOpen = false;
+  const all = readPlanDrafts();
+  if (c.sid in all) { delete all[c.sid]; writePlanDrafts(all); }
 }
 
 function removePlanCard() {
@@ -3253,17 +3440,19 @@ function removePlanCard() {
   state.planStatusEl = null;   // the old card's status line went with it
 }
 
-function planCardShell() {
+// kind: "plan" | "clarify" | "decision" — what the card waits for, which is what its expiry line says.
+function planCardShell(kind) {
   removePlanCard();
   const stream = $("chatStream");
   const hint = stream.querySelector(".empty-hint"); if (hint) hint.remove();
   const el = document.createElement("div");
   el.className = "msg assistant plan-card";
+  el.dataset.prompt = kind;
   stream.appendChild(el);
   state.planCardEl = el;
-  state.planPending = true;
   return el;
 }
+
 
 // A step arrives as `**Short title** — detailed prose`; it is shown as a title with the prose under
 // it, so the plan scans as a pipeline (titles) with detail on demand.
@@ -3394,19 +3583,21 @@ function planEditorHtml(doc) {
 }
 
 function showPlanPanel(agenda) {
-  const el = planCardShell();
+  const el = planCardShell("plan");
   el.classList.add("plan-sheet");
   state.planAgenda = agenda || [];
   el.innerHTML = planCardHtml(state.planAgenda, state.planDoc, state.planRevisedSteps);
-  el.querySelector('[data-plan="approve"]').addEventListener("click", () => submitPlan("approve"));
-  el.querySelector('[data-plan="cancel"]').addEventListener("click", () => submitPlan("cancel"));
-  wirePlanEditor(el);
+  const c = activeChat();     // the card's buttons answer THIS chat's run, whatever is on screen later
+  el.querySelector('[data-plan="approve"]').addEventListener("click", () => submitPlan("approve", undefined, undefined, c));
+  el.querySelector('[data-plan="cancel"]').addEventListener("click", () => submitPlan("cancel", undefined, undefined, c));
+  wirePlanEditor(el, c);
+  drawPlanExpiry();
   $("chatInput").placeholder = "Tell the PI what to change (e.g. 'drop the enrichment step')…";
   $("chatStream").scrollTop = $("chatStream").scrollHeight;
   updateComposerButton();
 }
 
-function wirePlanEditor(el) {
+function wirePlanEditor(el, c) {
   const panel = el.querySelector(".plan-yaml");
   if (!panel) return;
   const box = panel.querySelector(".plan-yaml-text");
@@ -3418,7 +3609,7 @@ function wirePlanEditor(el) {
   // While the box holds an edit that has not been applied, "Run this plan" would run the plan
   // WITHOUT it. So the edit becomes the primary action and Run waits for Apply or Reset.
   const sync = () => {
-    const dirty = notePlanDraft(box.value);
+    const dirty = notePlanDraft(box.value, c);
     apply.disabled = !dirty;
     apply.classList.toggle("primary", dirty);
     apply.classList.toggle("secondary", !dirty);
@@ -3427,7 +3618,7 @@ function wirePlanEditor(el) {
   };
   toggle.addEventListener("click", () => {
     panel.classList.toggle("hidden");
-    notePlanEditorOpen(!panel.classList.contains("hidden"));
+    notePlanEditorOpen(!panel.classList.contains("hidden"), c);
     label();
     if (!panel.classList.contains("hidden")) box.focus();
   });
@@ -3439,7 +3630,7 @@ function wirePlanEditor(el) {
     box.setRangeText("  ", box.selectionStart, box.selectionEnd, "end");
     sync();
   });
-  apply.addEventListener("click", () => submitPlan("edit", "", box.value));
+  apply.addEventListener("click", () => submitPlan("edit", "", box.value, c));
   panel.querySelector('[data-plan="reset"]').addEventListener("click", () => {
     box.value = original;
     sync();
@@ -3449,7 +3640,8 @@ function wirePlanEditor(el) {
 }
 
 function showClarify(questions) {
-  const el = planCardShell();
+  const c = activeChat();
+  const el = planCardShell("clarify");
   const head = document.createElement("div");
   head.innerHTML = renderMarkdown("## ❓ The PI needs a quick decision");
   el.appendChild(head);
@@ -3468,12 +3660,13 @@ function showClarify(questions) {
       chip.className = "clarify-chip";
       chip.textContent = opt;
       // Answer = "<question>: <option>" so the PI knows which question was answered.
-      chip.addEventListener("click", () => submitPlan("revise", q.question + ": " + opt));
+      chip.addEventListener("click", () => submitPlan("revise", q.question + ": " + opt, undefined, c));
       opts.appendChild(chip);
     }
     wrap.appendChild(opts);
     el.appendChild(wrap);
   }
+  drawPlanExpiry();
   $("chatInput").placeholder = "Answer the PI, or type your own…";
   $("chatStream").scrollTop = $("chatStream").scrollHeight;
   updateComposerButton();
@@ -3483,7 +3676,8 @@ function showClarify(questions) {
 // approach with real context. Reuses the SAME plan_event round-trip as plan review (answered via
 // /api/lab/plan), so there is no new backend path — only the card wording differs.
 function showDecision(goal, options) {
-  const el = planCardShell();
+  const c = activeChat();
+  const el = planCardShell("decision");
   const head = document.createElement("div");
   head.innerHTML = renderMarkdown("## 🔀 Decision point — how should we proceed?");
   el.appendChild(head);
@@ -3498,7 +3692,7 @@ function showDecision(goal, options) {
     chip.type = "button";
     chip.className = "clarify-chip";
     chip.textContent = opt;
-    chip.addEventListener("click", () => submitDecision(opt));
+    chip.addEventListener("click", () => submitDecision(opt, c));
     opts.appendChild(chip);
   }
   // Always offer to defer to the agent, even when the plan gave no explicit options.
@@ -3506,9 +3700,10 @@ function showDecision(goal, options) {
   defer.type = "button";
   defer.className = "clarify-chip ghost";
   defer.textContent = "Let the agent decide";
-  defer.addEventListener("click", () => submitDecision(""));
+  defer.addEventListener("click", () => submitDecision("", c));
   opts.appendChild(defer);
   el.appendChild(opts);
+  drawPlanExpiry();
   $("chatInput").placeholder = "Pick an option — or leave it to the agent…";
   $("chatStream").scrollTop = $("chatStream").scrollHeight;
   updateComposerButton();
@@ -3516,18 +3711,20 @@ function showDecision(goal, options) {
 
 // choice "" = proceed with the agent's judgment; a non-empty string = the chosen approach. Sent as a
 // "revise" (the backend's decision_review treats any non-cancel action as proceed, choice=feedback).
-async function submitDecision(choice) {
-  if (!state.connectionId) return;
-  finalizePlanCard(choice ? `✓ Chose: ${choice}` : "✓ Proceeding — agent decides");
-  releasePlanPrompt();
-  $("chatInput").placeholder = DEFAULT_PLACEHOLDER;
-  mountStream();
-  repaintWorking();
+async function submitDecision(choice, c = activeChat()) {
+  if (!state.connectionId || !c) return;
+  finalizePlanCard(choice ? `✓ Chose: ${choice}` : "✓ Proceeding — agent decides", null, c);
+  releasePlanPrompt(c);
+  if (chatVisible(c)) {
+    $("chatInput").placeholder = DEFAULT_PLACEHOLDER;
+    mountStream();
+    repaintWorking();
+  }
   updateComposerButton();
   try {
     await fetch("/api/lab/plan", {
       method: "POST", headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ connection_id: state.connectionId, conversation_id: state.runSessionId || state.activeId, action: "revise", feedback: choice || "" }),
+      body: JSON.stringify({ connection_id: state.connectionId, conversation_id: c.sid, action: "revise", feedback: choice || "" }),
     });
     toast(choice ? "Decision recorded — continuing…" : "Continuing…");
   } catch (err) { toast("Failed to send decision: " + err.message); }
@@ -3535,21 +3732,23 @@ async function submitDecision(choice) {
 
 // Resolve the live plan/clarify card with a short status line (drop the buttons), and on
 // approval persist the plan to history so it survives a reload.
-function finalizePlanCard(note, persistMarkdown) {
-  if (state.planCardEl) {
+function finalizePlanCard(note, persistMarkdown, c = activeChat()) {
+  if (state.planCardEl && chatVisible(c)) {
     // A resolved card is a record: its editor goes with its buttons, or "Apply edits" would stay
     // clickable on a plan that is no longer waiting for anything.
     const editor = state.planCardEl.querySelector(".plan-yaml");
     if (editor) editor.remove();
     const row = state.planCardEl.querySelector(".plan-actions-row");
     if (row) row.innerHTML = `<span class="plan-actions-status">${escapeHtml(note)}</span>`;
+    const expiry = state.planCardEl.querySelector(".plan-expiry");   // a question's or a decision's
+    if (expiry) expiry.remove();
     // Keep a handle to the STATUS line after the card is resolved. The card is the only thing on
     // screen while the PI works, and what it says is the user's only signal about which of the two
     // things is happening (answering vs re-planning) — see setPlanStatus.
     state.planStatusEl = row ? row.querySelector(".plan-actions-status") : null;
     state.planCardEl = null;
   }
-  if (persistMarkdown) pushToSession(state.runSessionId || state.activeId, { role: "assistant", content: persistMarkdown });
+  if (persistMarkdown && c) pushToSession(c.sid, { role: "assistant", content: persistMarkdown });
 }
 
 // Correct the resolved card's status line as the server learns what the reply actually was.
@@ -3561,51 +3760,103 @@ function setPlanStatus(text) {
   if (state.planStatusEl && text) state.planStatusEl.textContent = text;
 }
 
-function hidePlanPanel() {
+// ---- the waiting prompt's expiry warning ----------------------------------------------------------
+// The gateway sends plan_expiring once, when three quarters of the review window have passed with no
+// answer. It is about the card that is WAITING, so it is shown on that card: a line above its buttons
+// (a plan) or under its options (a question, a decision point). It used to go to setPlanStatus, which
+// writes only to a RESOLVED card's status line, so it never appeared anywhere. It is kept ON the held
+// prompt (its chat's ``plan.expiry``), not only in the card: the card is drawn again from that prompt — a
+// switch of chats, a replayed prompt after a reconnect — and the warning comes back with it. It goes
+// when the prompt is released (releasePlanPrompt): answered, resolved by the server, or the run over.
+function notePlanExpiring(c, msg) {
+  const p = c.plan;
+  if (!p) return;   // nothing is waiting, so there is nothing for it to be about
+  const secs = Number(msg && msg.seconds_left);
+  p.expiry = { at: Number.isFinite(secs) && secs >= 0 ? Date.now() + secs * 1000 : null };
+  if (chatVisible(c)) drawPlanExpiry();
+  else toast(`What is waiting in “${chatTitle(c.sid).trim()}” expires soon — open that chat to answer it.`);
+}
+
+// A clock time rather than "in N minutes": the line stays on screen until the prompt is answered,
+// and a countdown drawn once would be wrong a minute later.
+function planExpiryText(kind, at) {
+  const when = at ? "at " + new Date(at).toLocaleTimeString([], { hour: "numeric", minute: "2-digit" }) : "in a few minutes";
+  if (kind === "clarify") return `This question expires ${when} — answer it before then, or nothing will run.`;
+  if (kind === "decision") return `This decision expires ${when} — choose before then, or the run goes on without your answer.`;
+  return `This plan expires ${when} — run it, change it or reply before then, or nothing will run.`;
+}
+
+// Draws the chat on screen's waiting prompt's warning on its card. planCardEl is only ever that
+// prompt's card: a card is drawn only from its chat's prompt, and only while that chat is on screen.
+function drawPlanExpiry() {
+  const card = state.planCardEl;
+  const expiry = state.planPrompt && state.planPrompt.expiry;
+  if (!card || !expiry) return;
+  let line = card.querySelector(".plan-expiry");
+  if (!line) {
+    line = document.createElement("div");
+    line.className = "plan-expiry";
+    line.setAttribute("role", "status");
+    const row = card.querySelector(".plan-actions-row");
+    if (row) row.prepend(line); else card.appendChild(line);
+  }
+  line.innerHTML = planIcon("hourglass_bottom")
+    + `<span>${escapeHtml(planExpiryText(card.dataset.prompt, expiry.at))}</span>`;
+}
+
+// The prompt was released: a card of it still on screen (plan_done for a card answered elsewhere)
+// stops saying it expires.
+function dropPlanExpiry() {
+  const line = state.planCardEl && state.planCardEl.querySelector(".plan-expiry");
+  if (line) line.remove();
+}
+
+function hidePlanPanel(c = activeChat()) {
   // plan_done (any resolution). Card finalization happens in submitPlan; here we only
   // clear the pending state + restore the composer (idempotent).
-  releasePlanPrompt();
-  $("chatInput").placeholder = DEFAULT_PLACEHOLDER;
+  if (!c) return;
+  releasePlanPrompt(c);
+  if (chatVisible(c)) $("chatInput").placeholder = DEFAULT_PLACEHOLDER;
   updateComposerButton();
 }
 
 // action: "approve" | "revise" | "edit" | "cancel"; feedback only for "revise", planYaml only
 // for "edit" (the plan document as the user edited it).
-async function submitPlan(action, feedback, planYaml) {
-  if (!state.connectionId) return;
+async function submitPlan(action, feedback, planYaml, c = activeChat()) {
+  if (!state.connectionId || !c) return;
   // The approved document is saved with the plan: it is what the run was held to.
-  const docMd = (state.planDoc && state.planDoc.yaml)
-    ? "\n\n**Approved plan document**\n\n```yaml\n" + state.planDoc.yaml.trim() + "\n```"
+  const plan = c.plan || {};
+  const docMd = (plan.doc && plan.doc.yaml)
+    ? "\n\n**Approved plan document**\n\n```yaml\n" + plan.doc.yaml.trim() + "\n```"
     : "";
-  const agendaMd = (state.planAgenda && state.planAgenda.length)
-    ? "## 📋 Research plan\n\n" + state.planAgenda.map((s, i) => `${i + 1}. ${s}`).join("\n") + docMd
+  const agendaMd = (plan.agenda && plan.agenda.length)
+    ? "## 📋 Research plan\n\n" + plan.agenda.map((s, i) => `${i + 1}. ${s}`).join("\n") + docMd
     : null;
   // An edit that is sent stays as the draft until the server answers: refused, it comes back in the
   // editor. A reply in words leaves the draft alone too — the PI may answer a question and send the
   // same plan again. Only a plan that is run or cancelled has no use for it (keepPlanDraft drops it
   // when the plan changes).
-  if (action === "edit") state.planDraftYaml = planYaml || "";
-  else if (action !== "revise") dropPlanDraft();
+  if (action === "edit") c.planDraftYaml = planYaml || "";
+  else if (action !== "revise") dropPlanDraft(c);
   if (action === "approve") {
-    finalizePlanCard("▶ Approved — running…", agendaMd);
+    finalizePlanCard("▶ Approved — running…", agendaMd, c);
     // Re-anchor the live bubble below the just-approved plan so the run's activity
     // (reasoning / running code / report) streams in AFTER it, where the user is looking.
-    mountStream();
-    repaintWorking();
+    if (chatVisible(c)) { mountStream(); repaintWorking(); }
   }
-  else if (action === "cancel") finalizePlanCard("✕ Cancelled");
-  else if (action === "edit") finalizePlanCard("✎ Applying your edit…");
+  else if (action === "cancel") finalizePlanCard("✕ Cancelled", null, c);
+  else if (action === "edit") finalizePlanCard("✎ Applying your edit…", null, c);
   // Neutral until the server says which it was: a reply may be a QUESTION (answered, plan
   // untouched) or a CHANGE (re-planned). Claiming "re-planning" up front was wrong for every
   // question, and stayed wrong on screen for the whole 10-20 min the answer took.
-  else finalizePlanCard("✎ Sent to the PI — reading your reply…");
-  releasePlanPrompt();
-  $("chatInput").placeholder = DEFAULT_PLACEHOLDER;
+  else finalizePlanCard("✎ Sent to the PI — reading your reply…", null, c);
+  releasePlanPrompt(c);
+  if (chatVisible(c)) $("chatInput").placeholder = DEFAULT_PLACEHOLDER;
   updateComposerButton();
   try {
     await fetch("/api/lab/plan", {
       method: "POST", headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ connection_id: state.connectionId, conversation_id: state.runSessionId || state.activeId, action, feedback: feedback || "", plan_yaml: action === "edit" ? (planYaml || "") : "" }),
+      body: JSON.stringify({ connection_id: state.connectionId, conversation_id: c.sid, action, feedback: feedback || "", plan_yaml: action === "edit" ? (planYaml || "") : "" }),
     });
     if (action === "approve") toast("Plan approved — running…");
     else if (action === "cancel") toast("Plan cancelled.");
@@ -4001,11 +4252,14 @@ async function settleUpload(id, d, name, size, ctrl, attach) {
   upsertUpload({ id, sent: size, status: "done", note: "" });
   const unpacked = d.unpacked;
   // Carry the upload-time content skim (the deterministic peek gist) onto the chip so the user sees
-  // "what this is" per attached file, not just the name. An unpacked archive is its folder.
+  // "what this is" per attached file, not just the name. An unpacked archive is its folder. It joins
+  // the chat the upload was started from, which may not be the one on screen any more.
+  const chat = uploadChat(id);
   if (attach) addDataset({ name: unpacked ? `${unpacked.path.replace(/\/$/, "").split("/").pop()}/` : d.name,
-    path: unpacked ? unpacked.path : d.path, kind: unpacked ? "folder" : "file", gist: (d.peek && d.peek.gist) || "" });
+    path: unpacked ? unpacked.path : d.path, kind: unpacked ? "folder" : "file", gist: (d.peek && d.peek.gist) || "" }, chat);
+  const where = attach && chat && String(chat) !== String(state.activeId) ? ` — attached in “${chatTitle(chat)}”` : "";
   if (d.unpack_error) toast(`Uploaded ${d.name}, but it was not unpacked: ${d.unpack_error}`);
-  else toast(`Uploaded ${d.name || name} (${fmtUploadSize(d.size || size)})`);   // d.name may be uniquified
+  else toast(`Uploaded ${d.name || name} (${fmtUploadSize(d.size || size)})${where}`);   // d.name may be uniquified
   loadDatasets();                                                  // reflect the new file in the tab
   setTimeout(() => removeUpload(id), 4000);                        // clear the "Done" card after a beat
 }
@@ -4044,7 +4298,8 @@ async function uploadDataset(file) {
   let fields = before && before.fields;
   state.uploads = state.uploads.filter((u) => !(u.status === "pending" && u.kind === "file" && u.name === file.name && u.size === file.size));
   upsertUpload({ id, kind: "file", name: file.name, size: file.size, sent: (before && before.sent) || 0, status: "queued", file,
-    error: "", detail: "", lost: false, retrying: false, note: "", jobId: "", ctrl });
+    error: "", detail: "", lost: false, retrying: false, note: "", jobId: "", ctrl,
+    chat: (before && before.chat) || state.activeId });   // the chat this upload attaches to when done
   setUploadProgress(`Uploading ${file.name}…`);
   try {
     if (!fields) {
@@ -4215,7 +4470,7 @@ async function followFolder(id, folder, d, ctrl, attach, onRecorded) {
   upsertUpload({ id, status: "done", sent: card.size || d.size || 0, filesDone: d.count, filesTotal: d.count });
   // recorded: the browser's resume notes for this folder have nothing left to resume
   if (card.folderKey) { try { localStorage.removeItem(card.folderKey); localStorage.removeItem(`${card.folderKey}:completed`); } catch { /* private mode */ } }
-  if (attach) addDataset({ name: `${d.name}/`, path: d.path, kind: "folder" });
+  if (attach) addDataset({ name: `${d.name}/`, path: d.path, kind: "folder" }, uploadChat(id));
   if (onRecorded) onRecorded();
   toast(folderDoneText(d));
   loadDatasets();
@@ -4256,8 +4511,10 @@ async function uploadFolder(fileList) {
   const total = files.reduce((n, f) => n + f.size, 0);
   const ctrl = new AbortController();
   // `files` stays on the card: while the page is open, a Resume does not need the folder chosen again
+  const earlier = state.uploads.find((u) => u.id === id);
   upsertUpload({ id, kind: "folder", name: `${folder0}/`, size: total, sent: 0, filesDone: 0, filesTotal: files.length,
-    status: "uploading", error: "", detail: "", lost: false, retrying: false, note: "", jobId: "", serverFolder: "", folderKey, files, ctrl });
+    status: "uploading", error: "", detail: "", lost: false, retrying: false, note: "", jobId: "", serverFolder: "", folderKey, files, ctrl,
+    chat: (earlier && earlier.chat) || state.activeId });
   setUploadProgress(`Preparing ${folder0}/…`);
   let folder = folder0, failedRel = "";
   try {
@@ -4355,7 +4612,7 @@ async function uploadFolder(fileList) {
     }
     else {                                                           // recorded already: nothing left to copy to HPC3
       upsertUpload({ id, status: "done", sent: total, filesDone: files.length });
-      addDataset({ name: `${d.name}/`, path: d.path, kind: "folder" });
+      addDataset({ name: `${d.name}/`, path: d.path, kind: "folder" }, uploadChat(id));
       forget();
       toast(folderDoneText({ ...d, kept: d.kept || kept }));
       loadDatasets();
@@ -4572,11 +4829,22 @@ function toggleReference(path) {
   syncDatasetSelection();
 }
 
-function addDataset(d) {
+// ADD a data file to a chat's bind-set — the chat on screen, or `sid` (the chat an upload was
+// started from, which may have been left while the file was uploading).
+function addDataset(d, sid) {
   if (!d || !d.path) return;
   if (!state.datasets.some((x) => x.path === d.path)) state.datasets.unshift(d);
-  if (!state.boundPaths.includes(d.path)) state.boundPaths.push(d.path);   // ADD to the set
-  syncDatasetSelection();
+  const c = chatOf(sid || state.activeId);
+  if (c && !c.bound.includes(d.path)) c.bound.push(d.path);
+  if (!c || chatVisible(c)) syncDatasetSelection();
+  else renderDataMenuRecent();      // its chips appear when that chat is opened (showDialog)
+}
+
+// The chat an upload attaches to: the one it was started from (cards restored after a reload
+// have none, and attach nothing).
+function uploadChat(id) {
+  const u = state.uploads.find((x) => x.id === id);
+  return (u && u.chat) || null;
 }
 
 // Add/remove one path from the bind-set (a recent-list toggle or a chip ×).
@@ -5443,7 +5711,7 @@ function init() {
     const x = e.target.closest("[data-clear-path]");
     if (x) toggleBound(x.dataset.clearPath);
   });
-  $("caseNoteChips").addEventListener("click", (e) => { if (e.target.closest("[data-clear-note]")) { state.caseNote = null; renderCaseNoteChip(); } });
+  $("caseNoteChips").addEventListener("click", (e) => { if (e.target.closest("[data-clear-note]")) { state.caseNote = null; renderCaseNoteChip(); } });   // this chat's note only
   $("caseNoteFile").addEventListener("change", (e) => { const f = e.target.files[0]; if (f) attachCaseNote(f); e.target.value = ""; });
   // "＋ Data" popover: upload a file/folder, or pick a recent upload.
   $("dataMenuBtn").addEventListener("click", (e) => { e.stopPropagation(); toggleDataMenu(); });
@@ -5524,7 +5792,15 @@ function init() {
 async function restoreConnection() {
   let id = null;
   try { id = localStorage.getItem(CONN_KEY); } catch {}
-  if (!id) return;
+  if (!id) {
+    // A browser that never connected joins the session its account already has open elsewhere.
+    try {
+      const d = await (await fetch("/api/session")).json();
+      id = d && d.connection_id;
+    } catch { /* no accounts, or the server is unreachable: show the connect form */ }
+    if (!id) return;
+    try { localStorage.setItem(CONN_KEY, id); } catch {}
+  }
   try {
     const res = await fetch(`/api/connections/${id}`);
     if (res.status === 401 || res.status === 403) {
@@ -5547,12 +5823,9 @@ async function restoreConnection() {
       return;
     }
     state.connectionId = id;
-    // Re-bind the in-flight run's owner chat BEFORE the WS replays it, so its replayed
+    // Re-bind each in-flight run to its chat BEFORE the WS replays it, so its replayed
     // report/artifacts land in the chat that launched it — not the active one.
-    try {
-      const ro = JSON.parse(localStorage.getItem(RUNOWNER_KEY) || "null");
-      if (ro && ro.connId === id && ro.sid) state.runSessionId = ro.sid;
-    } catch {}
+    for (const sid of loadRunOwners(id)) chatOf(sid).owned = true;
     openWs(id);   // WS replay restores status + (if a run is live) the streaming bubble
   } catch { /* local server unreachable — stay on the disconnected/login view */ }
 }

@@ -172,7 +172,8 @@ def test_ok_when_the_model_actually_answers(monkeypatch):
     (403, "{}", "auth"),
     (402, "{}", "credit"),
     (400, '{"error":"insufficient balance"}', "credit"),
-    (429, "{}", "credit"),
+    (429, "{}", "rate"),                                   # requests / tokens per minute
+    (429, '{"error":"quota exceeded"}', "credit"),         # a 429 that names quota is the bill
     (404, '{"error":"model xyz not found"}', "model"),
     (400, '{"error":"invalid model id"}', "model"),
     (404, "{}", "endpoint"),

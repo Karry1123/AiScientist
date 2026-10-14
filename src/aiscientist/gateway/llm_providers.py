@@ -160,7 +160,7 @@ class VerifyResult:
     """Why a key did or didn't work. ``cause`` is what the UI keys its message on."""
 
     ok: bool
-    # 'ok' | 'auth' | 'credit' | 'model' | 'endpoint' | 'network'
+    # 'ok' | 'auth' | 'credit' | 'rate' | 'model' | 'endpoint' | 'network'
     cause: str
     message: str
     models: list[str] = field(default_factory=list)
@@ -205,7 +205,7 @@ class ModelsResult:
     URL" need three different things from the user and look identical as an empty list."""
 
     ok: bool
-    # 'ok' | 'auth' | 'credit' | 'model' | 'endpoint' | 'network' | 'unsupported'
+    # 'ok' | 'auth' | 'credit' | 'rate' | 'model' | 'endpoint' | 'network' | 'unsupported'
     cause: str
     message: str
     models: list[str] = field(default_factory=list)
@@ -276,7 +276,8 @@ def _classify(status: int, body: str) -> tuple[str, str]:
     if status == 404:
         return "endpoint", "No OpenAI-compatible API at that base URL (404)."
     if status == 429:
-        return "credit", "The endpoint is rate-limiting this key."
+        # A 429 that names credit or quota was caught above; this one is requests/tokens per minute.
+        return "rate", "The endpoint is rate-limiting this key (too many requests or tokens per minute)."
     return "endpoint", f"The endpoint answered HTTP {status}."
 
 

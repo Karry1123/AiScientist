@@ -44,6 +44,12 @@ The gateway orchestrates and never does the heavy compute. On each connect it sy
 tool change never needs an image rebuild. All gateway-to-HPC3 traffic goes over one SSH session per
 user. Deploys use `scripts/sync_deploy.sh` (rsync; the server never git-pulls).
 
+Each chat has its own dialog and its own run: attachments, draft, plan review, Stop and mid-run notes
+belong to one chat. One session runs several chats at once, one run per chat, up to
+`AISCIENTIST_MAX_RUNS_PER_SESSION` (default 3); they share the session's served model, which batches
+their requests, and each run writes its job files in its own scratch folder. An account has one
+session: a second browser or tab joins the open one instead of logging in to HPC3 again.
+
 ## One research run
 
 ```mermaid

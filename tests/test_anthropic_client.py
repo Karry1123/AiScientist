@@ -471,3 +471,20 @@ def test_an_openai_compatible_server_never_sees_provider_blocks():
     wired = vllm_client._wire_messages([{"role": "user", "content": "q"},
                                         {"role": "assistant", "content": "", "provider_blocks": blocks}])
     assert wired == [{"role": "user", "content": "q"}, {"role": "assistant", "content": ""}]
+
+
+def test_the_fast_chat_stream_ends_with_its_usage(fake):
+    fake(_final([{"type": "text", "text": "Hi"}]),
+         events=[SimpleNamespace(type="content_block_delta", delta=SimpleNamespace(type="text_delta", text="Hi"))])
+    got = list(ac.chat_tools_stream("claude-haiku-5-5", [{"role": "user", "content": "hi"}], [], api_key="k"))
+    kind, usage = got[-1]
+    assert kind == "usage"
+    assert usage["completion_tokens"] == 20 and usage["prompt_tokens"] == 100 + 900 + 50
+
+
+def test_a_rate_limit_is_not_read_as_an_empty_account():
+    """Both used to come back as "credit"; they have different fixes (wait vs top up)."""
+    RateLimitError = type("RateLimitError", (Exception,), {"status_code": 429})
+    BadRequestError = type("BadRequestError", (Exception,), {"status_code": 400})
+    assert ac.classify_error(RateLimitError("slow down"))[0] == "rate"
+    assert ac.classify_error(BadRequestError("Your credit balance is too low"))[0] == "credit"

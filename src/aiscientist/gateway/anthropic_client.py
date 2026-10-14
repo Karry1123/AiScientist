@@ -197,7 +197,7 @@ def _scrub(text: str, api_key: str | None) -> str:
 
 def classify_error(exc: BaseException) -> tuple[str, str]:
     """(cause, message) on the same causes the credential dialog already explains:
-    auth | credit | model | endpoint | network | context."""
+    auth | credit | rate | model | endpoint | network | context."""
     name = type(exc).__name__
     status = getattr(exc, "status_code", None)
     body = str(getattr(exc, "message", "") or exc)
@@ -214,7 +214,9 @@ def classify_error(exc: BaseException) -> tuple[str, str]:
     if status == 404 or name == "NotFoundError" or ("model" in low and "not found" in low):
         return "model", "Anthropic does not serve that model id for this key."
     if status == 429 or name == "RateLimitError":
-        return "credit", "Anthropic is rate-limiting this key."
+        # Not credit: the account has money, but this key sent more requests or tokens per minute
+        # than its usage tier allows (several chats running at once reach it sooner).
+        return "rate", "Anthropic is rate-limiting this key (requests or tokens per minute for its usage tier)."
     if status in (500, 502, 503, 529) or name in ("InternalServerError", "OverloadedError",
                                                    "ServiceUnavailableError"):
         return "endpoint", "The Anthropic API is overloaded or unavailable; try again shortly."
@@ -579,7 +581,7 @@ def chat_tools_stream(model: str, messages: list[dict], tools: list[dict], *, ap
                       effort: str | None = None, timeout: float = _TIMEOUT) -> Iterator[tuple[str, Any]]:
     """The :func:`vllm_client.chat_tools_stream` protocol for the fast chat: ``("content", text)``
     (and ``("thinking", text)`` when a summary is returned) as they arrive, then one
-    ``("tool_calls", calls)`` and one ``("provider_blocks", blocks)``."""
+    ``("tool_calls", calls)``, one ``("provider_blocks", blocks)`` and one ``("usage", usage)``."""
     client = _client(api_key, base_url, timeout)
     system, msgs = to_anthropic(messages)
     kwargs, betas = _prepare(model=model, system=system, messages=msgs, max_tokens=max_tokens,
@@ -605,6 +607,8 @@ def chat_tools_stream(model: str, messages: list[dict], tools: list[dict], *, ap
     turn = _turn(final, model)
     yield "tool_calls", turn["tool_calls"]
     yield "provider_blocks", turn["provider_blocks"]
+    if turn.get("usage"):
+        yield "usage", turn["usage"]
 
 
 def count_tokens(model: str, messages: list[dict], tools: list[dict] | None, *, api_key: str,

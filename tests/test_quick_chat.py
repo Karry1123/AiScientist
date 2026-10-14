@@ -380,3 +380,17 @@ def test_grounding_for_a_search_that_ran_out_of_time_does_not_claim_an_empty_cor
     empty = _format_grounding({"status": "failed", "n_contexts": 0, "agent_status": "success",
                                "error": "the indexed corpus returned 0 passages"})
     assert "The corpus has nothing on this." in empty
+
+
+def test_chat_tools_stream_asks_for_its_usage_and_reports_it_last(monkeypatch):
+    """A fast-chat turn costs tokens like any other call; without the usage it could not be
+    recorded, and chat answers were missing from the usage table."""
+    sent = []
+    stub_urlopen(monkeypatch, sent, sse(
+        {"choices": [{"delta": {"content": "ans"}}]},
+        {"choices": [], "usage": {"prompt_tokens": 12, "completion_tokens": 3, "total_tokens": 15}},
+    ))
+    out = list(vllm_client.chat_tools_stream(1234, "m", [], []))
+    assert sent[0]["stream_options"] == {"include_usage": True}
+    assert out == [("content", "ans"),
+                   ("usage", {"prompt_tokens": 12, "completion_tokens": 3, "total_tokens": 15})]

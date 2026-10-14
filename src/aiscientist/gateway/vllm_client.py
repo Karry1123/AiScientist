@@ -341,6 +341,8 @@ def chat_tools_stream(
         ``{"id", "type", "function": {"name", "arguments"}}`` with ``arguments`` as a
         JSON *string* — the same shape ``chat_tools`` returns, so callers parse it
         identically.
+      * ``("usage", {...})`` — ONCE, last, when the server reports the turn's token usage
+        (``stream_options.include_usage``), so the caller can record what the turn cost.
 
     ``think`` defaults to **False** here (the opposite of ``chat_stream``): the whole
     point of the fast path is that the first sentence appears immediately, and a Qwen3
@@ -348,7 +350,8 @@ def chat_tools_stream(
     only where the trace is wanted.
     """
     url = f"{_endpoint(local_port, base_url)}/chat/completions"
-    payload: dict = {"model": model, "messages": _wire_messages(messages), "stream": True}
+    payload: dict = {"model": model, "messages": _wire_messages(messages), "stream": True,
+                     "stream_options": {"include_usage": True}}
     if tools:
         payload["tools"] = tools
         payload["tool_choice"] = "auto"
@@ -358,6 +361,7 @@ def chat_tools_stream(
     data = json.dumps(payload).encode("utf-8")
     req = urllib.request.Request(url, data=data, headers=_headers(api_key), method="POST")
     calls: dict[int, dict] = {}
+    usage: dict | None = None
     try:
         with urllib.request.urlopen(req, timeout=timeout) as resp:  # noqa: S310 - local tunnel
             for raw in resp:
@@ -373,6 +377,8 @@ def chat_tools_stream(
                     continue
                 if isinstance(event, dict) and event.get("error"):
                     raise GatewayError(f"vLLM chat error: {event['error']}", stage="vllm_chat", detail=event)
+                if isinstance(event.get("usage"), dict):
+                    usage = dict(event["usage"])
                 choices = event.get("choices") or []
                 if not choices:
                     continue
@@ -393,6 +399,8 @@ def chat_tools_stream(
                                stage="vllm_chat", detail=error_detail(exc)) from exc
     if calls:
         yield ("tool_calls", [calls[i] for i in sorted(calls)])
+    if usage:
+        yield ("usage", usage)
 
 
 def complete_ex(

@@ -110,9 +110,10 @@ def test_each_run_has_independent_cancel_and_plan_events():
     assert a.chat_stop.is_set() and not b.chat_stop.is_set()   # cancelling A never touches B
 
 
-def test_resolve_run_only_matches_the_active_run():
+def test_resolve_run_only_matches_a_live_run():
     c = _conn()
     a = c.begin_run("conv-A"); c.bind_run_id(a, "runA")
+    c.end_run(a)                                               # A finished
     b = c.begin_run("conv-B"); c.bind_run_id(b, "runB")        # B is now active
     assert c.resolve_run(run_id="runB") is b
     assert c.resolve_run(conversation_id="conv-B") is b

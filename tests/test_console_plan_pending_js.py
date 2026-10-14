@@ -1,8 +1,9 @@
 """The console's waiting prompt (a plan, a clarify question, a decision point), run under node.
 
 A prompt waits in ONE chat, the one that owns the run, and its card is DOM that ``renderChat()``
-throws away on every switch of chats. ``frontend/console/app.js`` therefore holds the prompt in
-``state.planPrompt`` until it is resolved and draws the card from it. This runs the functions
+throws away on every switch of chats. ``frontend/console/app.js`` therefore holds the prompt in that
+chat's record (``chatOf(sid).plan``; ``state.planPrompt`` is the chat on screen's) until it is
+resolved and draws the card from it. Several chats may each have one waiting. This runs the functions
 involved (the WebSocket handler, the prompt section, ``renderChat``, ``renderSessionList``, the
 plan editor's HTML, the submit and run-end paths) under node with the DOM-building functions
 stubbed, and pins what a person depends on:
@@ -33,9 +34,10 @@ APP_JS = Path(__file__).resolve().parents[1] / "frontend" / "console" / "app.js"
 
 # The parts of app.js the harness runs, as (start, end) markers; everything else is a stub below.
 BLOCKS = [
+    ("const chats = new Map();", "function toast("),
     ("// What the sidebar says about a chat whose prompt is waiting", "// ---- chat rendering"),
     ("function renderChat()", "function refreshDownloads()"),
-    ("function finishAssistantStream()", "function clearRunOwner()"),
+    ("function finishAssistantStream(c)", "function appendArtifacts("),
     ("const STREAM_TYPES", "// ---- actions"),
     ("const DEFAULT_PLACEHOLDER", "// A step arrives as"),
     ("function planEditorHtml(", "function showPlanPanel("),
@@ -57,17 +59,15 @@ const el = (id) => els[id] || (els[id] = { id, innerHTML: "", textContent: "", p
 const drawn = (kind) => () => {
   log.push("draw:" + kind);
   sandbox.state.planCardEl = { kind, isConnected: true, querySelector: () => null, remove() { this.isConnected = false; } };
-  sandbox.state.planPending = true;
 };
 const sandbox = {
+  // The per-chat module turns the plan / dialog fields of `state` into the chat on screen's.
   state: {
     sessions: [{ id: "A", title: "Owner chat ", messages: [{ role: "user", content: "q" }] },
                { id: "B", title: "Other chat", messages: [] }],
-    activeId: "A", runSessionId: "A", connectionId: "conn", run: null, running: false,
-    planPending: false, planPrompt: null, planCardEl: null, planStatusEl: null, planAgenda: [],
-    planDoc: null, planProblems: [], planRevisedSteps: [], planDraftYaml: "", planDraftBase: "", planEditorOpen: false,
+    activeId: "A", connectionId: "conn", planCardEl: null, planStatusEl: null,
   },
-  PLANDRAFT_KEY: "draft",
+  PLANDRAFT_KEY: "draft", RUNOWNER_KEY: "owners", STREAMS_KEY: "streams", LASTRUN_KEY: "lastrun",
   localStorage: { getItem: (k) => (store.has(k) ? store.get(k) : null), setItem: (k, v) => store.set(k, String(v)),
                   removeItem: (k) => store.delete(k) },
   $: el, escapeHtml: __ESCAPE__, planIcon: () => "", absTime: () => "", relTime: () => "1m ago",
@@ -76,12 +76,12 @@ const sandbox = {
   refreshDownloads() {}, syncPresetUI() {}, repaintWorking() {},
   mountStream: () => log.push("mount"),
   messageEl: (m) => ({ m }),
-  ownerVisible: () => !!(sandbox.state.run && sandbox.state.runSessionId === sandbox.state.activeId),
+  ownerVisible: () => { const c = sandbox.activeChat(); return !!(c && c.run); },
   activeSession: () => sandbox.state.sessions.find((s) => s.id === sandbox.state.activeId) || null,
   showPlanPanel: drawn("plan"), showClarify: drawn("clarify"), showDecision: drawn("decision"),
-  setRunning: (r) => { sandbox.state.running = r; },
-  startAssistantStream: () => { sandbox.state.run = { text: "", thinking: "", feed: [] }; },
-  alreadyHaveRun: () => false, clearRunOwner() {},
+  setChatRunning: (c, r) => { c.running = r; },
+  startAssistantStream: (c) => { c.run = { text: "", thinking: "", feed: [] }; },
+  alreadyHaveRun: () => false, appendArtifacts() {},
   renderContextMeter: (m) => log.push("meter:" + m.used),
   pushToSession: (sid) => log.push("saved:" + sid),
   fetch: async () => ({ ok: true, json: async () => ({}) }), isUnreachable: () => false,
@@ -89,8 +89,11 @@ const sandbox = {
 };
 const api = vm.runInNewContext(src + `
 ;({ handleWsMessage, renderChat, renderSessionList, planEditorHtml, notePlanDraft, notePlanEditorOpen,
-    submitPlan, submitDecision })`, sandbox);
+    submitPlan, submitDecision, chatOf, chats })`, sandbox);
 const S = sandbox.state;
+// This window launched chat A's run, so A's run events are this window's to handle.
+const A = () => api.chatOf("A");
+A().owned = true;
 const YAML = "plan: 1\nsteps:\n  - id: s1\n    title: QC\n  - id: s2\n    title: Clustering\n    settings:\n      resolution: 1.2\n";
 const EDIT = YAML.replace("resolution: 1.2", "resolution: 0.8");
 const plan = (extra) => ({ type: "plan_prompt", conversation_id: "A", run_id: "r1",
@@ -98,9 +101,8 @@ const plan = (extra) => ({ type: "plan_prompt", conversation_id: "A", run_id: "r
   revised: [], problems: [], ...extra });
 const draws = () => log.filter((x) => x.startsWith("draw:"));
 const sidebar = () => { api.renderSessionList(); return els.sessionList.innerHTML; };
-// A page reload: the page's memory is gone, the browser's storage is not.
-const reload = () => Object.assign(S, { planPrompt: null, planPending: false, planCardEl: null, planDoc: null,
-  planProblems: [], planDraftYaml: "", planDraftBase: "", planEditorOpen: false, run: null });
+// A page reload: the page's memory is gone, the browser's storage is not (A's run owner included).
+const reload = () => { api.chats.clear(); S.planCardEl = null; A().owned = true; };
 const out = {};
 (async () => {
 __SCENARIO__
@@ -140,7 +142,7 @@ def test_switching_away_and_back_draws_the_waiting_card_again():
   api.handleWsMessage(plan());
   const card = S.planCardEl;
   S.activeId = "B"; log.length = 0; api.renderChat();
-  out.away = { draws: draws(), cardEl: S.planCardEl, pending: S.planPending, composer: log.includes("composer") };
+  out.away = { draws: draws(), cardEl: S.planCardEl, pending: A().planPending, composer: log.includes("composer") };
   S.activeId = "A"; log.length = 0; api.renderChat();
   out.back = { log: log.slice(), fresh: S.planCardEl !== card && S.planCardEl.isConnected };
 """)
@@ -156,7 +158,7 @@ def test_a_prompt_that_arrives_while_another_chat_is_shown_waits_for_its_own_cha
   S.activeId = "B";
   api.handleWsMessage({ type: "chat_start", conversation_id: "A", run_id: "r1" });
   api.handleWsMessage({ type: "decision_prompt", conversation_id: "A", run_id: "r1", goal: "Batch correction?", options: ["Harmony"] });
-  out.elsewhere = { draws: draws(), sid: S.planPrompt.sid, toast: log.find((x) => x.startsWith("toast:")) || "", sidebar: sidebar() };
+  out.elsewhere = { draws: draws(), sid: A().plan.sid, toast: log.find((x) => x.startsWith("toast:")) || "", sidebar: sidebar() };
   S.activeId = "A"; api.renderChat();
   out.inOwner = draws();
 """)
@@ -168,10 +170,11 @@ def test_a_prompt_that_arrives_while_another_chat_is_shown_waits_for_its_own_cha
 
 
 def test_an_untagged_prompt_belongs_to_the_chat_that_launched_the_run():
+    """An older gateway sends no conversation id: the prompt goes to the chat this window launched."""
     out = _run("""
   S.activeId = "B";
   api.handleWsMessage({ type: "plan_clarify", questions: [{ question: "Which tissue?", options: ["retina"] }] });
-  out.sid = S.planPrompt.sid; out.draws = draws();
+  out.sid = A().plan.sid; out.draws = draws();
 """)
     assert out == {"sid": "A", "draws": []}
 
@@ -252,8 +255,10 @@ def test_the_draft_survives_a_reload_for_the_same_run_and_plan_only():
   reload(); api.handleWsMessage({ ...replay, run_id: "r2" });
   out.otherRun = api.planEditorHtml(S.planDoc);
 """)
-    assert out["stored"] == {"sid": "A", "run": "r1", "base": out["stored"]["base"], "text": out["stored"]["text"], "open": True}
-    assert "resolution: 0.8" in out["stored"]["text"] and "resolution: 1.2" in out["stored"]["base"]
+    stored = out["stored"]["A"]                       # one entry per chat: several may wait at once
+    assert list(out["stored"]) == ["A"]
+    assert stored == {"run": "r1", "base": stored["base"], "text": stored["text"], "open": True}
+    assert "resolution: 0.8" in stored["text"] and "resolution: 1.2" in stored["base"]
     assert out["sameRun"]["open"] is True and "resolution: 0.8" in out["sameRun"]["html"]
     assert out["otherRun"].startswith('<div class="plan-yaml hidden">') and "resolution: 1.2" in out["otherRun"]
 
@@ -313,3 +318,22 @@ def test_the_context_meter_of_a_turn_is_never_shown_in_another_chat():
   out.own = log.filter((x) => x.startsWith("meter:"));
 """)
     assert out["elsewhere"] == [] and out["own"] == ["meter:51234"]
+
+
+def test_two_chats_each_keep_their_own_waiting_prompt():
+    """Several chats run at once, so several may be waiting: each keeps its own card and label."""
+    out = _run("""
+  api.chatOf("B").owned = true;
+  api.handleWsMessage(plan());
+  api.handleWsMessage({ type: "plan_clarify", conversation_id: "B", run_id: "r2", questions: [{ question: "Which tissue?", options: ["retina"] }] });
+  out.held = { A: A().plan.kind, B: api.chatOf("B").plan.kind };
+  out.sidebar = sidebar();
+  api.submitPlan("approve");                     // answers A's plan only
+  out.after = { A: A().plan, B: api.chatOf("B").plan && api.chatOf("B").plan.kind };
+  log.length = 0; S.activeId = "B"; api.renderChat();
+  out.inB = draws();
+""")
+    assert out["held"] == {"A": "plan", "B": "clarify"}
+    assert ">Plan to review</span>" in out["sidebar"] and ">Question for you</span>" in out["sidebar"]
+    assert out["after"] == {"A": None, "B": "clarify"}
+    assert out["inB"] == ["draw:clarify"]

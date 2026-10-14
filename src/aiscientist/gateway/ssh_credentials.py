@@ -55,10 +55,38 @@ def _key_file(owner: str, row: dict) -> Path:
     return Path(row.get("key_path") or canonical)
 
 
-def _owner_dir(owner: str) -> Path:
-    d = _root() / _safe_owner(owner)
+def _private_dir(d: Path) -> Path:
+    """Create ``d`` and keep it 0700 — see ``llm_credentials._private_dir``: a folder made with
+    the default mode took the state dir's default ACL, readable by group and other."""
     d.mkdir(parents=True, exist_ok=True)
+    try:
+        if stat.S_IMODE(d.stat().st_mode) != 0o700:
+            d.chmod(0o700)
+    except OSError:
+        pass
     return d
+
+
+def _owner_dir(owner: str) -> Path:
+    _private_dir(_root())
+    return _private_dir(_root() / _safe_owner(owner))
+
+
+def _write_private(path: Path, data: bytes) -> None:
+    """Write ``data`` to ``path`` atomically, created 0600 before a byte goes in. A private key
+    written with the default mode and chmod-ed afterwards was readable by more than its owner in
+    between."""
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, stat.S_IRUSR | stat.S_IWUSR)
+    try:
+        with os.fdopen(fd, "wb") as fh:
+            fh.write(data)
+            fh.flush()
+            os.fsync(fh.fileno())
+    except BaseException:
+        tmp.unlink(missing_ok=True)
+        raise
+    os.replace(tmp, path)
 
 
 def _index_path(owner: str) -> Path:
@@ -76,7 +104,7 @@ def _load_index(owner: str) -> list[dict]:
 
 
 def _save_index(owner: str, rows: list[dict]) -> None:
-    _index_path(owner).write_text(json.dumps(rows, indent=2), encoding="utf-8")
+    _write_private(_index_path(owner), json.dumps(rows, indent=2).encode("utf-8"))
 
 
 def _public(row: dict) -> dict:
@@ -139,11 +167,7 @@ def create_and_deploy(owner: str, executor, *, host: str, hpc_user: str,
 
     cred_id = uuid4().hex[:12]
     key_path = _owner_dir(owner) / f"{cred_id}.key"
-    key_path.write_bytes(priv)
-    try:
-        key_path.chmod(stat.S_IRUSR | stat.S_IWUSR)   # 0600
-    except OSError:
-        pass
+    _write_private(key_path, priv)                      # 0600 from the first byte
 
     row = {
         "id": cred_id, "host": host, "hpc_user": hpc_user, "key_path": str(key_path),
