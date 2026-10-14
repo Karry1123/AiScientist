@@ -3721,6 +3721,7 @@ async function finishStaging(d, id, name, size, signal) {
 async function finishFolderStaging(folder, d, id, signal) {
   const onAbort = () => { postJson("/api/upload/staging/cancel", { folder }).catch(() => {}); wakeStagingWaiters(); };
   if (signal) signal.addEventListener("abort", onAbort, { once: true });
+  let first = true;
   try {
     for (;;) {
       if (signal && signal.aborted) throw new DOMException("cancelled", "AbortError");
@@ -3730,8 +3731,10 @@ async function finishFolderStaging(folder, d, id, signal) {
       const r = await fetch(`/api/upload/staging?connection_id=${encodeURIComponent(state.connectionId)}&folder=${encodeURIComponent(folder)}`).catch(() => null);
       const f = r && r.ok ? ((await r.json().catch(() => ({}))).folder || {}) : null;
       if (f) {
-        if (f.recorded) return { ...d, status: "registered", name: folder, path: f.remote_root || d.path, size: f.size, count: f.count };
+        if (f.recorded) return { ...d, status: "registered", name: folder, path: f.remote_root || d.path, size: f.size, count: f.count, kept: f.kept_count || 0 };
         if (f.pending === 0 && f.failed > 0) throw new Error(`${f.failed} of ${f.count} files did not reach HPC3`);
+        // what is on HPC3 before this page first looks (copied meanwhile, or there from an earlier upload) is not speed
+        if (first) { uploadPaces.delete(id); first = false; }
         upsertUpload({ id, status: "staging", filesDone: f.done || 0, filesTotal: f.count || 0, sent: f.sent || 0, size: f.size || 0 });
         setUploadProgress(`Copying ${folder}/ to HPC3 — ${f.done || 0}/${f.count || "?"} files${uploadPaceTextFor(id)}`);
       }
@@ -3970,9 +3973,16 @@ async function followFolder(id, folder, d, ctrl, attach, onRecorded) {
   if (card.folderKey) { try { localStorage.removeItem(card.folderKey); localStorage.removeItem(`${card.folderKey}:completed`); } catch { /* private mode */ } }
   if (attach) addDataset({ name: `${d.name}/`, path: d.path, kind: "folder" });
   if (onRecorded) onRecorded();
-  toast(`Uploaded folder ${d.name}/ (${d.count} files, ${fmtUploadSize(d.size)})`);
+  toast(folderDoneText(d));
   loadDatasets();
   setTimeout(() => removeUpload(id), 4000);
+}
+// `kept` files of the folder were already uploaded when this upload started (see uploadFolder).
+function folderDoneText(d) {
+  const all = `${d.count} files, ${fmtUploadSize(d.size)}`;
+  if (d.already || (d.kept && d.kept >= d.count)) return `${d.name}/ was already uploaded (${all}): nothing was sent again`;
+  if (d.kept) return `Added ${d.count - d.kept} files to ${d.name}/: now ${all}`;
+  return `Uploaded folder ${d.name}/ (${all})`;
 }
 // Upload a WHOLE folder (webkitdirectory) — every file keeps its nested relative path, so
 // a multi-level folder round-trips intact. Registered as ONE dataset entry; all uploads
@@ -4007,21 +4017,34 @@ async function uploadFolder(fileList) {
   setUploadProgress(`Preparing ${folder0}/…`);
   let folder = folder0, failedRel = "";
   try {
-    // Reserve a NON-colliding top-level folder name first, so a second upload of the same
-    // folder lands in "name_2/" instead of merging into / overwriting the first.
-    let savedFolder = "";
+    // Ask the server which folder this goes to. It is told what the folder holds, so it recognises
+    // one that is already uploaded, in part or whole (an upload that stopped, in this browser or
+    // another, or the same folder chosen again): the answer is then that folder, and `have` lists
+    // the files, by position, that are there and are not sent again. A different folder of the
+    // same name lands in "name_2/" instead of merging into / overwriting the first.
+    let savedFolder = "", kept = 0;
     try { savedFolder = localStorage.getItem(folderKey) || ""; } catch { /* private mode */ }
     if (!savedFolder) {
       doneBits.fill(0);
-      const rr = await postJson("/api/upload/reserve-folder", { name: folder0 });
+      const rr = await postJson("/api/upload/reserve-folder", { name: folder0,
+        files: files.map((f) => [(f.webkitRelativePath || `${folder0}/${f.name}`).split("/").slice(1).join("/"), f.size]) });
       const rd = await rr.json().catch(() => ({}));
       if (!rr.ok || !rd.folder) throw new Error(rd.error || "folder reservation failed");
       folder = rd.folder;
-      try { localStorage.setItem(folderKey, folder); } catch { /* upload still works this session */ }
+      for (const i of rd.have || []) {
+        if (Number.isInteger(i) && i >= 0 && i < files.length && !isDone(i)) { doneBits[i >> 3] |= 1 << (i & 7); kept++; }
+      }
+      try {
+        localStorage.setItem(folderKey, folder);
+        if (kept) localStorage.setItem(bitsKey, btoa(String.fromCharCode(...doneBits)));
+      } catch { /* upload still works this session */ }
+      // (all of them there: the closing message says so, see folderDoneText)
+      if (kept && kept < files.length) toast(`${folder}/ is already uploaded in part: ${kept} of ${files.length} files are there, sending the other ${files.length - kept}`);
     } else folder = savedFolder;
     let done = 0, doneBytes = 0, nextFile = 0, stopped = false, firstError = null, storageWarned = false, painted = 0;
     let retryingFiles = 0;
     files.forEach((f, i) => { if (isDone(i)) { done++; doneBytes += f.size; } });
+    uploadPaces.delete(id);             // files that are already there are not speed: measure from here
     const inFlight = new Map();         // file index -> bytes of it sent so far
     const controllers = new Set();
     ctrl.signal.addEventListener("abort", () => { stopped = true; for (const c of controllers) c.abort(); }, { once: true });
@@ -4086,11 +4109,11 @@ async function uploadFolder(fileList) {
       upsertUpload({ id, filesDone: 0, sent: 0 });                  // now counting copies to HPC3, from none
       await followFolder(id, folder, d, ctrl, true, forget);
     }
-    else {                                                           // no copy to HPC3 in this session
+    else {                                                           // recorded already: nothing left to copy to HPC3
       upsertUpload({ id, status: "done", sent: total, filesDone: files.length });
       addDataset({ name: `${d.name}/`, path: d.path, kind: "folder" });
       forget();
-      toast(`Uploaded folder ${d.name}/ (${d.count} files, ${fmtUploadSize(d.size)})`);
+      toast(folderDoneText({ ...d, kept: d.kept || kept }));
       loadDatasets();
       setTimeout(() => removeUpload(id), 4000);
     }

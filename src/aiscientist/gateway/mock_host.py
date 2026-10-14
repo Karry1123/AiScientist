@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import os
 import re
+import shlex
 
 from dataclasses import dataclass, field
 
@@ -106,6 +107,17 @@ class MockExecutor:
         # --- dynamic serve-port file (gpu.read_serve_port) ----------------
         if cmd.startswith("cat ") and "vllm.port" in cmd:
             return ok(str(st.serve_port)) if st.gpu_job_id else ok("")
+
+        # --- uploads: what put_file "wrote" is what is there ----------------
+        # (the gateway's check for a taken upload name, and its listing of an upload folder)
+        if cmd.startswith("test -e ") and cmd.endswith("&& echo taken"):
+            path = shlex.split(cmd)[2]
+            there = any(r == path or r.startswith(path + "/") for r in st.remote_sizes)
+            return ok("taken\n" if there else "")
+        if cmd.startswith("find ") and "-printf '%s\\t%P\\n'" in cmd:
+            root = shlex.split(cmd)[1].rstrip("/") + "/"
+            return ok("".join(f"{size}\t{r[len(root):]}\n" for r, size in sorted(st.remote_sizes.items())
+                              if r.startswith(root)))
 
         # --- basic shell (after tools, so heredoc bodies don't misfire) ---
         if cmd in ("hostname", "uname -n"):

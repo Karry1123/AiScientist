@@ -102,3 +102,28 @@ def test_the_copy_to_hpc3_is_measured_on_its_own(pace):
     assert pace["copy_text"] == " · 150.0 MB/s · 5 s left"
     assert pace["tracked_after_done"] is False
     assert pace["timers"] == 1                                 # one repaint timer, however many cards
+
+
+def test_the_closing_message_of_a_folder_says_what_was_sent():
+    """A folder chosen again is not sent again (RCHENLAB/AiScientist issue 1): the message that
+    closes its card says how much of it was added, or that nothing was."""
+    node = shutil.which("node")
+    if node is None:
+        pytest.skip("node is not installed")
+    source = APP_JS.read_text(encoding="utf-8")
+    size = next(line for line in source.splitlines() if line.startswith("const fmtUploadSize"))
+    start = source.index("function folderDoneText(d) {")
+    block = source[start:source.index("\n}\n", start) + 3]
+    cases = [{"name": "run1", "count": 41, "size": 16.17e9},
+             {"name": "run1", "count": 41, "size": 16.17e9, "kept": 6},
+             {"name": "run1", "count": 41, "size": 16.17e9, "kept": 41},
+             {"name": "run1", "count": 41, "size": 16.17e9, "already": True}]
+    script = f"{size}\n{block}\nconsole.log(JSON.stringify({json.dumps(cases)}.map(folderDoneText)))"
+    done = subprocess.run([node, "-e", script], capture_output=True, text=True, timeout=30)
+    assert done.returncode == 0, done.stderr
+    assert json.loads(done.stdout) == [
+        "Uploaded folder run1/ (41 files, 16.17 GB)",
+        "Added 35 files to run1/: now 41 files, 16.17 GB",
+        "run1/ was already uploaded (41 files, 16.17 GB): nothing was sent again",
+        "run1/ was already uploaded (41 files, 16.17 GB): nothing was sent again",
+    ]

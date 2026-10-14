@@ -29,9 +29,8 @@ def env(tmp_path, monkeypatch):
     conn.executor = MockExecutor(username="tester")
     gw.CONNECTIONS[conn.id] = conn
     gw._STAGING.pop(conn.owner, None)
-    # names on "HPC3" = what the mock was handed, so name collisions are checkable offline
-    monkeypatch.setattr(gw, "_remote_name_taken", lambda c, rel: any(
-        r.endswith("/" + rel) for _l, r in c.executor.state.staged_files))
+    # names on "HPC3" = what the mock was handed (MockExecutor answers the gateway's `test -e` and
+    # its folder listing from that), so name collisions are checkable offline
     gate = threading.Event()
     gate.set()
     real_put = conn.executor.put_file
@@ -432,3 +431,189 @@ def test_handing_the_same_upload_over_twice_gives_one_copy(env):
     local.write_bytes(b"abcd")
     later = gw._submit_staging(conn, local, "twice.bin", name="twice.bin", upload_id="same")
     assert later.id != first.id and _wait_job(client, conn, later.id)["state"] == "done"
+
+
+# --- the same folder chosen again (RCHENLAB/AiScientist issue 1: "uploads are not incremental") ----
+
+def _reserve(client, conn, name, files=None):
+    body = {"connection_id": conn.id, "name": name}
+    if files is not None:
+        body["files"] = [[rel, len(data)] for rel, data in files]
+    return client.post("/api/upload/reserve-folder", json=body)
+
+
+def _send(client, conn, folder, rel, data):
+    r = client.post("/api/upload", data={"connection_id": conn.id, "rel_path": f"{folder}/{rel}"},
+                    files={"file": ("f", data, "application/octet-stream")})
+    assert r.status_code == 200, r.text
+    return r.json()
+
+
+def _settle(client, conn, gw, folder):
+    for job in gw._staging_queue(conn).jobs(folder):
+        _wait_job(client, conn, job.id)
+
+
+def _copies(conn, suffix):
+    return [r for _l, r in conn.executor.state.staged_files if r.endswith(suffix)]
+
+
+RUN = [("web_summary.html", b"w" * 7), ("outs/matrix.h5", b"m" * 40), ("outs/sorted.bam", b"b" * 900)]
+
+
+def test_a_folder_that_stopped_half_way_is_continued_not_started_again(env):
+    """The first upload sent 2 of 3 files and stopped (the browser never registered the folder).
+    Choosing the folder again goes to the same folder and is told which files are there."""
+    client, conn, gw, _gate = env
+    first = _reserve(client, conn, "run1", RUN).json()
+    assert first == {"status": "reserved", "folder": "run1", "merged": False, "have": []}
+    for rel, data in RUN[:2]:
+        _send(client, conn, "run1", rel, data)
+    _settle(client, conn, gw, "run1")
+
+    again = _reserve(client, conn, "run1", RUN).json()
+    assert again == {"status": "reserved", "folder": "run1", "merged": True, "have": [0, 1]}
+    assert not (conn.workspace / "uploads" / "run1_2").exists()
+
+    _send(client, conn, "run1", *RUN[2])
+    reg = client.post("/api/upload/register-folder",
+                      json={"connection_id": conn.id, "folder": "run1", "count": 3}).json()
+    _settle(client, conn, gw, "run1")
+    state = client.get("/api/upload/staging", params={"connection_id": conn.id, "folder": "run1"}).json()["folder"]
+    assert reg["status"] in ("registered", "staging")
+    assert state["recorded"] is True and state["count"] == 3 and state["size"] == 947 and state["done"] == 3
+    for rel, _data in RUN:                                # every file was copied to HPC3 exactly once
+        assert len(_copies(conn, f"/run1/{rel}")) == 1
+    events = [e for e in gw.upload_log.tail(conn.workspace) if e["event"] in ("folder_reserved", "folder_recorded")]
+    assert events[-2]["merged"] is True and events[-2]["already_there"] == 2 and events[-2]["to_send"] == 1
+    assert events[-1]["count"] == 3 and events[-1]["added"] == 1
+
+
+def test_a_folder_that_is_all_there_is_recognised_and_nothing_is_sent(env):
+    client, conn, gw, _gate = env
+    _reserve(client, conn, "run1", RUN)
+    for rel, data in RUN:
+        _send(client, conn, "run1", rel, data)
+    assert client.post("/api/upload/register-folder",
+                       json={"connection_id": conn.id, "folder": "run1", "count": 3}).json()["status"] == "registered"
+    _settle(client, conn, gw, "run1")
+    sent_before = len(conn.executor.state.staged_files)
+
+    again = _reserve(client, conn, "run1", RUN).json()
+    assert again["folder"] == "run1" and again["merged"] is True and again["have"] == [0, 1, 2]
+    reg = client.post("/api/upload/register-folder",
+                      json={"connection_id": conn.id, "folder": "run1", "count": 3}).json()
+    assert reg["status"] == "registered" and reg["already"] is True
+    assert reg["count"] == 3 and reg["size"] == 947
+    assert len(conn.executor.state.staged_files) == sent_before
+    assert not (conn.workspace / "uploads" / "run1").exists()        # the placeholder is gone again
+
+
+@pytest.mark.parametrize("other, why", [
+    ([("web_summary.html", b"w" * 8), ("outs/matrix.h5", b"m" * 40)], "a file of another size"),
+    ([("web_summary.html", b"w" * 7)], "it lacks a file that is there"),
+    ([("notes.txt", b"n")], "nothing in common"),
+])
+def test_another_folder_of_the_same_name_still_gets_its_own(env, other, why):
+    client, conn, gw, _gate = env
+    _reserve(client, conn, "run1", RUN[:2])
+    for rel, data in RUN[:2]:
+        _send(client, conn, "run1", rel, data)
+    client.post("/api/upload/register-folder", json={"connection_id": conn.id, "folder": "run1", "count": 2})
+    _settle(client, conn, gw, "run1")
+    got = _reserve(client, conn, "run1", other).json()
+    assert got == {"status": "reserved", "folder": "run1_2", "merged": False, "have": []}, why
+
+
+def test_the_copy_of_the_same_folder_is_found_under_its_second_name(env):
+    """``run1`` is someone else's data; the folder chosen now was uploaded before as ``run1_2``."""
+    client, conn, gw, _gate = env
+    _reserve(client, conn, "run1", [("other.txt", b"x")])
+    _send(client, conn, "run1", "other.txt", b"x")
+    assert _reserve(client, conn, "run1", RUN).json()["folder"] == "run1_2"
+    _send(client, conn, "run1_2", *RUN[0])
+    _settle(client, conn, gw, "run1")
+    _settle(client, conn, gw, "run1_2")
+    got = _reserve(client, conn, "run1", RUN).json()
+    assert got["folder"] == "run1_2" and got["merged"] is True and got["have"] == [0]
+
+
+def test_a_folder_whose_copies_are_still_running_is_not_added_to(env, monkeypatch):
+    client, conn, gw, gate = env
+    monkeypatch.setattr(gw, "_STAGE_WAIT_S", 0.05)
+    _reserve(client, conn, "run1", RUN)
+    _send(client, conn, "run1", *RUN[0])
+    _settle(client, conn, gw, "run1")
+    gate.clear()
+    assert _send(client, conn, "run1", *RUN[1])["status"] == "staging"
+    refused = _reserve(client, conn, "run1", RUN)
+    assert refused.status_code == 409 and "still being copied" in refused.json()["error"]
+    assert not (conn.workspace / "uploads" / "run1_2").exists()       # and no second copy is started
+    gate.set()
+    _settle(client, conn, gw, "run1")
+    assert _reserve(client, conn, "run1", RUN).json()["have"] == [0, 1]
+
+
+def test_a_file_whose_copy_failed_is_sent_again_with_the_missing_ones(env, monkeypatch):
+    client, conn, gw, _gate = env
+    from aiscientist.gateway import staging
+    monkeypatch.setattr(staging, "RETRY_DELAYS", (0.01, 0.01))
+    monkeypatch.setattr(gw, "_STAGE_WAIT_S", 0.05)
+    _reserve(client, conn, "run1", RUN)
+    _send(client, conn, "run1", *RUN[0])
+    _settle(client, conn, gw, "run1")
+    real_put = conn.executor.put_file
+    conn.executor.put_file = lambda local, remote: (_ for _ in ()).throw(OSError("connection reset"))
+    _send(client, conn, "run1", *RUN[1])
+    _settle(client, conn, gw, "run1")
+    conn.executor.put_file = real_put
+    kept = conn.workspace / "uploads" / "run1" / "outs" / "matrix.h5"
+    assert kept.exists() and [j.state for j in gw._staging_queue(conn).jobs("run1")] == ["done", "failed"]
+
+    got = _reserve(client, conn, "run1", RUN).json()
+    assert got["merged"] is True and got["have"] == [0]
+    assert not kept.exists() and gw._staging_queue(conn).jobs("run1") == []   # the page sends it afresh
+    for rel, data in RUN[1:]:
+        _send(client, conn, "run1", rel, data)
+    client.post("/api/upload/register-folder", json={"connection_id": conn.id, "folder": "run1", "count": 3})
+    _settle(client, conn, gw, "run1")
+    state = client.get("/api/upload/staging", params={"connection_id": conn.id, "folder": "run1"}).json()["folder"]
+    assert state["recorded"] is True and state["count"] == 3 and state["size"] == 947
+
+
+def test_a_folder_name_that_was_recorded_once_is_recorded_again(env):
+    """The first ``run1`` was recorded, then deleted from Storage. A new ``run1`` used to be counted
+    together with the old one's copies under a record that already said "recorded": the page showed
+    it as uploaded and no dataset was ever recorded."""
+    client, conn, gw, _gate = env
+    for _ in range(2):
+        assert _reserve(client, conn, "run1").json()["folder"] == "run1"
+        _send(client, conn, "run1", "a.txt", b"abc")
+        reg = client.post("/api/upload/register-folder",
+                          json={"connection_id": conn.id, "folder": "run1", "count": 1}).json()
+        assert reg["status"] == "registered" and reg["count"] == 1 and reg["size"] == 3
+        _settle(client, conn, gw, "run1")
+        conn.executor.state.staged_files.clear()          # deleted on HPC3: the name is free again
+        conn.executor.state.remote_sizes.clear()
+
+
+def test_which_folder_counts_as_the_same_folder():
+    from aiscientist.gateway import app as gw
+    chosen = [("a.txt", 1), ("sub/b.bin", 20), ("c.txt", 3)]
+    assert gw._same_folder({"a.txt": 1, "sub/b.bin": 20}, chosen) == [0, 1]
+    assert gw._same_folder({"sub/b.bin": 20, "sub/b.bin.part": 7}, chosen) == [1]   # a copy that never finished
+    assert gw._same_folder({"a.txt": 1, "extra.txt": 5}, chosen) is None            # a file the chosen one lacks
+    assert gw._same_folder({"a.txt": 2}, chosen) is None                            # another size
+    assert gw._same_folder({}, chosen) is None                                      # nothing there: nothing shared
+    assert gw._same_folder({"c.txt.part": 1}, chosen) is None                       # only a leftover: not evidence
+    # a real file that happens to end in .part is a file like any other
+    assert gw._same_folder({"x.part": 4}, [("x.part", 4), ("x", 9)]) == [0]
+
+
+def test_the_chosen_files_are_cleaned_the_way_the_upload_cleans_them():
+    from aiscientist.gateway import app as gw
+    assert gw._chosen_files([["my data/a b.txt", 3], [".hidden", 0]]) == [("mydata/ab.txt", 3), ("hidden", 0)]
+    assert gw._chosen_files([["a b.txt", 1], ["ab.txt", 1]]) is None      # two files, one cleaned path
+    assert gw._chosen_files([["a.txt", -1]]) is None
+    assert gw._chosen_files([["../..", 1]]) is None
+    assert gw._chosen_files("a.txt") is None and gw._chosen_files([]) is None and gw._chosen_files(None) is None

@@ -141,6 +141,13 @@ class StagingStore:
         safe = "".join(c if c.isalnum() or c in "-_." else "_" for c in folder)
         return self.root / f"folder-{safe}.json"
 
+    def start_folder(self, folder: str, **meta) -> dict:
+        """A fresh record for a folder whose upload starts now, in place of an earlier upload's.
+        That one says ``recorded``, and a folder that is recorded is never recorded again."""
+        data = {**meta, "folder": folder}
+        self._write(self._folder_path(folder), data)
+        return data
+
     def register_folder(self, folder: str, **meta) -> dict:
         data = {**self.folder(folder), **meta, "folder": folder, "registered": True}
         self._write(self._folder_path(folder), data)

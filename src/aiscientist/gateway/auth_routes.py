@@ -333,6 +333,21 @@ def record_dataset(user_id: int, name: str, path: str, size_bytes: int, kind: st
         return d.id
 
 
+def record_folder_dataset(user_id: int, name: str, path: str, size_bytes: int) -> int | None:
+    """One row per uploaded folder: files added to a folder that is already a dataset update its
+    row's size instead of listing the folder a second time."""
+    with session_scope() as s:
+        row = s.scalars(select(Dataset).where(Dataset.user_id == user_id, Dataset.path == path)
+                        .order_by(Dataset.id.desc()).limit(1)).first()
+        if row is None:
+            row = Dataset(user_id=user_id, name=name, path=path, size_bytes=size_bytes, kind="folder")
+            s.add(row)
+        else:
+            row.size_bytes = size_bytes
+        s.commit()
+        return row.id
+
+
 def dataset_path_recorded(user_id: int, path: str) -> bool:
     """True when this user already has a dataset row for ``path`` (binding a server folder twice
     must not list it twice)."""

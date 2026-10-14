@@ -2911,7 +2911,9 @@ def _finish_staged_folder(owner: str, folder: str) -> dict | None:
         jobs = q.jobs(folder)
         if not jobs or any(j.state in staging.ACTIVE for j in jobs):
             return None
-        if len(jobs) < int(meta.get("count") or 0):
+        # files that were already on HPC3 when this upload started (see _reserve_upload_folder)
+        kept_count, kept_size = int(meta.get("kept_count") or 0), int(meta.get("kept_size") or 0)
+        if len(jobs) + kept_count < int(meta.get("count") or 0):
             return None                  # registered early: some files have not been handed over yet
         conns = _owner_connections(owner)
         bad = [j for j in jobs if j.state != "done"]
@@ -2925,22 +2927,27 @@ def _finish_staged_folder(owner: str, folder: str) -> dict | None:
                     c.emit("error", "upload", f"{len(bad)} of {len(jobs)} files of {folder}/ did not reach "
                            "HPC3; retry them from the Uploads panel.")
             return None
-        size, count = sum(j.size for j in jobs), len(jobs)
+        sent = {j.remote_path: j.size for j in jobs}     # a file handed over twice is one file
+        size, count = kept_size + sum(sent.values()), kept_count + len(sent)
         q.store.update_folder(folder, recorded=True, size=size, count=count)
         upload_log.record(_upload_workspace(owner), "folder_recorded", folder=folder, count=count,
-                          size=size, remote_path=meta.get("remote_root"))
+                          size=size, added=len(sent) if kept_count else None,
+                          remote_path=meta.get("remote_root"))
+    said = (f"Added {len(sent)} file(s) to {folder}/, which already held {kept_count}: it is now "
+            f"{count} files, {size / 1e6:.1f} MB on your HPC3 storage." if kept_count else
+            f"Uploaded folder {folder}/ ({count} files, {size / 1e6:.1f} MB) to your HPC3 storage.")
     for c in conns:
-        c.emit("success", "upload", f"Uploaded folder {folder}/ ({count} files, {size / 1e6:.1f} MB) "
-               "to your HPC3 storage.")
+        c.emit("success", "upload", said)
     if conns:
         shutil.rmtree(conns[0].workspace / "uploads" / folder, ignore_errors=True)
     user_id = meta.get("user_id")
     if _AUTH_ENABLED and user_id:
         try:
-            auth_routes.record_dataset(user_id, folder, meta["remote_root"], size, "folder")
+            auth_routes.record_folder_dataset(user_id, folder, meta["remote_root"], size)
         except Exception as exc:  # noqa: BLE001 - history is best-effort
             print(f"[auth] record_dataset (folder) failed: {exc}")
-    return {"name": folder, "path": meta["remote_root"], "size": size, "count": count}
+    return {"name": folder, "path": meta["remote_root"], "size": size, "count": count,
+            **({"kept": kept_count} if kept_count else {})}
 
 
 def _submit_staging(conn: Connection, local: Path, rel: str, *, name: str, kind: str = "other",
@@ -3032,21 +3039,157 @@ def _unique_upload_name(conn: Connection, dest_dir: Path, name: str) -> str:
     return f"{stem} ({uuid4().hex[:6]}){suffix}"
 
 
-def _unique_folder_name(conn: Connection, uploads: Path, name: str) -> str:
-    """A top-level folder name that no upload of this user has yet: ``data``, ``data_2``, ``data_3``.
-    The suffix uses only characters :func:`safe_relpath` keeps, because the browser sends the name
-    back in every file's path and it is cleaned again there. ``data (1)`` came back as ``data1``, a
-    folder nobody had reserved, and every file of a second ``data`` folder was refused."""
-    def taken(n: str) -> bool:
-        return (uploads / n).exists() or (_uploads_on_hpc(conn) and _remote_name_taken(conn, n))
+# --- choosing a folder that is already uploaded ---------------------------------------------------
+# A folder is not sent twice. When the chosen folder's name is among the user's uploads and every
+# file already there is one of the chosen files, with the same size, it is the same folder: an
+# upload that stopped half-way, or the same folder chosen again. The browser is told which of its
+# files are there and sends only the others, into that folder, which stays one dataset. A folder
+# that holds anything else (a file the chosen folder lacks, or one of another size) is a different
+# folder of the same name and the upload gets a name of its own, as before. Nothing that is already
+# uploaded is ever written over.
 
-    if not taken(name):
-        return name
-    for k in range(2, 1000):
-        alt = f"{name}_{k}"
-        if not taken(alt):
-            return alt
-    return f"{name}_{uuid4().hex[:6]}"
+_FOLDER_COMPARE_MAX = 50_000        # files; a larger folder is not compared (it is sent whole)
+_FOLDER_COMPARE_NAMES = 5           # how many taken names (data, data_2, ...) are looked into
+
+
+class _FolderBusy(Exception):
+    """The same folder is being copied to HPC3 right now."""
+
+
+def _chosen_files(raw: Any) -> "list[tuple[str, int]] | None":
+    """The browser's list of the chosen folder's files, ``[[path below the folder, size], ...]``,
+    each path cleaned as the upload itself cleans it. None when there is no usable list: an older
+    page, too many files, or two files that clean to one path (that upload fails by itself)."""
+    if not isinstance(raw, list) or not raw or len(raw) > _FOLDER_COMPARE_MAX:
+        return None
+    out: list[tuple[str, int]] = []
+    seen: set[str] = set()
+    for item in raw:
+        try:
+            rel, size = safe_relpath(str(item[0])), int(item[1])
+        except (TypeError, ValueError, IndexError, KeyError):
+            return None
+        if not rel or rel in seen or size < 0:
+            return None
+        seen.add(rel)
+        out.append((rel, size))
+    return out
+
+
+def _folder_listing(conn: Connection, folder: str) -> "dict[str, int] | None":
+    """Path below the folder -> size, for every file in the user's upload folder ``folder``. None
+    when it cannot be read, is not a folder, or holds more files than are compared."""
+    if not _uploads_on_hpc(conn):
+        root = conn.workspace / "uploads" / folder
+        if not root.is_dir():
+            return None
+        found: dict[str, int] = {}
+        for p in root.rglob("*"):
+            if p.is_file():
+                found[p.relative_to(root).as_posix()] = p.stat().st_size
+                if len(found) > _FOLDER_COMPARE_MAX:
+                    return None
+        return found
+    root = f"{_hpc_uploads_dir(conn)}/{folder}"
+    try:
+        res = conn.executor.exec(f"find {shlex.quote(root)} -type f -printf '%s\\t%P\\n' 2>/dev/null "
+                                 f"| head -n {_FOLDER_COMPARE_MAX + 1}", timeout=120.0)
+    except Exception:  # noqa: BLE001 - when it cannot be compared, the folder is sent whole
+        return None
+    found = {}
+    for line in (res.stdout or "").splitlines():
+        size, tab, rel = line.partition("\t")
+        if not tab or not rel or not size.isdigit():
+            return None                  # a file of that name, or a path this cannot carry
+        found[rel] = int(size)
+    return None if len(found) > _FOLDER_COMPARE_MAX else found
+
+
+def _same_folder(there: "dict[str, int]", chosen: "list[tuple[str, int]]") -> "list[int] | None":
+    """Which of the chosen files (by position) are already there, when the folder that is there is
+    the chosen one: it holds at least one file, and each of its files is a chosen file of the same
+    size. None for any other folder. An ``x.part`` beside a chosen ``x`` is a copy that never
+    finished, not a file of the folder."""
+    sizes = dict(chosen)
+    have: set[str] = set()
+    for rel, size in there.items():
+        if sizes.get(rel) == size:
+            have.add(rel)
+        elif not (rel.endswith(".part") and rel not in sizes and rel[:-5] in sizes):
+            return None
+    if not have:
+        return None
+    return [i for i, (rel, _size) in enumerate(chosen) if rel in have]
+
+
+def _folder_busy(conn: Connection, folder: str) -> bool:
+    """A copy into this upload folder is still running."""
+    if not _uploads_on_hpc(conn):
+        return False
+    root = f"{_hpc_uploads_dir(conn)}/{folder}"
+    return any(n == root or n.startswith(root + "/") for n in _staging_queue(conn).active_names())
+
+
+def _reset_folder_record(conn: Connection, folder: str, **meta) -> None:
+    """Start the queue's account of an upload folder afresh. An earlier upload of the name leaves
+    its settled copies and a record that says ``recorded``; a new upload into the name was counted
+    together with them and never recorded. What a failed copy kept for a retry goes with it."""
+    if not _uploads_on_hpc(conn):
+        return
+    queue = _staging_queue(conn)
+    for job in queue.jobs(folder):
+        dropped = queue.forget(job.id)   # None for a copy that is still running: it stays
+        if dropped is not None and dropped.state == "failed":
+            _discard_leftovers(conn.owner, dropped)
+    if meta:
+        queue.store.start_folder(folder, **meta)
+    else:
+        queue.store.delete_folder(folder)
+
+
+def _reserve_upload_folder(conn: Connection, raw: str, files: Any) -> dict:
+    """The folder a folder upload named ``raw`` goes to: ``{"folder", "merged", "have", ...}``.
+
+    A name nobody has is taken as it is. A name that holds the chosen folder is used again
+    (``merged``), with ``have`` = the chosen files, by position, that are already there. Any other
+    taken name is passed over: ``data``, ``data_2``, ``data_3``. The suffix uses only characters
+    :func:`safe_relpath` keeps, because the browser sends the name back in every file's path and it
+    is cleaned again there: ``data (1)`` came back as ``data1``, a folder nobody had reserved, and
+    every file of a second ``data`` folder was refused. Looks at HPC3: call via a thread."""
+    uploads = conn.workspace / "uploads"
+    on_hpc = _uploads_on_hpc(conn)
+    chosen = _chosen_files(files)
+    looked = 0
+    for k in range(1, 1000):
+        name = raw if k == 1 else f"{raw}_{k}"
+        local = uploads / name
+        if not local.exists() and not (on_hpc and _remote_name_taken(conn, name)):
+            break
+        if chosen is None or looked >= _FOLDER_COMPARE_NAMES:
+            continue
+        looked += 1
+        there = _folder_listing(conn, name)
+        have = _same_folder(there, chosen) if there else None
+        if have is None:
+            continue
+        if on_hpc:
+            if _folder_busy(conn, name):
+                raise _FolderBusy(name)
+            # A file still waiting on the server that is neither on HPC3 nor a failed copy's would
+            # collide with the upload of that same file: leave such a folder alone.
+            failed = {j.local_path for j in _staging_queue(conn).jobs(name) if j.state == "failed"}
+            waiting = [p for p in local.rglob("*") if p.is_file()] if local.is_dir() else []
+            if any(str(p) not in failed and p.relative_to(local).as_posix() not in there for p in waiting):
+                continue
+        kept = sum(chosen[i][1] for i in have)
+        local.mkdir(parents=True, exist_ok=True)     # the placeholder every file's upload checks for
+        _reset_folder_record(conn, name, merged=True, kept_count=len(have), kept_size=kept)
+        return {"folder": name, "merged": True, "have": have, "kept_count": len(have), "kept_size": kept}
+    else:
+        name = f"{raw}_{uuid4().hex[:6]}"
+    (uploads / name).mkdir(parents=True, exist_ok=True)   # placeholder reserves the name
+    _reset_folder_record(conn, name)
+    return {"folder": name, "merged": False, "have": []}
 
 
 def _resume_staging(conn: Connection) -> None:
@@ -4435,21 +4578,38 @@ async def upload_dataset(
 
 @app.post("/api/upload/reserve-folder")
 async def reserve_folder(payload: dict, request: Request) -> JSONResponse:
-    """Reserve a NON-COLLIDING top-level folder name before a folder upload starts, and
-    create it as a placeholder. The browser then prefixes every file's relative path with
-    the returned name, so uploading a second folder of the same name lands in
-    ``data_2/`` instead of merging into / overwriting the first ``data/``."""
+    """Say which top-level folder a folder upload goes to, before it starts, and create it as a
+    placeholder. The browser prefixes every file's relative path with the returned name.
+
+    With ``files`` (the chosen folder's ``[[path below the folder, size], ...]``) a folder that is
+    already among the user's uploads is recognised: the answer is that folder, ``merged``, and
+    ``have`` lists the chosen files, by position, that are there and need not be sent. A different
+    folder of the same name, or a call without ``files``, gets a name of its own: ``data_2/``."""
     conn = _owned_conn(payload.get("connection_id"), request)
     raw = safe_relpath(payload.get("name", "")).split("/")[0]
     if not raw:
         return JSONResponse({"error": "bad folder name"}, status_code=400)
-    uploads = conn.workspace / "uploads"
-    uploads.mkdir(parents=True, exist_ok=True)
-    folder = await asyncio.to_thread(_unique_folder_name, conn, uploads, raw)
-    (uploads / folder).mkdir(parents=True, exist_ok=True)   # placeholder reserves the name
+    (conn.workspace / "uploads").mkdir(parents=True, exist_ok=True)
+    files = payload.get("files")
+    try:
+        got = await asyncio.to_thread(_reserve_upload_folder, conn, raw, files)
+    except _FolderBusy as busy:
+        upload_log.record(conn.workspace, "refused", folder=str(busy),
+                          error="the same folder is still being copied to HPC3")
+        return JSONResponse({"error": f"{busy}/ is still being copied to HPC3. Choose the folder again when "
+                                      "that has finished: only the files that are missing will be sent."},
+                            status_code=409)
+    folder = got["folder"]
+    if got["merged"]:
+        there, total = len(got["have"]), len(files)
+        where = "your HPC3 storage" if _uploads_on_hpc(conn) else "the server"
+        conn.emit("info", "upload", f"{folder}/ is already on {where} with {there} of these {total} files: "
+                  + (f"only the other {total - there} are uploaded." if total > there else "nothing is uploaded again."))
     upload_log.record(conn.workspace, "folder_reserved", folder=folder,
-                      asked=raw if raw != folder else "")
-    return JSONResponse({"status": "reserved", "folder": folder})
+                      asked=raw if raw != folder else "", merged=got["merged"],
+                      already_there=len(got["have"]) if got["merged"] else None,
+                      to_send=len(files) - len(got["have"]) if got["merged"] else None)
+    return JSONResponse({"status": "reserved", "folder": folder, "merged": got["merged"], "have": got["have"]})
 
 
 @app.post("/api/upload/register-folder")
@@ -4465,15 +4625,16 @@ async def register_folder(payload: dict, request: Request) -> JSONResponse:
     uploads_root = (conn.workspace / "uploads").resolve()
     if not str(root).startswith(str(uploads_root)) or not root.is_dir():
         return JSONResponse({"error": "folder not found"}, status_code=404)
+    try:
+        expected = max(0, int(payload.get("count") or 0))
+    except (TypeError, ValueError):
+        expected = 0
+    already = False
     if _uploads_on_hpc(conn) and _staging_queue(conn).jobs(folder):
         # Its files are being copied in the background: the folder becomes one dataset when the
         # last copy is verified, whether that is now or later (see _finish_staged_folder).
         q = _staging_queue(conn)
         remote_root = f"{_hpc_uploads_dir(conn)}/{folder}"
-        try:
-            expected = max(0, int(payload.get("count") or 0))
-        except (TypeError, ValueError):
-            expected = 0
         q.store.register_folder(folder, remote_root=remote_root, user_id=conn.app_user_id, count=expected)
         upload_log.record(conn.workspace, "folder_registered", folder=folder, count=expected,
                           handed_over=len(q.jobs(folder)))
@@ -4489,24 +4650,39 @@ async def register_folder(payload: dict, request: Request) -> JSONResponse:
         # Files were streamed to dfs3b (local copies removed); size/count come from the remote tree,
         # and the folder root recorded is the dfs3b path. Drop the now-empty local placeholder.
         remote_root = f"{_hpc_uploads_dir(conn)}/{folder}"
-        count = int((conn.executor.exec(f"find {shlex.quote(remote_root)} -type f | wc -l").out or "0").strip() or 0)
-        size = int((conn.executor.exec(f"du -sb {shlex.quote(remote_root)} 2>/dev/null | cut -f1").out or "0").strip() or 0)
+        store = _staging_queue(conn).store
+        meta = store.folder(folder)
+        if meta.get("merged") and expected and int(meta.get("kept_count") or 0) >= expected:
+            # Every chosen file was already there (see _reserve_upload_folder): nothing was sent,
+            # and the numbers are the ones that comparison found.
+            already = True
+            count, size = int(meta.get("kept_count") or 0), int(meta.get("kept_size") or 0)
+            store.update_folder(folder, registered=True, recorded=True, count=count, size=size,
+                                remote_root=remote_root)
+        else:
+            count = int((conn.executor.exec(f"find {shlex.quote(remote_root)} -type f | wc -l").out or "0").strip() or 0)
+            size = int((conn.executor.exec(f"du -sb {shlex.quote(remote_root)} 2>/dev/null | cut -f1").out or "0").strip() or 0)
         recorded_path, where = remote_root, "your HPC3 storage"
         shutil.rmtree(root, ignore_errors=True)
     else:
         files = [p for p in root.rglob("*") if p.is_file()]
         count, size, recorded_path, where = len(files), sum(p.stat().st_size for p in files), str(root), "the server"
-    conn.emit("success", "upload",
-              f"Uploaded folder {folder}/ ({count} files, {size / 1e6:.1f} MB) to {where}.")
+    if already:
+        conn.emit("info", "upload", f"{folder}/ is already on {where} ({count} files, {size / 1e6:.1f} MB): "
+                                    "nothing was uploaded again.")
+    else:
+        conn.emit("success", "upload",
+                  f"Uploaded folder {folder}/ ({count} files, {size / 1e6:.1f} MB) to {where}.")
     upload_log.record(conn.workspace, "folder_recorded", folder=folder, count=count, size=size,
-                      remote_path=recorded_path)
+                      added=0 if already else None, remote_path=recorded_path)
     if _AUTH_ENABLED and conn.app_user_id:
         try:
-            auth_routes.record_dataset(conn.app_user_id, folder, recorded_path, size, "folder")
+            auth_routes.record_folder_dataset(conn.app_user_id, folder, recorded_path, size)
         except Exception as exc:  # noqa: BLE001 - history is best-effort
             print(f"[auth] record_dataset (folder) failed: {exc}")
     return JSONResponse({"status": "registered", "name": folder, "path": recorded_path,
-                         "size": size, "count": count, "kind": "folder"})
+                         "size": size, "count": count, "kind": "folder",
+                         **({"already": True} if already else {})})
 
 
 # --- binding a dataset that is already on the server (see server_data.py) ------------------------
@@ -4778,9 +4954,12 @@ async def upload_staging(connection_id: str, request: Request, job_id: str = "",
 
 def _staged_folder_summary(q: "staging.StagingQueue", name: str, jobs: list) -> dict:
     meta = {k: v for k, v in q.store.folder(name).items() if k != "user_id"}
-    return {**meta, "name": name, "count": len(jobs), "size": sum(j.size for j in jobs),
-            "sent": sum(j.sent if j.state != "done" else j.size for j in jobs),
-            "done": sum(1 for j in jobs if j.state == "done"),
+    # files that were already on HPC3 when this upload started are part of the folder: counted as done
+    kept_count, kept_size = int(meta.get("kept_count") or 0), int(meta.get("kept_size") or 0)
+    return {**meta, "name": name, "count": kept_count + len(jobs),
+            "size": kept_size + sum(j.size for j in jobs),
+            "sent": kept_size + sum(j.sent if j.state != "done" else j.size for j in jobs),
+            "done": kept_count + sum(1 for j in jobs if j.state == "done"),
             "pending": sum(1 for j in jobs if j.state in staging.ACTIVE),
             "failed": sum(1 for j in jobs if j.state in ("failed", "cancelled"))}
 

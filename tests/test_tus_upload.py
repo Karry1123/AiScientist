@@ -246,3 +246,59 @@ def test_a_second_folder_of_the_same_name_gets_its_own_folder(env):
     assert _patch(client, made.headers["location"], 0, b"abc", hashlib.sha256(b"abc").digest()).status_code == 204
     assert (conn.workspace / "uploads" / second / "nested" / "a.csv").read_bytes() == b"abc"
     assert not any((conn.workspace / "uploads" / first).rglob("*.csv"))      # nothing merged into the first
+
+
+FOLDER = [("nested/a.csv", b"abc"), ("b.csv", b"defg")]
+
+
+def _reserve_files(client, conn, name, files):
+    return client.post("/api/upload/reserve-folder", json={
+        "connection_id": conn.id, "name": name, "files": [[rel, len(data)] for rel, data in files]}).json()
+
+
+def _send_folder_file(client, conn, folder, rel, data):
+    made = _create(client, conn, len(data), folder=folder, rel_path=f"{folder}/{rel}")
+    assert made.status_code == 201, made.text
+    done = _patch(client, made.headers["location"], 0, data, hashlib.sha256(data).digest(),
+                  final_sha=hashlib.sha256(data).hexdigest())
+    assert done.status_code == 204, done.text
+    return done
+
+
+def test_the_same_folder_chosen_again_gets_only_its_missing_files(env):
+    """Kept on the server (no copy to HPC3): the folder that is there is the one on its disk."""
+    client, conn, _gw = env
+    assert _reserve_files(client, conn, "study", FOLDER) == {
+        "status": "reserved", "folder": "study", "merged": False, "have": []}
+    _send_folder_file(client, conn, "study", *FOLDER[0])
+    again = _reserve_files(client, conn, "study", FOLDER)
+    assert again == {"status": "reserved", "folder": "study", "merged": True, "have": [0]}
+    _send_folder_file(client, conn, "study", *FOLDER[1])
+    reg = client.post("/api/upload/register-folder",
+                      json={"connection_id": conn.id, "folder": "study", "count": 2}).json()
+    assert reg["status"] == "registered" and reg["count"] == 2 and reg["size"] == 7
+    uploads = conn.workspace / "uploads"
+    assert (uploads / "study" / "nested" / "a.csv").read_bytes() == b"abc"
+    assert not (uploads / "study_2").exists()
+    # the whole folder again: all of it is there
+    assert _reserve_files(client, conn, "study", FOLDER)["have"] == [0, 1]
+    # a folder of that name with other content is not this folder
+    assert _reserve_files(client, conn, "study", [("nested/a.csv", b"abcd")])["folder"] == "study_2"
+
+
+def test_the_same_folder_chosen_again_with_copies_to_hpc3(env):
+    client, conn, gw = env
+    conn.settings.uploads_on_hpc = True
+    assert _reserve_files(client, conn, "study", FOLDER)["merged"] is False
+    first = _send_folder_file(client, conn, "study", *FOLDER[0])
+    assert gw._staging_queue(conn).wait(first.headers["upload-staging-job"], 5).state == "done"
+
+    again = _reserve_files(client, conn, "study", FOLDER)       # another browser: nothing remembered
+    assert again["folder"] == "study" and again["merged"] is True and again["have"] == [0]
+    second = _send_folder_file(client, conn, "study", *FOLDER[1])
+    assert gw._staging_queue(conn).wait(second.headers["upload-staging-job"], 5).state == "done"
+    client.post("/api/upload/register-folder", json={"connection_id": conn.id, "folder": "study", "count": 2})
+    state = client.get("/api/upload/staging", params={"connection_id": conn.id, "folder": "study"}).json()["folder"]
+    assert state["recorded"] is True and state["count"] == 2 and state["size"] == 7
+    remotes = [r for _l, r in conn.executor.state.staged_files]
+    assert sorted(r.rsplit("/study/", 1)[1] for r in remotes) == ["b.csv", "nested/a.csv"]   # each copied once
