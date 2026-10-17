@@ -3937,7 +3937,7 @@ function postJson(url, body) {
 }
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 // 20 GB reads badly as "21474.8 MB"
-const fmtUploadSize = (n) => ((n || 0) >= 1e9 ? `${((n || 0) / 1e9).toFixed(2)} GB` : `${((n || 0) / 1e6).toFixed(1)} MB`);
+const fmtUploadSize = (n) => ((n || 0) >= 1e9 ? `${(n / 1e9).toFixed(2)} GB` : (n || 0) >= 1e6 ? `${(n / 1e6).toFixed(1)} MB` : (n || 0) >= 1e3 ? `${(n / 1e3).toFixed(1)} kB` : `${n || 0} B`);
 
 // -- speed and time left ----------------------------------------------------------------------------
 // Each card measures its own bytes over the last seconds, in both halves: the browser sending to the
@@ -4151,8 +4151,10 @@ function tusUpload(file, fields, ctrl, hashPromise, onProgress, onWaitingForHash
     });
     tusKicks.add(kick);
     ctrl.signal.addEventListener("abort", () => {
-      upload.abort(true).catch(() => {});
-      reject(new DOMException("cancelled", "AbortError"));
+      upload.abort(true).then(() => reject(new DOMException("cancelled", "AbortError"))).catch((error) => {
+        error.cleanupFailed = true;
+        reject(error);
+      });
     }, { once: true });
     upload.findPreviousUploads().then((previous) => pickPreviousUpload(previous, upload.options.urlStorage)).then((previous) => {
       if (ctrl.signal.aborted) return;
@@ -4226,11 +4228,11 @@ async function finishFolderStaging(folder, d, id, signal) {
       const r = await fetch(`/api/upload/staging?connection_id=${encodeURIComponent(state.connectionId)}&folder=${encodeURIComponent(folder)}`).catch(() => null);
       const f = r && r.ok ? ((await r.json().catch(() => ({}))).folder || {}) : null;
       if (f) {
-        if (f.recorded) return { ...d, status: "registered", name: folder, path: f.remote_root || d.path, size: f.size, count: f.count, kept: f.kept_count || 0 };
+        if (f.recorded) return { ...d, status: "registered", name: d.name || f.original_name || folder, path: f.remote_root || d.path, size: f.size, count: f.count, kept: f.kept_count || 0 };
         if (f.pending === 0 && f.failed > 0) throw new Error(`${f.failed} of ${f.count} files did not reach HPC3`);
         // what is on HPC3 before this page first looks (copied meanwhile, or there from an earlier upload) is not speed
         if (first) { uploadPaces.delete(id); first = false; }
-        upsertUpload({ id, status: "staging", filesDone: f.done || 0, filesTotal: f.count || 0, sent: f.sent || 0, size: f.size || 0 });
+        upsertUpload({ id, status: "staging", filesDone: f.done || 0, filesTotal: f.count || 0, filesFailed: f.failed || 0, sent: f.sent || 0, size: f.size || 0 });
         setUploadProgress(`Copying ${folder}/ to HPC3 — ${f.done || 0}/${f.count || "?"} files${uploadPaceTextFor(id)}`);
       }
       await nextStagingEvent(STAGING_POLL_MS);
@@ -4264,6 +4266,11 @@ async function settleUpload(id, d, name, size, ctrl, attach) {
   setTimeout(() => removeUpload(id), 4000);                        // clear the "Done" card after a beat
 }
 function failUpload(id, err, name, ctrl) {
+  if (err.cleanupFailed) {
+    upsertUpload({ id, status: "error", error: `Cancellation cleanup failed: ${err.message}`, note: "" });
+    toast(`Cancellation cleanup failed for ${name}: ${err.message}`);
+    return;
+  }
   if ((ctrl && ctrl.signal.aborted) || err.name === "AbortError") {      // the user cancelled: not an error
     upsertUpload({ id, status: "cancelled", note: "" });
     toast(`Cancelled ${name}`);
@@ -4390,9 +4397,26 @@ function uploadAction(act, id) {
   else if (act === "pickfile") $("datasetFile").click();
   else if (act === "pickdir") $("datasetDir").click();
 }
+function uploadFileCounts(u) {
+  const rows = u.serverFolder ? [] : (u.fileProgress || []);
+  const done = rows.length ? rows.filter((f) => f.status === "done").length : (u.filesDone || 0);
+  const failed = rows.length ? rows.filter((f) => f.status === "error").length : (u.filesFailed || 0);
+  const cancelled = rows.filter((f) => f.status === "cancelled").length;
+  return { done, failed, cancelled, remaining: Math.max(0, (u.filesTotal || rows.length) - done - failed - cancelled) };
+}
+function uploadFileRows(u) {
+  return (u.fileProgress || []).map((f) => {
+    const pct = f.size ? Math.min(100, Math.round(f.sent / f.size * 100)) : f.status === "done" ? 100 : 0;
+    const label = { queued: "Waiting", uploading: "Uploading", verifying: "Verifying", done: "Uploaded", error: "Failed", cancelled: "Cancelled" }[f.status] || f.status;
+    return `<div class="upload-file ${f.status}"><span class="upload-file-name" title="${escapeHtml(f.name)}">${escapeHtml(f.name)}</span>` +
+      `<span>${fmtUploadSize(f.sent)} / ${fmtUploadSize(f.size)} · ${pct}%</span>` +
+      `<span title="${escapeHtml(f.error || "")}">${escapeHtml(label)}${f.error ? `: ${escapeHtml(f.error)}` : ""}</span></div>`;
+  }).join("");
+}
 function uploadCardView(u) {
-  const pct = u.size ? Math.min(100, Math.round(((u.sent || 0) / u.size) * 100)) : 0;
-  const files = u.filesTotal ? `${u.filesDone || 0}/${u.filesTotal} files` : "";
+  const pct = u.size ? Math.min(100, Math.round(((u.sent || 0) / u.size) * 100)) : u.status === "done" ? 100 : 0;
+  const counts = uploadFileCounts(u);
+  const files = u.filesTotal ? `${counts.done} completed · ${counts.remaining} remaining · ${counts.failed} failed${counts.cancelled ? ` · ${counts.cancelled} cancelled` : ""}` : "";
   const pace = uploadPaceText(u);
   let stat;
   if (u.status === "done") stat = "Done";
@@ -4409,7 +4433,7 @@ function uploadCardView(u) {
   if (UPLOAD_ACTIVE.includes(u.status)) buttons.push(["cancel", "Cancel"]);
   else if (u.status === "error") {
     if (u.jobId || u.serverFolder) buttons.push(["retry", "Retry copy"]);
-    else if (u.kind === "folder") buttons.push(u.files ? ["resume", "Resume"] : ["pickdir", "Choose the folder again"]);
+    else if (u.kind === "folder") buttons.push(u.files ? ["resume", "Retry failed files"] : ["pickdir", "Choose the folder again"]);
     else if (u.file) buttons.push(["resume", "Resume"]);
     buttons.push(["dismiss", "Dismiss"]);
   } else if (u.status === "pending") {
@@ -4420,6 +4444,8 @@ function uploadCardView(u) {
     : u.kind === "folder" ? "drive_folder_upload" : "upload_file";
   // the upload library's own wording, for whoever has to debug it
   const tip = u.status === "error" && u.detail && u.detail !== u.error ? `${stat}\n\n${u.detail}` : stat;
+  if (u.status !== "uploading") stat += ` · ${pct}% · ${fmtUploadSize(u.sent)} / ${fmtUploadSize(u.size)}`;
+  if (files && u.status !== "uploading" && u.status !== "staging") stat += ` · ${files}`;
   return { stat, pct, buttons, icon, tip };
 }
 // Cards are updated in place. Rebuilding them on every progress event replaced the buttons several
@@ -4444,8 +4470,12 @@ function renderUploads() {
       fresh.innerHTML = `<div class="upload-row"><span class="material-symbols-outlined msym">${v.icon}</span>` +
         `<span class="upload-name"></span><span class="upload-stat"></span>` +
         v.buttons.map(([act, label]) => `<button type="button" class="ghost small" data-act="${act}">${escapeHtml(label)}</button>`).join("") +
-        `</div><div class="meter"><div class="meter-fill"></div></div>`;
-      if (el) el.replaceWith(fresh);
+        `</div><div class="meter"><div class="meter-fill"></div></div>` +
+        `<details class="upload-files"><summary>File progress</summary><div class="upload-file-list"></div></details>`;
+      if (el) {
+        fresh.querySelector(".upload-files").open = !!el.querySelector(".upload-files")?.open;
+        el.replaceWith(fresh);
+      }
       el = fresh;
     }
     const nameEl = el.querySelector(".upload-name");
@@ -4455,6 +4485,14 @@ function renderUploads() {
     const fill = el.querySelector(".meter-fill");
     fill.style.width = `${v.pct}%`;
     fill.classList.toggle("mem", u.status === "done");
+    const details = el.querySelector(".upload-files");
+    details.hidden = !(u.fileProgress && u.fileProgress.length);
+    if (details.open) {
+      const list = details.querySelector(".upload-file-list");
+      const html = uploadFileRows(u);
+      if (list.innerHTML !== html) list.innerHTML = html;
+    }
+    details.ontoggle = () => { if (details.open) details.querySelector(".upload-file-list").innerHTML = uploadFileRows(state.uploads.find((x) => x.id === u.id) || u); };
     const at = prev ? prev.nextElementSibling : host.firstElementChild;
     if (at !== el) host.insertBefore(el, at);
     prev = el;
@@ -4512,7 +4550,12 @@ async function uploadFolder(fileList) {
   const ctrl = new AbortController();
   // `files` stays on the card: while the page is open, a Resume does not need the folder chosen again
   const earlier = state.uploads.find((u) => u.id === id);
-  upsertUpload({ id, kind: "folder", name: `${folder0}/`, size: total, sent: 0, filesDone: 0, filesTotal: files.length,
+  if (earlier && earlier.fileProgress) earlier.fileProgress.forEach((f, i) => {
+    if (f.status === "done") doneBits[i >> 3] |= 1 << (i & 7);
+  });
+  const fileProgress = files.map((f, i) => ({ name: f.webkitRelativePath || f.name, size: f.size,
+    sent: isDone(i) ? f.size : 0, status: isDone(i) ? "done" : "queued", error: "" }));
+  upsertUpload({ id, kind: "folder", name: `${folder0}/`, size: total, sent: 0, filesDone: 0, filesTotal: files.length, fileProgress,
     status: "uploading", error: "", detail: "", lost: false, retrying: false, note: "", jobId: "", serverFolder: "", folderKey, files, ctrl,
     chat: (earlier && earlier.chat) || state.activeId });
   setUploadProgress(`Preparing ${folder0}/…`);
@@ -4522,29 +4565,30 @@ async function uploadFolder(fileList) {
     // one that is already uploaded, in part or whole (an upload that stopped, in this browser or
     // another, or the same folder chosen again): the answer is then that folder, and `have` lists
     // the files, by position, that are there and are not sent again. A different folder of the
-    // same name lands in "name_2/" instead of merging into / overwriting the first.
-    let savedFolder = "", kept = 0;
-    try { savedFolder = localStorage.getItem(folderKey) || ""; } catch { /* private mode */ }
-    if (!savedFolder) {
-      doneBits.fill(0);
-      const rr = await postJson("/api/upload/reserve-folder", { name: folder0,
-        files: files.map((f) => [(f.webkitRelativePath || `${folder0}/${f.name}`).split("/").slice(1).join("/"), f.size]) });
-      const rd = await rr.json().catch(() => ({}));
-      if (!rr.ok || !rd.folder) throw new Error(rd.error || "folder reservation failed");
-      folder = rd.folder;
-      for (const i of rd.have || []) {
-        if (Number.isInteger(i) && i >= 0 && i < files.length && !isDone(i)) { doneBits[i >> 3] |= 1 << (i & 7); kept++; }
-      }
-      try {
-        localStorage.setItem(folderKey, folder);
-        if (kept) localStorage.setItem(bitsKey, btoa(String.fromCharCode(...doneBits)));
-      } catch { /* upload still works this session */ }
-      // (all of them there: the closing message says so, see folderDoneText)
-      if (kept && kept < files.length) toast(`${folder}/ is already uploaded in part: ${kept} of ${files.length} files are there, sending the other ${files.length - kept}`);
-    } else folder = savedFolder;
+    // same name is assigned its own storage identifier.
+    let savedFolder = (earlier && earlier.reservedFolder) || "", kept = 0;
+    try { savedFolder = localStorage.getItem(folderKey) || savedFolder; } catch { /* private mode */ }
+    // Browser notes can outlive the server's upload TTL. Revalidate even a saved UUID;
+    // only files the server still has may be skipped.
+    const rr = await postJson("/api/upload/reserve-folder", { name: folder0, folder: savedFolder,
+      files: files.map((f) => [(f.webkitRelativePath || `${folder0}/${f.name}`).split("/").slice(1).join("/"), f.size]) });
+    const rd = await rr.json().catch(() => ({}));
+    if (!rr.ok || !rd.folder) throw new Error(rd.error || "folder reservation failed");
+    folder = rd.folder;
+    doneBits.fill(0);
+    fileProgress.forEach((f) => { f.sent = 0; f.status = "queued"; f.error = ""; });
+    for (const i of rd.have || []) {
+      if (Number.isInteger(i) && i >= 0 && i < files.length && !isDone(i)) { doneBits[i >> 3] |= 1 << (i & 7); kept++; }
+    }
+    try {
+      localStorage.setItem(folderKey, folder);
+      localStorage.setItem(bitsKey, btoa(String.fromCharCode(...doneBits)));
+    } catch { /* upload still works this session */ }
+    if (kept && kept < files.length) toast(`${folder0}/ is already uploaded in part: ${kept} of ${files.length} files are there, sending the other ${files.length - kept}`);
+    upsertUpload({ id, reservedFolder: folder });
     let done = 0, doneBytes = 0, nextFile = 0, stopped = false, firstError = null, storageWarned = false, painted = 0;
     let retryingFiles = 0;
-    files.forEach((f, i) => { if (isDone(i)) { done++; doneBytes += f.size; } });
+    files.forEach((f, i) => { if (isDone(i)) { done++; doneBytes += f.size; fileProgress[i].sent = f.size; fileProgress[i].status = "done"; } });
     uploadPaces.delete(id);             // files that are already there are not speed: measure from here
     const inFlight = new Map();         // file index -> bytes of it sent so far
     const controllers = new Set();
@@ -4554,8 +4598,8 @@ async function uploadFolder(fileList) {
       painted = Date.now();
       let sent = doneBytes;
       for (const n of inFlight.values()) sent += n;
-      upsertUpload({ id, name: `${folder}/`, sent, filesDone: done, status: "uploading" });
-      setUploadProgress(`Uploading ${folder}/ — ${done}/${files.length} files${uploadPaceTextFor(id)}`);
+      upsertUpload({ id, sent, filesDone: done, fileProgress, status: "uploading" });
+      setUploadProgress(`Uploading ${folder0}/ — ${done}/${files.length} files${uploadPaceTextFor(id)}`);
     };
     paint(true);
     async function folderWorker() {
@@ -4573,10 +4617,11 @@ async function uploadFolder(fileList) {
           let d;
           try {
             if (stopped || fctrl.signal.aborted) throw new DOMException("cancelled", "AbortError");
+            fileProgress[index].status = "uploading";
             const hashPromise = hashUploadFile(f, fctrl);
             hashPromise.catch(() => {});
-            d = await tusUpload(f, { folder, rel_path: rel }, fctrl, hashPromise, (sent) => { inFlight.set(index, sent); paint(false); },
-              null, (retrying) => {
+            d = await tusUpload(f, { folder, rel_path: rel }, fctrl, hashPromise, (sent) => { fileProgress[index].sent = sent; inFlight.set(index, sent); paint(false); },
+              (waiting) => { fileProgress[index].status = waiting ? "verifying" : "uploading"; paint(true); }, (retrying) => {
                 retryingFiles += retrying ? 1 : -1;
                 upsertUpload({ id, retrying: retryingFiles > 0 });
               });
@@ -4587,12 +4632,14 @@ async function uploadFolder(fileList) {
           catch { storageWarned = true; }
           inFlight.delete(index);
           done++; doneBytes += f.size;
+          fileProgress[index].sent = f.size; fileProgress[index].status = "done";
           paint(true);
         } catch (error) {
-          inFlight.delete(index);
-          if (!firstError && !stopped) { firstError = error; failedRel = rel; }   // the error itself: it says what kind of failure
-          stopped = true;
-          for (const other of controllers) if (other !== fctrl) other.abort();
+          fileProgress[index].status = ctrl.signal.aborted ? "cancelled" : "error";
+          fileProgress[index].error = ctrl.signal.aborted ? "" : (error.message || "Upload failed");
+          if (!firstError && !stopped) { firstError = error; failedRel = rel; }
+          // A failed file keeps its resumable partial. Other files finish independently.
+          paint(true);
         } finally { controllers.delete(fctrl); }
       }
     }
@@ -4621,14 +4668,24 @@ async function uploadFolder(fileList) {
   } catch (err) {
     if (ctrl.signal.aborted || err.name === "AbortError") {
       upsertUpload({ id, status: "cancelled", note: "" });
-      toast(`Cancelled ${folder}/ — choose the folder again to continue where it stopped.`);
+      fileProgress.forEach((f) => { if (f.status !== "done") f.status = "cancelled"; });
+      try {
+        const response = await postJson("/api/upload/staging/cancel", { folder, discard_upload: true });
+        if (!response.ok) throw new Error("Server could not remove temporary files");
+        localStorage.removeItem(folderKey); localStorage.removeItem(bitsKey);
+        toast(`Cancelled ${folder0}/`);
+      } catch (cleanupError) {
+        upsertUpload({ id, status: "error", error: `Cancellation cleanup failed: ${cleanupError.message}` });
+        toast(`Cancellation cleanup failed for ${folder0}/: ${cleanupError.message}`);
+        return;
+      }
       setTimeout(() => removeUpload(id), 4000);
     } else {
       const f = uploadFailure(err, "", "Resume uploads only the files that are still missing.");
       const text = failedRel && !f.lost ? `${failedRel}: ${f.text}` : f.text;   // a refusal names its file
       upsertUpload({ id, status: "error", note: "", error: text, detail: f.detail, lost: f.lost });
-      reportUploadError(id, `${folder}/`, err);
-      toast(`${folder}/: ${text}`);
+      reportUploadError(id, `${folder0}/`, err);
+      toast(`${folder0}/: ${text}`);
     }
   } finally { setUploadProgress(null); }
 }

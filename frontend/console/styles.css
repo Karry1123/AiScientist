@@ -1516,3 +1516,13 @@ button.primary .msym, button.secondary .msym {
   .dl-item:hover, .session-item:hover, .file-cell:hover, .file-cell:hover img,
   .clarify-chip:hover, .nav-item:not(.active):hover { transform: none !important; }
 }
+
+.upload-files { margin-top: 9px; font-size: 12px; }
+.upload-files summary { cursor: pointer; color: var(--text-secondary); }
+.upload-file-list { max-height: 280px; overflow: auto; margin-top: 8px; }
+.upload-file { display: grid; grid-template-columns: minmax(120px, 1fr) auto minmax(80px, 1fr); gap: 12px; padding: 5px 0; font-variant-numeric: tabular-nums; }
+.upload-file-name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.upload-file.error { color: var(--red); }
+.upload-file.done { color: var(--green); }
+.upload-file.cancelled { color: var(--text-tertiary); }
+@media (max-width: 600px) { .upload-file { grid-template-columns: 1fr; gap: 2px; } }

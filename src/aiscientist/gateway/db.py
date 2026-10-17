@@ -72,6 +72,19 @@ def init_db() -> None:
     # idempotent ADD COLUMN (skipped when the column already exists), which SQLite and
     # PostgreSQL both support for a nullable column with no default. Keep these forward-only.
     _ensure_columns(engine, "runs", {"conversation_id": "VARCHAR(64)"})
+    _ensure_columns(engine, "datasets", {
+        "uuid": "VARCHAR(36)", "status": "VARCHAR(24)", "updated_at": "TIMESTAMP",
+    })
+    # Backfill metadata only: existing paths and files remain untouched.
+    import uuid
+    from sqlalchemy import text
+    with engine.begin() as conn:
+        for row in conn.execute(text("SELECT id FROM datasets WHERE uuid IS NULL")).all():
+            conn.execute(text("UPDATE datasets SET uuid=:uuid WHERE id=:id"),
+                         {"uuid": str(uuid.uuid4()), "id": row[0]})
+        conn.execute(text("UPDATE datasets SET status='complete' WHERE status IS NULL"))
+        conn.execute(text("UPDATE datasets SET updated_at=uploaded_at WHERE updated_at IS NULL"))
+        conn.execute(text("CREATE UNIQUE INDEX IF NOT EXISTS ix_datasets_uuid ON datasets (uuid)"))
 
 
 def _ensure_columns(engine: Engine, table: str, columns: dict[str, str]) -> None:

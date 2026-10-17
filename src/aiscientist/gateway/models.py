@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import datetime as _dt
 import json as _json
+import uuid as _uuid
 
 from sqlalchemy import (BigInteger, Boolean, DateTime, Float, ForeignKey, Integer, String,
                         Text, func)
@@ -88,6 +89,10 @@ class Dataset(Base):
 
     id: Mapped[int] = mapped_column(primary_key=True)
     user_id: Mapped[int] = mapped_column(ForeignKey("users.id"), index=True)
+    uuid: Mapped[str] = mapped_column(String(36), default=lambda: str(_uuid.uuid4()), unique=True)
+    status: Mapped[str] = mapped_column(String(24), default="complete")
+    updated_at: Mapped[_dt.datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), onupdate=func.now())
     name: Mapped[str] = mapped_column(String(255))
     path: Mapped[str] = mapped_column(String(1024))       # server path under the user workspace
     size_bytes: Mapped[int] = mapped_column(BigInteger, default=0)
@@ -99,7 +104,11 @@ class Dataset(Base):
 
     def public(self) -> dict:
         return {
-            "id": self.id, "name": self.name, "path": self.path, "size_bytes": self.size_bytes,
+            "id": self.id, "uuid": self.uuid, "owner": self.user_id,
+            "name": self.name, "original_name": self.name, "path": self.path,
+            "storage_path": self.path, "size_bytes": self.size_bytes, "status": self.status,
+            "created_at": self.uploaded_at.isoformat() if self.uploaded_at else None,
+            "updated_at": self.updated_at.isoformat() if self.updated_at else None,
             "kind": self.kind, "uploaded_at": self.uploaded_at.isoformat() if self.uploaded_at else None,
         }
 

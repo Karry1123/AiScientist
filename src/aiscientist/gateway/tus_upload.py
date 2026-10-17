@@ -32,7 +32,7 @@ from fastapi import APIRouter, Request
 from fastapi.responses import Response
 from starlette.requests import ClientDisconnect
 
-from . import upload_log
+from . import upload_log, upload_storage
 
 router = APIRouter(prefix="/api/tus")
 _VERSION = "1.0.0"
@@ -82,7 +82,7 @@ def _metadata(raw: str) -> dict[str, str]:
 def _paths(conn, upload_id: str) -> tuple[Path, Path]:
     if not re.fullmatch(r"[0-9a-f]{32}", upload_id):
         raise ValueError("invalid upload id")
-    root = conn.workspace / "uploads" / ".parts"
+    root = upload_storage.uploads(conn) / ".parts"
     return root / f"{upload_id}.json", root / f"{upload_id}.part"
 
 
@@ -131,20 +131,26 @@ def _save(path: Path, meta: dict) -> None:
 
 
 def _cleanup_parts(root: Path) -> None:
-    """Remove expired sidecars at most once a day per workspace."""
+    """Expire inactive resumable uploads without touching a live PATCH."""
     now = time.time()
     key = str(root)
     with _locks_guard:
-        if now - _last_cleanup.get(key, 0) < 86400:
+        if now - _last_cleanup.get(key, 0) < min(60, upload_storage.ttl_seconds()):
             return
         _last_cleanup[key] = now
     if not root.is_dir():
         return
     for path in root.glob("*.json"):
-        if now - path.stat().st_mtime < 7 * 86400:
+        if now - path.stat().st_mtime < upload_storage.ttl_seconds():
             continue
         upload_id = path.stem
-        if not re.fullmatch(r"[0-9a-f]{32}", upload_id):
+        if not re.fullmatch(r"[0-9a-f]{32}", upload_id) or _lock(upload_id).locked():
+            continue
+        try:
+            meta = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            continue
+        if meta.get("status") in ("staging", "complete"):
             continue
         for suffix in (".json", ".part", ".incoming"):
             (root / (upload_id + suffix)).unlink(missing_ok=True)
@@ -171,6 +177,10 @@ def _load(request: Request, upload_id: str):
                                                and conn.app_user_id != meta["app_user_id"]):
             continue
         gw._owned_conn(conn.id, request)
+        if meta.get("status") == "uploading" and time.time() - path.stat().st_mtime >= upload_storage.ttl_seconds() and not _lock(upload_id).locked():
+            for item in (part, part.with_suffix(".incoming"), path):
+                item.unlink(missing_ok=True)
+            return None, None, None, _answer(410, body={"error": "upload expired"})
         return conn, meta, (path, part), None
     return None, None, None, _unattached(request, upload_id)
 
@@ -183,19 +193,22 @@ def _unattached(request: Request, upload_id: str) -> Response:
     again. A 404 then made tus-js-client forget the upload and send the file again from byte 0; on a
     423 it keeps the upload and asks again."""
     gw = _gw()
-    if gw._AUTH_ENABLED:
-        user = gw._optional_user(request)
-        if user is None:
-            return _answer(401, body={"error": "Not authenticated"})
-        owners = [gw.safe_name(user.username)]
-    else:                                    # one user, no accounts: the upload id is the key
-        owners = [p.parents[2].name for p in gw.CONSOLE_RUNS_DIR.glob(f"*/uploads/.parts/{upload_id}.json")]
-    for owner in owners:
+    from . import dataset_storage
+    roots = (gw.CONSOLE_RUNS_DIR, dataset_storage.data_root() / "temp")
+    paths = [p for root in roots for p in root.glob(f"*/uploads/.parts/{upload_id}.json")]
+    user = gw._optional_user(request) if gw._AUTH_ENABLED else None
+    if gw._AUTH_ENABLED and user is None:
+        return _answer(401, body={"error": "Not authenticated"})
+    for path in paths:
+        owner = path.parents[2].name
+        if user is not None and owner != gw.safe_name(user.username):
+            continue
         try:
-            path = gw.CONSOLE_RUNS_DIR / owner / "uploads" / ".parts" / f"{upload_id}.json"
             meta = json.loads(path.read_text(encoding="utf-8"))
         except (OSError, ValueError):
             continue
+        if meta.get("status") == "uploading" and time.time() - path.stat().st_mtime > upload_storage.ttl_seconds():
+            return _answer(410, body={"error": "upload expired"})
         if meta.get("owner") != owner or (gw._AUTH_ENABLED and meta.get("app_user_id") not in (None, user.id)):
             continue
         return _answer(423, headers={"Upload-Offset": str(meta.get("offset", 0)),
@@ -230,8 +243,8 @@ async def create(request: Request) -> Response:
     if length < 0 or length > _MAX_SIZE:
         return _answer(413, body={"error": "upload exceeds Tus-Max-Size"})
     conn = gw._owned_conn(fields.get("connection_id"), request)
-    conn.workspace.mkdir(parents=True, exist_ok=True)
-    if shutil.disk_usage(conn.workspace).free < length + 64 * 1024**2:
+    upload_storage.uploads(conn).mkdir(parents=True, exist_ok=True)
+    if shutil.disk_usage(upload_storage.uploads(conn)).free < length + 64 * 1024**2:
         upload_log.record(conn.workspace, "refused", name=fields.get("filename"), size=length,
                           error="not enough eyeserver disk space")
         return _answer(507, body={"error": "not enough eyeserver disk space"})
@@ -240,7 +253,7 @@ async def create(request: Request) -> Response:
     folder = gw.safe_relpath(fields.get("folder") or "").split("/")[0]
     if rel and (not folder or rel.split("/")[0] != folder or len(rel.split("/")) < 2):
         return _answer(400, body={"error": "rel_path must be inside the reserved folder"})
-    if folder and not (conn.workspace / "uploads" / folder).is_dir():
+    if folder and not (upload_storage.uploads(conn) / folder).is_dir():
         upload_log.record(conn.workspace, "refused", name=rel or name, folder=folder, size=length,
                           error="the folder is not reserved on the server")
         return _answer(404, body={"error": "reserve the folder before uploading its files"})
@@ -255,7 +268,8 @@ async def create(request: Request) -> Response:
     path.parent.mkdir(parents=True, exist_ok=True)
     await asyncio.to_thread(_cleanup_parts, path.parent)
     part.touch(exist_ok=False)
-    meta = {"connection_id": conn.id, "owner": conn.owner, "app_user_id": conn.app_user_id,
+    dataset_uuid = str(uuid4()) if upload_storage.enabled(conn) and not folder else ""
+    meta = {"original_name": fields.get("filename") or name, "dataset_uuid": dataset_uuid, "connection_id": conn.id, "owner": conn.owner, "app_user_id": conn.app_user_id,
             "length": length,
                  "name": name, "rel_path": rel, "folder": folder, "unpack": unpack,
                  "client_sha256": client_sha256,
@@ -276,8 +290,12 @@ async def result(upload_id: str, request: Request) -> Response:
         return error
     gw = _gw()
     rel = meta.get("rel_path", "")
-    path = f"{gw._hpc_uploads_dir(conn)}/{rel}" if gw._uploads_on_hpc(conn) else str(conn.workspace / "uploads" / rel)
-    return _answer(200, body={"status": meta["status"], "name": meta["name"],
+    path = meta.get("storage_path") or (f"{gw._hpc_uploads_dir(conn)}/{rel}" if gw._uploads_on_hpc(conn) else str(upload_storage.uploads(conn) / rel))
+    if meta.get("job_id"):
+        job = gw._staging_queue(conn).get(meta["job_id"])
+        if job is not None:
+            path = job.remote_path
+    return _answer(200, body={"status": meta["status"], "name": meta.get("original_name") or meta["name"],
                               "path": path, "size": meta["length"], "job_id": meta.get("job_id", ""),
                               "peek": meta.get("peek"), "error": meta.get("error", "")})
 
@@ -332,7 +350,7 @@ def _log_finish_error(conn, upload_id: str, meta: dict, exc: Exception) -> None:
 
 async def _finish(conn, meta: dict, path: Path, part: Path) -> None:
     gw = _gw()
-    uploads = conn.workspace / "uploads"
+    uploads = upload_storage.uploads(conn)
     if meta["status"] == "finalizing":
         rel = meta["rel_path"]
         dest = uploads / rel
@@ -340,18 +358,36 @@ async def _finish(conn, meta: dict, path: Path, part: Path) -> None:
         if meta["rel_path"]:
             rel = meta["rel_path"]
             dest = uploads / rel
+            if not dest.resolve().is_relative_to(uploads.resolve()):
+                raise ValueError("unsafe upload destination")
             dest.parent.mkdir(parents=True, exist_ok=True)
             if dest.exists():
                 raise ValueError(f"folder entry already exists: {rel}")
         else:
-            rel = await asyncio.to_thread(gw._unique_upload_name, conn, uploads, meta["name"])
-            dest = uploads / rel
+            if meta.get("dataset_uuid"):
+                rel = f"{meta['dataset_uuid']}/{meta['name']}"
+                dest = uploads / rel
+                dest.parent.mkdir(parents=True, exist_ok=True)
+            else:
+                rel = await asyncio.to_thread(gw._unique_upload_name, conn, uploads, meta["name"])
+                dest = uploads / rel
         meta["rel_path"] = rel
         meta["status"] = "finalizing"
         _save(path, meta)
+    if not part.exists() and not dest.exists() and meta.get("dataset_uuid") and not gw._uploads_on_hpc(conn):
+        from . import dataset_storage
+        dest = dataset_storage.dataset_dir(meta["dataset_uuid"]) / "original" / meta["name"]
+    if not dest.resolve().is_relative_to(uploads.resolve()):
+        from . import dataset_storage
+        expected = (dataset_storage.dataset_dir(meta["dataset_uuid"]) / "original" / meta["name"]
+                    if meta.get("dataset_uuid") else None)
+        if expected is None or dest.resolve() != expected or dest.is_symlink():
+            raise ValueError("unsafe upload destination")
     source = part if part.exists() else dest
     if not source.is_file():
         raise ValueError("completed upload bytes are missing")
+    if source.stat().st_size != meta["length"]:
+        raise ValueError("completed upload size mismatch")
     # The HPC3 staging worker checks this digest before copying. Re-reading a 25 GiB file here
     # would hold the final PATCH past the gateway proxy's 15-second response window.
     if meta["client_sha256"] and not gw._uploads_on_hpc(conn):
@@ -365,6 +401,13 @@ async def _finish(conn, meta: dict, path: Path, part: Path) -> None:
             raise ValueError("whole-file SHA-256 mismatch")
     if part.exists():
         os.replace(part, dest)
+    if meta.get("dataset_uuid") and not gw._uploads_on_hpc(conn):
+        from . import dataset_storage
+        published = dataset_storage.dataset_dir(meta["dataset_uuid"]) / "original"
+        if dest.parent != published:
+            dataset_storage.publish_dataset(dest.parent, meta["dataset_uuid"])
+            dest = published / dest.name
+        meta["storage_path"] = str(dest)
     meta["status"] = "complete"
     meta["name"] = dest.name if not meta["folder"] else rel
     # Skim only regular single files, matching /api/upload. Staging itself never blocks this request.
@@ -379,7 +422,7 @@ async def _finish(conn, meta: dict, path: Path, part: Path) -> None:
         meta["status"] = "staging"
     elif not meta["folder"]:
         if gw._AUTH_ENABLED and conn.app_user_id:
-            gw.auth_routes.record_dataset(conn.app_user_id, dest.name, str(dest),
+            gw.auth_routes.record_dataset(conn.app_user_id, meta.get("original_name") or dest.name, str(dest),
                                           dest.stat().st_size, gw._file_kind(dest.name))
         conn.emit("success", "upload", f"Uploaded {dest.name} to the server.")
     _save(path, meta)
@@ -459,6 +502,8 @@ async def patch(upload_id: str, request: Request) -> Response:
                 meta["client_sha256"] = final_sha
             await asyncio.to_thread(_append_chunk, part, incoming)
             meta["offset"] = offset + count
+            if meta.get("folder") and upload_storage.enabled(conn):
+                upload_storage.session_path(conn, meta["folder"]).touch()
             _save(path, meta)
             if meta["offset"] == meta["length"]:
                 try:
@@ -511,8 +556,13 @@ async def delete(upload_id: str, request: Request) -> Response:
         meta = json.loads(path.read_text(encoding="utf-8"))
         if meta.get("job_id"):
             _gw()._staging_queue(conn).cancel(meta["job_id"])
-        else:
+        elif meta.get("status") != "complete":
             part.unlink(missing_ok=True)
+            if meta.get("rel_path"):
+                target = upload_storage.uploads(conn) / meta["rel_path"]
+                if target.resolve().is_relative_to(upload_storage.uploads(conn).resolve()):
+                    target.unlink(missing_ok=True)
+        part.with_suffix(".incoming").unlink(missing_ok=True)
         path.unlink(missing_ok=True)
         upload_log.record(conn.workspace, "discarded", upload_id=upload_id,
                           name=meta.get("rel_path") or meta.get("name"), offset=meta.get("offset"),

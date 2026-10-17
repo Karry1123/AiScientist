@@ -325,22 +325,35 @@ def my_runs(request: Request) -> dict:
 
 
 def record_dataset(user_id: int, name: str, path: str, size_bytes: int, kind: str,
-                   sha256: str | None = None) -> int | None:
+                   sha256: str | None = None, dataset_uuid: str | None = None) -> int | None:
     with session_scope() as s:
-        d = Dataset(user_id=user_id, name=name, path=path, size_bytes=size_bytes, kind=kind, sha256=sha256)
+        from .dataset_storage import managed_uuid
+        metadata = {"uuid": dataset_uuid or managed_uuid(path)}
+        metadata = {k: v for k, v in metadata.items() if v is not None}
+        if metadata:
+            existing = s.scalars(select(Dataset).where(Dataset.uuid == metadata["uuid"])).first()
+            if existing is not None:
+                if existing.user_id != user_id or existing.path != path:
+                    raise ValueError("Dataset UUID already belongs to another storage reference")
+                return existing.id
+        d = Dataset(user_id=user_id, name=name, path=path, size_bytes=size_bytes, kind=kind, sha256=sha256, **metadata)
         s.add(d)
         s.commit()
         return d.id
 
 
-def record_folder_dataset(user_id: int, name: str, path: str, size_bytes: int) -> int | None:
+def record_folder_dataset(user_id: int, name: str, path: str, size_bytes: int,
+                          dataset_uuid: str | None = None) -> int | None:
     """One row per uploaded folder: files added to a folder that is already a dataset update its
     row's size instead of listing the folder a second time."""
     with session_scope() as s:
         row = s.scalars(select(Dataset).where(Dataset.user_id == user_id, Dataset.path == path)
                         .order_by(Dataset.id.desc()).limit(1)).first()
         if row is None:
-            row = Dataset(user_id=user_id, name=name, path=path, size_bytes=size_bytes, kind="folder")
+            from .dataset_storage import managed_uuid
+            metadata = {"uuid": dataset_uuid or managed_uuid(path)}
+            metadata = {k: v for k, v in metadata.items() if v is not None}
+            row = Dataset(user_id=user_id, name=name, path=path, size_bytes=size_bytes, kind="folder", **metadata)
             s.add(row)
         else:
             row.size_bytes = size_bytes
@@ -356,7 +369,7 @@ def dataset_path_recorded(user_id: int, path: str) -> bool:
                                                   Dataset.path == path).limit(1)).first() is not None
 
 
-def delete_dataset_record(user_id: int, dataset_id: int) -> str | None:
+def delete_dataset_record(user_id: int, dataset_id: int, delete_files=None) -> str | None:
     """Remove ONE dataset-history row, but only if it belongs to ``user_id`` (so a user
     can never delete another account's dataset by guessing an id). Returns the stored
     server-side ``path`` so the caller can unlink the physical file, or ``None`` when the
@@ -366,6 +379,18 @@ def delete_dataset_record(user_id: int, dataset_id: int) -> str | None:
         if row is None or row.user_id != user_id:
             return None
         path = row.path
+        if delete_files is not None:
+            from pathlib import Path
+            from .dataset_storage import managed_uuid, dataset_dir
+            identity = managed_uuid(path)
+            target = dataset_dir(identity) if identity else Path(path).resolve()
+            for other in s.scalars(select(Dataset).where(Dataset.id != dataset_id)):
+                other_path = Path(other.path).resolve()
+                if (target == other_path or target.is_relative_to(other_path)
+                        or other_path.is_relative_to(target)):
+                    raise ValueError("Dataset storage overlaps another registered dataset")
+            # A failed physical deletion leaves the registry entry available for retry.
+            delete_files(path)
         s.delete(row)
         s.commit()
         return path
@@ -936,3 +961,32 @@ def ensure_bootstrap_admin() -> str | None:
               "(plaintext in .env). The bcrypt hash is now in the DB — DELETE that line from "
               ".env. Prefer `aiscientist-admin create-admin` (interactive) or AISCIENTIST_ADMIN_PASSWORD_HASH.")
     return username
+
+
+class ReconcileDatasetsRequest(BaseModel):
+    cleanup: bool = False
+    all_owners: bool = False
+
+
+@router.post("/datasets/reconcile")
+def reconcile_datasets(req: ReconcileDatasetsRequest, request: Request) -> dict:
+    user = require_user(request)
+    if req.all_owners and user.role != "admin":
+        raise HTTPException(status_code=403, detail="Admin only")
+    from .dataset_storage import reconcile
+    return reconcile(user_id=None if req.all_owners else user.id, cleanup=req.cleanup)
+
+
+class MigrateDatasetRequest(BaseModel):
+    dataset_id: int
+    apply: bool = False
+
+
+@router.post("/datasets/migrate")
+def migrate_legacy_dataset(req: MigrateDatasetRequest, request: Request) -> dict:
+    user = require_user(request)
+    from .dataset_storage import migrate_dataset
+    try:
+        return migrate_dataset(user.id, req.dataset_id, apply=req.apply)
+    except (ValueError, OSError) as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc

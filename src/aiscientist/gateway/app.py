@@ -34,6 +34,7 @@ from ..integrations.safety import endpoint_is_off_host as _endpoint_is_off_host
 from . import hpc_gc                      # shared-root bootstrap + the HPC3 Temp sweeper
 from . import shared_llm                  # the lab's shared reasoning-model server and its keeper
 from . import staging                     # background copies of uploads to HPC3
+from . import upload_storage, dataset_storage
 from . import upload_log                  # what happened to each upload, per user
 from .errors import GatewayError, VLLMNetworkError, error_detail
 from .executor import RemoteExecutor
@@ -50,8 +51,8 @@ load_project_env(ROOT)
 # Where results live on the gateway host (eyeserver), partitioned per SSH user:
 # <results_dir>/<ucinetid>/<run_id>/artifacts/...
 # On eyeserver set AISCIENTIST_RESULTS_DIR=/data/aiscientist (the big /data disk, not
-# /home). Defaults to runs/console for local development.
-CONSOLE_RUNS_DIR = Path(os.environ.get("AISCIENTIST_RESULTS_DIR") or (ROOT / "runs" / "console")).resolve()
+# /home). Defaults to DATA_ROOT/analysis_results.
+CONSOLE_RUNS_DIR = Path(os.environ.get("AISCIENTIST_RESULTS_DIR") or (dataset_storage.data_root() / "analysis_results")).resolve()
 
 
 def safe_name(value: str) -> str:
@@ -1468,6 +1469,7 @@ async def _start_checkpoint_gc() -> None:
     """Launch the two housekeeping sweeps: stale A2 analysis checkpoints in the eyeserver's local
     run bundles (default 7 days), and cold per-run process files in each live session's HPC3
     ``<shared_root>/Temp/<user>`` area (default 3 days)."""
+    asyncio.create_task(_upload_gc_loop())
     asyncio.create_task(_checkpoint_gc_loop())
     asyncio.create_task(_hpc_temp_gc_loop())
 
@@ -2847,7 +2849,7 @@ def _staging_queue(conn: Connection) -> "staging.StagingQueue":
         if q is None:
             owner = conn.owner
             q = staging.StagingQueue(
-                staging.StagingStore(conn.workspace / "uploads" / ".staging"),
+                staging.StagingStore(upload_storage.uploads(conn) / ".staging"),
                 push=lambda job, progress: _push_staged(owner, job, progress),
                 verify=lambda job: _verify_staged(owner, job),
                 on_change=lambda job: _on_staging_change(owner, job),
@@ -2932,8 +2934,10 @@ def _unpack_staged(owner: str, job: "staging.StagingJob") -> dict:
         # A free folder name, chosen once and kept on the job: a retry must land in the SAME place,
         # because the script treats an existing destination as "already unpacked".
         stem = _archive_stem(job.name) or f"{job.name}.unpacked"
-        name = _unique_upload_name(conn, conn.workspace / "uploads", stem)
-        job.unpack_dest = f"{_hpc_uploads_dir(conn)}/{name}"
+        name = _unique_upload_name(conn, upload_storage.uploads(conn), stem)
+        identity = upload_storage.remote_identity(job.remote_path)
+        job.unpack_dest = (f"{_hpc_uploads_dir(conn)}/datasets/{identity}/processed/{stem}" if identity
+                           else f"{_hpc_uploads_dir(conn)}/{name}")
         _staging_queue(conn).store.save(job)
     if conn.mock:
         return {"path": job.unpack_dest, "files": 0, "bytes": job.size, "mock": True}
@@ -2959,6 +2963,16 @@ _VERIFY_MIN_BYTES = int(os.environ.get("AISCIENTIST_UPLOAD_VERIFY_MIN_BYTES", st
 
 
 def _verify_staged(owner: str, job: "staging.StagingJob") -> str:
+    verified = _check_staged(owner, job)
+    identity = upload_storage.remote_identity(job.remote_path)
+    if identity and not job.folder:
+        conn = _staging_conn(owner, job.hpc_user)
+        original = _publish_remote(conn, identity)
+        job.remote_path = original + "/" + Path(job.local_path).name
+    return verified
+
+
+def _check_staged(owner: str, job: "staging.StagingJob") -> str:
     conn = _staging_conn(owner, job.hpc_user)
     ex = conn.executor
     remote = ex.remote_size(job.remote_path)
@@ -2976,6 +2990,23 @@ def _verify_staged(owner: str, job: "staging.StagingJob") -> str:
             pass
         raise staging.VerifyError(f"{job.name} on HPC3 does not match the upload (SHA-256 differs).")
     return "sha256"
+
+
+def _publish_remote(conn: Connection, identifier: str) -> str:
+    """Rename a verified UUID tree on its own filesystem; retry after rename is safe."""
+    from uuid import UUID
+    identifier = str(UUID(identifier))
+    base = _hpc_uploads_dir(conn)
+    source, target = f"{base}/temp/{identifier}/original", f"{base}/datasets/{identifier}"
+    command = (f"mkdir -p {shlex.quote(target + '/processed')} && "
+               f"if test -d {shlex.quote(source)}; then "
+               f"test ! -e {shlex.quote(target + '/original')} && "
+               f"mv -- {shlex.quote(source)} {shlex.quote(target + '/original')}; "
+               f"else test -d {shlex.quote(target + '/original')}; fi")
+    result = conn.executor.exec(command)
+    if not result.ok:
+        raise OSError(result.stderr or "Could not publish verified dataset on HPC3")
+    return target + "/original"
 
 
 def _remote_sha256(conn: Connection, path: str) -> str:
@@ -3042,7 +3073,8 @@ def _on_staging_change(owner: str, job: "staging.StagingJob") -> None:
             name, path, size, kind, sha = job.name, job.remote_path, job.size, job.kind, job.sha256 or None
         if _AUTH_ENABLED and job.user_id:
             try:
-                auth_routes.record_dataset(job.user_id, name, path, size, kind, sha256=sha)
+                auth_routes.record_dataset(job.user_id, name, path, size, kind, sha256=sha,
+                                           dataset_uuid=upload_storage.remote_identity(job.remote_path))
             except Exception as exc:  # noqa: BLE001 - history is best-effort
                 print(f"[auth] record_dataset failed: {exc}")
     elif job.state == "failed":
@@ -3126,9 +3158,9 @@ def _discard_leftovers(owner: str, job: "staging.StagingJob") -> None:
 
 def _settled_keep_seconds() -> float:
     try:
-        days = float(os.environ.get("AISCIENTIST_UPLOAD_KEEP_SETTLED_DAYS", "") or 7)
+        days = float(os.environ.get("AISCIENTIST_UPLOAD_KEEP_SETTLED_DAYS", "") or upload_storage.ttl_seconds() / 86400)
     except ValueError:
-        days = 7.0
+        days = upload_storage.ttl_seconds() / 86400
     return max(0.0, days) * 86400
 
 
@@ -3191,6 +3223,13 @@ def _finish_staged_folder(owner: str, folder: str) -> dict | None:
             return None
         sent = {j.remote_path: j.size for j in jobs}     # a file handed over twice is one file
         size, count = kept_size + sum(sent.values()), kept_count + len(sent)
+        if conns and upload_storage.enabled(conns[0]):
+            manifest = upload_storage.session(conns[0], folder).get("files")
+            if manifest is not None:
+                actual = {j.remote_path.split("/original/", 1)[-1]: j.size for j in jobs}
+                if actual != {str(rel): int(length) for rel, length in manifest}:
+                    raise ValueError("Folder is incomplete or sizes do not match the manifest")
+            _publish_remote(conns[0], folder)
         q.store.update_folder(folder, recorded=True, size=size, count=count)
         upload_log.record(_upload_workspace(owner), "folder_recorded", folder=folder, count=count,
                           size=size, added=len(sent) if kept_count else None,
@@ -3201,14 +3240,15 @@ def _finish_staged_folder(owner: str, folder: str) -> dict | None:
     for c in conns:
         c.emit("success", "upload", said)
     if conns:
-        shutil.rmtree(conns[0].workspace / "uploads" / folder, ignore_errors=True)
+        shutil.rmtree(upload_storage.uploads(conns[0]) / folder, ignore_errors=True)
     user_id = meta.get("user_id")
     if _AUTH_ENABLED and user_id:
         try:
-            auth_routes.record_folder_dataset(user_id, folder, meta["remote_root"], size)
+            auth_routes.record_folder_dataset(user_id, meta.get("original_name") or folder, meta["remote_root"], size,
+                                             dataset_uuid=upload_storage.remote_identity(meta["remote_root"]))
         except Exception as exc:  # noqa: BLE001 - history is best-effort
             print(f"[auth] record_dataset (folder) failed: {exc}")
-    return {"name": folder, "path": meta["remote_root"], "size": size, "count": count,
+    return {"name": meta.get("original_name") or folder, "path": meta["remote_root"], "size": size, "count": count,
             **({"kept": kept_count} if kept_count else {})}
 
 
@@ -3236,7 +3276,14 @@ def _submit_staging(conn: Connection, local: Path, rel: str, *, name: str, kind:
     held = queue.find_upload(upload_id) if upload_id else None
     if held is not None and held.state in staging.ACTIVE and held.local_path == str(local):
         return held
-    job = staging.new_job(owner=conn.owner, local_path=str(local), remote_path=f"{_hpc_uploads_dir(conn)}/{rel}",
+    remote_path = f"{_hpc_uploads_dir(conn)}/{rel}"
+    if upload_storage.enabled(conn):
+        identifier = folder or local.parent.name
+        from uuid import UUID
+        identifier = str(UUID(identifier))
+        nested = rel.split("/", 1)[1] if "/" in rel else local.name
+        remote_path = f"{_hpc_uploads_dir(conn)}/temp/{identifier}/original/{nested}"
+    job = staging.new_job(owner=conn.owner, local_path=str(local), remote_path=remote_path,
                           name=name, size=local.stat().st_size, kind=kind, folder=folder,
                           user_id=conn.app_user_id, peek=peek, hpc_user=_hpc_user(conn),
                           upload_id=upload_id, client_sha256=(client_sha256 or "").strip().lower(),
@@ -3342,7 +3389,7 @@ def _folder_listing(conn: Connection, folder: str) -> "dict[str, int] | None":
     """Path below the folder -> size, for every file in the user's upload folder ``folder``. None
     when it cannot be read, is not a folder, or holds more files than are compared."""
     if not _uploads_on_hpc(conn):
-        root = conn.workspace / "uploads" / folder
+        root = upload_storage.uploads(conn) / folder
         if not root.is_dir():
             return None
         found: dict[str, int] = {}
@@ -3418,7 +3465,13 @@ def _reserve_upload_folder(conn: Connection, raw: str, files: Any) -> dict:
     :func:`safe_relpath` keeps, because the browser sends the name back in every file's path and it
     is cleaned again there: ``data (1)`` came back as ``data1``, a folder nobody had reserved, and
     every file of a second ``data`` folder was refused. Looks at HPC3: call via a thread."""
-    uploads = conn.workspace / "uploads"
+    uploads = upload_storage.uploads(conn)
+    if upload_storage.enabled(conn):
+        upload_storage.expire_sessions(conn)
+        chosen = _chosen_files(files)
+        if files is not None and chosen is None:
+            raise ValueError("invalid folder manifest")
+        return upload_storage.reserve(conn, raw, chosen)
     on_hpc = _uploads_on_hpc(conn)
     chosen = _chosen_files(files)
     looked = 0
@@ -3548,7 +3601,8 @@ async def _admit_bound_paths(conn: Connection, bound: "list[dict]",
         root = sd.root_of(path, roots) if roots else None
         if root is None:
             try:
-                inside_own = Path(path).resolve().is_relative_to(own)
+                inside_own = (Path(path).resolve().is_relative_to(own)
+                              or _describable_path(conn, path) is not None)
             except OSError:
                 inside_own = False
             if _AUTH_ENABLED and not inside_own:
@@ -3833,9 +3887,17 @@ def _describable_path(conn: Connection, path: str) -> "str | None":
         return None if ".." in path.split("/") else path
     try:
         resolved = Path(path).resolve()
-        uploads = (conn.workspace / "uploads").resolve()
+        uploads = (upload_storage.uploads(conn)).resolve()
     except (OSError, RuntimeError, ValueError):   # ValueError: a NUL byte in the path
         return None
+    if _AUTH_ENABLED and conn.app_user_id and dataset_storage.managed_uuid(resolved):
+        from .db import session_scope
+        from .models import Dataset
+        with session_scope() as session:
+            for row in session.query(Dataset).filter(Dataset.user_id == conn.app_user_id):
+                registered = Path(row.path).resolve()
+                if resolved == registered or (registered.is_dir() and resolved.is_relative_to(registered)):
+                    return str(resolved)
     if resolved.is_relative_to(uploads) or sd.root_of(resolved, sd.server_data_roots()) is not None:
         return str(resolved)
     return None
@@ -4808,7 +4870,7 @@ async def upload_dataset(
     files are NOT recorded as individual datasets — the folder is registered once via
     /api/upload/register-folder after all its files land."""
     conn = _owned_conn(connection_id, request)
-    dest_dir = conn.workspace / "uploads"
+    dest_dir = upload_storage.uploads(conn)
     dest_dir.mkdir(parents=True, exist_ok=True)
     safe_rel = safe_relpath(rel_path) if rel_path else ""
     if safe_rel:
@@ -4817,14 +4879,26 @@ async def upload_dataset(
         name = dest.name
     else:
         # Never overwrite an existing upload of the same name — uniquify instead.
-        name = await asyncio.to_thread(_unique_upload_name, conn, dest_dir, safe_filename(file.filename or "dataset"))
+        name = safe_filename(file.filename or "dataset")
+        if upload_storage.enabled(conn):
+            identifier = str(uuid4())
+            dest_dir = dest_dir / identifier
+            dest_dir.mkdir(parents=True)
+        else:
+            name = await asyncio.to_thread(_unique_upload_name, conn, dest_dir, name)
         dest = dest_dir / name
     try:
         with open(dest, "wb") as out:
             await asyncio.to_thread(shutil.copyfileobj, file.file, out)
+    except BaseException:
+        dest.unlink(missing_ok=True)
+        raise
     finally:
         await file.close()
     size = dest.stat().st_size
+    if upload_storage.enabled(conn) and not safe_rel and not _uploads_on_hpc(conn):
+        published = dataset_storage.publish_dataset(dest.parent, identifier)
+        dest = published / name
     recorded_path = str(dest)
     peek: "dict | None" = None
     if safe_rel:  # a folder file: copied to HPC3 too (preserving nesting); registered by register-folder
@@ -4838,7 +4912,7 @@ async def upload_dataset(
         peek = await asyncio.to_thread(_peek_local_upload, dest)
         if _uploads_on_hpc(conn):
             # The queue records the dataset and announces it once the copy is verified.
-            job = _submit_staging(conn, dest, name, name=name, kind=_file_kind(name), peek=peek, unpack=unpack)
+            job = _submit_staging(conn, dest, f"{identifier}/{name}" if upload_storage.enabled(conn) else name, name=name, kind=_file_kind(name), peek=peek, unpack=unpack)
             job = await _await_staging(conn, job) or job
             return _staging_response(job, rel_path="", peek=peek)
         gist = (peek or {}).get("gist") or ""
@@ -4866,10 +4940,40 @@ async def reserve_folder(payload: dict, request: Request) -> JSONResponse:
     raw = safe_relpath(payload.get("name", "")).split("/")[0]
     if not raw:
         return JSONResponse({"error": "bad folder name"}, status_code=400)
-    (conn.workspace / "uploads").mkdir(parents=True, exist_ok=True)
+    (upload_storage.uploads(conn)).mkdir(parents=True, exist_ok=True)
     files = payload.get("files")
     try:
-        got = await asyncio.to_thread(_reserve_upload_folder, conn, raw, files)
+        saved = str(payload.get("folder") or "")
+        if upload_storage.enabled(conn) and saved:
+            try:
+                upload_storage.expire_sessions(conn)
+                meta = upload_storage.session(conn, saved)
+                chosen = _chosen_files(files)
+                if chosen != [tuple(item) for item in (meta.get("files") or [])]:
+                    raise ValueError("Folder manifest changed")
+                have = []
+                remote_done = {j.remote_path.split("/original/", 1)[-1]: j.size
+                               for j in _staging_queue(conn).jobs(saved) if j.state == "done"} if _uploads_on_hpc(conn) else {}
+                for index, (rel, size) in enumerate(chosen or []):
+                    target = upload_storage.uploads(conn) / saved / rel
+                    published = dataset_storage.dataset_dir(saved) / "original" / rel
+                    if ((target.is_file() and target.stat().st_size == size)
+                            or (published.is_file() and published.stat().st_size == size)
+                            or remote_done.get(rel) == size):
+                        have.append(index)
+                got = {"folder": saved, "merged": True, "have": have}
+            except FileNotFoundError:
+                got = upload_storage.reserve(conn, str(payload.get("name") or raw)[:255], _chosen_files(files))
+        elif upload_storage.enabled(conn):
+            chosen = _chosen_files(files)
+            if files is not None and chosen is None:
+                raise ValueError("invalid folder manifest")
+            upload_storage.expire_sessions(conn)
+            got = upload_storage.reserve(conn, str(payload.get("name") or raw)[:255], chosen)
+        else:
+            got = await asyncio.to_thread(_reserve_upload_folder, conn, raw, files)
+    except ValueError as exc:
+        return JSONResponse({"error": str(exc)}, status_code=400)
     except _FolderBusy as busy:
         upload_log.record(conn.workspace, "refused", folder=str(busy),
                           error="the same folder is still being copied to HPC3")
@@ -4898,8 +5002,22 @@ async def register_folder(payload: dict, request: Request) -> JSONResponse:
     folder = safe_relpath(payload.get("folder", "")).split("/")[0]
     if not folder:
         return JSONResponse({"error": "bad folder name"}, status_code=400)
-    root = (conn.workspace / "uploads" / folder).resolve()
-    uploads_root = (conn.workspace / "uploads").resolve()
+    if upload_storage.enabled(conn) and not _uploads_on_hpc(conn):
+        try:
+            result = await asyncio.to_thread(upload_storage.publish, conn, folder, int(payload.get("count") or 0))
+            if _AUTH_ENABLED and conn.app_user_id:
+                auth_routes.record_folder_dataset(conn.app_user_id, result["name"], result["path"], result["size"])
+            return JSONResponse({"status": "registered", **result})
+        except (OSError, ValueError) as exc:
+            return JSONResponse({"error": str(exc)}, status_code=409)
+    if upload_storage.enabled(conn) and _uploads_on_hpc(conn):
+        recorded = _staging_queue(conn).store.folder(folder)
+        if recorded.get("recorded"):
+            return JSONResponse({"status": "registered", "name": recorded.get("original_name") or folder,
+                                 "path": recorded["remote_root"], "size": recorded["size"],
+                                 "count": recorded["count"], "kind": "folder"})
+    root = (upload_storage.uploads(conn) / folder).resolve()
+    uploads_root = (upload_storage.uploads(conn)).resolve()
     if not str(root).startswith(str(uploads_root)) or not root.is_dir():
         return JSONResponse({"error": "folder not found"}, status_code=404)
     try:
@@ -4911,8 +5029,11 @@ async def register_folder(payload: dict, request: Request) -> JSONResponse:
         # Its files are being copied in the background: the folder becomes one dataset when the
         # last copy is verified, whether that is now or later (see _finish_staged_folder).
         q = _staging_queue(conn)
-        remote_root = f"{_hpc_uploads_dir(conn)}/{folder}"
-        q.store.register_folder(folder, remote_root=remote_root, user_id=conn.app_user_id, count=expected)
+        remote_root = (f"{_hpc_uploads_dir(conn)}/datasets/{folder}/original" if upload_storage.enabled(conn)
+                       else f"{_hpc_uploads_dir(conn)}/{folder}")
+        original_name = upload_storage.session(conn, folder)["original_name"] if upload_storage.enabled(conn) else folder
+        q.store.register_folder(folder, remote_root=remote_root, user_id=conn.app_user_id, count=expected,
+                                original_name=original_name)
         upload_log.record(conn.workspace, "folder_registered", folder=folder, count=expected,
                           handed_over=len(q.jobs(folder)))
         done = await asyncio.to_thread(_finish_staged_folder, conn.owner, folder)
@@ -5070,7 +5191,7 @@ def _safe_token(value: str, fallback: str = "upload") -> str:
 
 
 def _upload_part_path(conn: Connection, upload_id: str) -> Path:
-    parts = conn.workspace / "uploads" / ".parts"
+    parts = upload_storage.uploads(conn) / ".parts"
     parts.mkdir(parents=True, exist_ok=True)
     return parts / f"{_safe_token(upload_id)}.part"
 
@@ -5168,10 +5289,18 @@ async def upload_chunk(
         return JSONResponse({"status": "partial", "received": received})
     # finalize: atomic rename of the .part into the uploads dir — under a free name, never over an
     # earlier upload (which, with staging, may be a file still being copied)
-    uploads_dir = conn.workspace / "uploads"
-    safe = await asyncio.to_thread(_unique_upload_name, conn, uploads_dir, safe_filename(name or "dataset"))
+    uploads_dir = upload_storage.uploads(conn)
+    safe = safe_filename(name or "dataset")
+    if upload_storage.enabled(conn):
+        identifier = str(uuid4())
+        uploads_dir = uploads_dir / identifier
+        uploads_dir.mkdir(parents=True)
+    else:
+        safe = await asyncio.to_thread(_unique_upload_name, conn, uploads_dir, safe)
     dest = uploads_dir / safe
     part.replace(dest)
+    if upload_storage.enabled(conn) and not _uploads_on_hpc(conn):
+        dest = dataset_storage.publish_dataset(dest.parent, identifier) / safe
     size = dest.stat().st_size
     recorded_path = str(dest)
     peek = await asyncio.to_thread(_peek_local_upload, dest)   # skim locally before any staging
@@ -5266,6 +5395,31 @@ async def upload_staging_cancel(payload: dict, request: Request) -> JSONResponse
     conn = _owned_conn(payload.get("connection_id"), request)
     q = _staging_queue(conn)
     folder = safe_relpath(str(payload.get("folder") or "")).split("/")[0]
+    if folder and upload_storage.enabled(conn) and payload.get("discard_upload"):
+        try:
+            upload_storage.session(conn, folder)  # UUID and ownership validated
+            if q.store.folder(folder).get("recorded"):
+                raise ValueError("Upload already completed; delete it from Datasets")
+            q.store.update_folder(folder, registered=False, cancelled=True)
+            for job in q.jobs(folder):
+                if job.state in staging.ACTIVE:
+                    q.cancel(job.id)
+            for job in q.jobs(folder):
+                settled = await asyncio.to_thread(q.wait, job.id, 5)
+                if settled is None or settled.state in staging.ACTIVE:
+                    raise OSError("A copy is still closing; retry cancellation")
+            if _uploads_on_hpc(conn):
+                remote = f"{_hpc_uploads_dir(conn)}/temp/{folder}"
+                result = await asyncio.to_thread(conn.executor.exec, f"rm -rf -- {shlex.quote(remote)}")
+                if not result.ok:
+                    raise OSError(result.stderr or "Remote cancellation cleanup failed")
+            await asyncio.to_thread(upload_storage.cancel, conn, folder)
+            for job in q.jobs(folder):
+                q.forget(job.id)
+            q.store.delete_folder(folder)
+            return JSONResponse({"status": "cancelled", "job_ids": []})
+        except (OSError, ValueError) as exc:
+            return JSONResponse({"error": str(exc)}, status_code=409)
     ids = [str(payload.get("job_id") or "")] if not folder else \
         [j.id for j in q.jobs(folder) if j.state in staging.ACTIVE]
     stopped = [i for i in ids if i and q.cancel(i)]
@@ -5400,40 +5554,46 @@ async def delete_dataset(payload: dict, request: Request) -> JSONResponse:
         dataset_id = int(payload.get("id"))
     except (TypeError, ValueError):
         return JSONResponse({"error": "bad dataset id"}, status_code=400)
-    stored = auth_routes.delete_dataset_record(user.id, dataset_id)
+    conn = _active_conn_for_user(user)
+
+    def remove(stored: str) -> None:
+        from . import server_data as sd
+        if sd.root_of(stored, sd.server_data_roots()) is not None:
+            return  # A bound lab path is a reference; it is never owned by this upload.
+        target = Path(stored)
+        managed = dataset_storage.data_root() / "datasets"
+        if target.resolve().is_relative_to(managed.resolve()):
+            dataset_storage.remove_managed_dataset(target)
+            return
+        uploads_root = (CONSOLE_RUNS_DIR / safe_name(user.username) / "uploads").resolve()
+        if conn is not None and _is_remote_dataset(conn, stored):
+            from posixpath import normpath
+            normalized = normpath(stored)
+            if normalized != stored or not any(normalized.startswith(base.rstrip("/") + "/")
+                                                for base in _hpc_uploads_dirs(conn)):
+                raise ValueError("Refusing to delete outside your upload storage")
+            identity = upload_storage.remote_identity(stored)
+            deletion_path = (stored.split(f"/datasets/{identity}/", 1)[0] + f"/datasets/{identity}"
+                             if identity and f"/datasets/{identity}/" in stored else stored)
+            result = conn.executor.exec(f"rm -rf -- {shlex.quote(deletion_path)}")
+            if not result.ok:
+                raise OSError(result.stderr or "Remote deletion failed")
+            return
+        resolved = target.resolve()
+        if resolved == uploads_root or not resolved.is_relative_to(uploads_root) or target.is_symlink():
+            raise ValueError("Refusing to delete outside your upload storage; connect to HPC3 for remote data")
+        if target.is_dir():
+            shutil.rmtree(target)
+        else:
+            target.unlink(missing_ok=True)
+
+    try:
+        stored = await asyncio.to_thread(auth_routes.delete_dataset_record, user.id, dataset_id,
+                                        delete_files=remove)
+    except (OSError, ValueError) as exc:
+        return JSONResponse({"error": f"Dataset deletion failed: {exc}"}, status_code=409)
     if stored is None:
         return JSONResponse({"error": "Dataset not found."}, status_code=404)
-    conn = _active_conn_for_user(user)
-    from . import server_data as sd
-    server_root = sd.root_of(stored, sd.server_data_roots())
-    if server_root is not None:
-        # A bound server path: the server's data is the lab's, never deleted from here. Only this
-        # session's HPC3 copy goes (another bound folder that shares files re-copies them next run).
-        if conn is not None and conn.executor is not None:
-            mirror = sd.mirror_dir(_session_mirror_base(conn), server_root, Path(stored).resolve())
-            if mirror.startswith(f"{_session_mirror_base(conn)}/"):
-                try:
-                    await asyncio.to_thread(conn.executor.exec, f"rm -rf {shlex.quote(mirror)}")
-                except Exception as exc:  # noqa: BLE001 - the history row is already removed
-                    print(f"[datasets] could not rm HPC3 copy {mirror}: {exc}")
-        return JSONResponse({"ok": True, "deleted": dataset_id})
-    if conn is not None and _is_remote_dataset(conn, stored):
-        # Dataset lives on HPC3 dfs3b — remove it over the user's SSH session, strictly scoped
-        # to their own uploads dir (never rm outside it). Best-effort: if no live session, the
-        # row is gone and the file can be cleaned from the HPC3 storage panel.
-        if any(stored.startswith(base + "/") for base in _hpc_uploads_dirs(conn)):
-            try:                                                   # -rf: also removes folder datasets
-                await asyncio.to_thread(conn.executor.exec, f"rm -rf {shlex.quote(stored)}")
-            except Exception as exc:  # noqa: BLE001 - history row already removed
-                print(f"[datasets] could not rm remote {stored}: {exc}")
-    else:
-        uploads_root = (CONSOLE_RUNS_DIR / safe_name(user.username) / "uploads").resolve()
-        try:
-            target = Path(stored).resolve()
-            if target.is_relative_to(uploads_root) and target.is_file():
-                target.unlink()
-        except OSError as exc:  # row is already gone; a stuck file is logged, not fatal
-            print(f"[datasets] could not unlink {stored}: {exc}")
     return JSONResponse({"ok": True, "deleted": dataset_id})
 
 
@@ -7553,7 +7713,7 @@ async def _build_code_executor(conn: Connection, run: "RunState | None", run_id:
             artifacts_dir=str(art),
             # Expose the WHOLE per-user uploads tree so run_code can reach every uploaded
             # file/folder — incl. folders added after the primary dataset was chosen.
-            uploads_dir=str(conn.workspace / "uploads"),
+            uploads_dir=str(upload_storage.uploads(conn)),
             dataset_root=decisions.get("dataset_root"),
             # The other bound files (a reference atlas, a BED panel) by name and role.
             inputs=_local_inputs(decisions),
@@ -7922,6 +8082,18 @@ def _expire_old_checkpoints(runs_root: Path, ttl_days: int, *, now: float | None
         except OSError:
             continue
     return removed
+
+
+async def _upload_gc_loop() -> None:
+    while True:
+        try:
+            await asyncio.to_thread(upload_storage.expire_all)
+            for conn in list(CONNECTIONS.values()):
+                if _uploads_on_hpc(conn):
+                    await asyncio.to_thread(_expire_settled, conn)
+        except Exception as exc:  # housekeeping retries next pass
+            print(f"[gc] upload sweep failed: {exc}")
+        await asyncio.sleep(min(300, upload_storage.ttl_seconds()))
 
 
 async def _checkpoint_gc_loop() -> None:
