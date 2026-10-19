@@ -132,9 +132,16 @@ class Run(Base):
             "id": self.id, "run_id": self.run_id, "question": self.question, "status": self.status,
             "plan_mode": self.plan_mode, "dataset_id": self.dataset_id,
             "conversation_id": self.conversation_id,
+            "compute_usage": self.compute_usage(),
             "created_at": self.created_at.isoformat() if self.created_at else None,
             "finished_at": self.finished_at.isoformat() if self.finished_at else None,
         }
+
+
+    def compute_usage(self) -> dict:
+        from .estimates import run_usage
+
+        return run_usage(self.run_id)
 
 
 class Conversation(Base):
@@ -250,3 +257,25 @@ class LlmCall(Base):
             "max_tokens": self.max_tokens, "duration_ms": self.duration_ms,
             "created_at": self.created_at.isoformat() if self.created_at else None,
         }
+
+
+class ComputeUsage(Base):
+    """Measured tool calls, including failed/cancelled calls; no dataset contents."""
+
+    __tablename__ = "compute_usage"
+    id: Mapped[int] = mapped_column(primary_key=True)
+    run_id: Mapped[str] = mapped_column(String(32), index=True)
+    skill: Mapped[str] = mapped_column(String(128), index=True)
+    units: Mapped[float] = mapped_column(Float)
+    seconds: Mapped[float] = mapped_column(Float)
+    cpu_hours: Mapped[float] = mapped_column(Float)
+    gpu_hours: Mapped[float] = mapped_column(Float)
+    cost: Mapped[float] = mapped_column(Float)
+    source: Mapped[str] = mapped_column(String(32))
+    success: Mapped[bool] = mapped_column(Boolean)
+
+
+class ComputeEstimate(Base):
+    __tablename__ = "compute_estimates"
+    run_id: Mapped[str] = mapped_column(String(32), primary_key=True)
+    payload: Mapped[str] = mapped_column(Text)

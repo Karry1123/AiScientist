@@ -9,7 +9,6 @@ import os
 import re
 import shlex
 import shutil
-import subprocess
 import threading
 import time
 import traceback
@@ -17,7 +16,7 @@ import zipfile
 from datetime import datetime, timezone
 from pathlib import Path, PurePosixPath
 from types import SimpleNamespace
-from typing import Any, Callable, NamedTuple
+from typing import TYPE_CHECKING, Any, Callable, NamedTuple
 from uuid import uuid4
 
 from fastapi import FastAPI, File, Form, Request, UploadFile, WebSocket, WebSocketDisconnect
@@ -52,6 +51,10 @@ load_project_env(ROOT)
 # On eyeserver set AISCIENTIST_RESULTS_DIR=/data/aiscientist (the big /data disk, not
 # /home). Defaults to runs/console for local development.
 CONSOLE_RUNS_DIR = Path(os.environ.get("AISCIENTIST_RESULTS_DIR") or (ROOT / "runs" / "console")).resolve()
+
+
+if TYPE_CHECKING:
+    from ..agents.research_lab import ResumeState
 
 
 def safe_name(value: str) -> str:
@@ -604,6 +607,8 @@ class Connection:
             s["run_complete"] = payload
             if payload.get("run_id"):
                 s["run_id"] = payload["run_id"]
+        elif t == "run_usage":
+            s["run_usage"] = payload
         elif t == "run_status":
             s["status_label"] = payload.get("text", "")
 
@@ -644,6 +649,8 @@ class Connection:
             out.append(s["artifacts"])
         if s.get("run_complete"):
             out.append(s["run_complete"])
+        if s.get("run_usage"):
+            out.append(s["run_usage"])
         # Every replayed event names its conversation, so a client demuxes a replay exactly like
         # the live events that follow it.
         tag = {k: s[k] for k in ("run_id", "conversation_id") if s.get(k)}
@@ -2086,7 +2093,7 @@ async def update_llm_credential(cred_id: str, req: LLMCredentialUpdate,
 async def verify_llm_credential(cred_id: str, request: Request, user: str = "") -> JSONResponse:
     """Re-test a saved credential against its endpoint. Used by the UI to show which keys still
     work (a key can stop working with no local change at all — revoked, or out of credit)."""
-    from . import llm_credentials, llm_providers
+    from . import llm_credentials
 
     owner = _cred_owner(request, user)
     row = llm_credentials.get_credential(owner, cred_id)
@@ -8737,8 +8744,10 @@ async def _run_lab(conn: Connection, req: LabRequest, *,
         if getattr(report_render_fn, "remote", None) is not None:
             emit("info", "lab", "Report rendering runs on HPC3 (CPU Slurm, pandoc/xelatex).")
         literature_executor = _build_literature_executor(conn)
+        from .estimates import estimate_plan, instrument_catalog, run_usage, save_estimate
+
         scientist = ResearchHarness(
-            catalog=_session_roster(
+            catalog=instrument_catalog(_session_roster(
                 conn,
                 build_scientist_catalog(code_executor=code_executor, scgpt_runner=scgpt_runner,
                                         analysis_executor=analysis_executor,
@@ -8746,7 +8755,7 @@ async def _run_lab(conn: Connection, req: LabRequest, *,
                                         phenotype_executor=phenotype_executor,
                                         literature_executor=literature_executor,
                                         hpc_shell=_build_hpc_shell(conn, run)),
-                literature_executor, emit),
+                literature_executor, emit), run_id, conn.settings),
             chat_fn=scientist_chat,
             count_tokens_fn=count_tokens,   # exact server-side window sensing (vLLM /tokenize)
         )
@@ -8913,6 +8922,7 @@ async def _run_lab(conn: Connection, req: LabRequest, *,
                         emit(str(payload.get("level") or "info"), "lab", text[:700])
             t = ev.get("type")
             if t == "pi_agenda":
+                save_estimate(run_id, estimate_plan(list(ev["agenda"]), scientist.catalog, decisions, conn.settings))
                 emit("step", "lab", "PI agenda: " + " | ".join(ev["agenda"]))
             elif t == "scientist_start":
                 emit("step", "lab", f"{ev.get('specialist', 'Scientist')}: {ev['step']}")
@@ -8959,7 +8969,11 @@ async def _run_lab(conn: Connection, req: LabRequest, *,
                 conn.push({"type": "plan_clarify", "questions": payload})
                 emit("step", "lab", "The PI needs a quick decision — pick an option or type your own.")
             else:
+                estimate = estimate_plan(list(payload), scientist.catalog, decisions, conn.settings)
+                save_estimate(run_id, estimate)
+                conn.pending_plan["estimate"] = estimate
                 conn.push({"type": "plan_prompt", "agenda": list(payload),
+                           "plan": {"estimate": estimate},
                            "revised": list(run_flags["plan_revised"])})
                 emit("step", "lab", "Plan ready — Run it, or tell the PI what to change in chat.")
             # Reviewing a plan is READING — a 15-step methods section, in a second language for most
@@ -9460,6 +9474,11 @@ async def _run_lab(conn: Connection, req: LabRequest, *,
         conn.push({"type": "chat_error", "message": str(exc)})
         _finish_run_record(conn, locals().get("run_id"), "error", None, str(exc))
     finally:
+        if "run_usage" in locals() and "run_id" in locals():
+            try:
+                conn.push({"type": "run_usage", "run_id": run_id, **run_usage(run_id)})
+            except Exception as exc:  # usage reporting must not prevent run cleanup
+                print(f"[lab] compute usage unavailable: {exc}")
         run.running = False
         # Close the run scope so a post-run WS reconnect doesn't see a stale pending plan; the run
         # stays in conn.runs so a late approve/cancel that names it resolves to a no-op.
@@ -10381,9 +10400,9 @@ def _dataset_section(art: Path, result: Any = None) -> str:
             lines += ["", f"**Cells per `{dba.get('label_column')}` per arm.**", ""]
             lines.append("| label | " + " | ".join(arms) + " | testable (≥30 in each arm) |")
             lines.append("|---|" + "|".join("---:" for _ in arms) + "|:---:|")
-            for l, per in lab.items():
+            for label, per in lab.items():
                 ok = all(per.get(a, 0) >= 30 for a in arms)
-                lines.append(f"| {l} | " + " | ".join(f"{per.get(a, 0):,}" for a in arms)
+                lines.append(f"| {label} | " + " | ".join(f"{per.get(a, 0):,}" for a in arms)
                              + f" | {'yes' if ok else 'no'} |")
         if dba.get("depth_imbalance"):
             lines += ["", f"**Depth check.** {dba['depth_imbalance']}"]
@@ -10567,7 +10586,8 @@ def _claim_audit_section(result: Any) -> str:
     for c in claims:
         failed = "; ".join(f"{n}: {r.get('reason', '')}" for n, r in (c.get("checks") or {}).items()
                            if r.get("verdict") == "fail") or "none"
-        cell = lambda s: str(s).replace("|", "\\|").replace("\n", " ")
+        def cell(s):
+            return str(s).replace("|", "\\|").replace("\n", " ")
         rows.append(f"| {cell(c.get('claim', ''))} | {label.get(c.get('status'), c.get('status'))} | {cell(failed)} |")
     return ("## Claim audit\n\nEach candidate headline finding was checked separately before the report was "
             "written; the manuscript leads only with the robust ones.\n\n" + "\n".join(rows) + "\n")
@@ -12246,7 +12266,8 @@ async def ws_endpoint(websocket: WebSocket, connection_id: str) -> None:
                 await websocket.send_json(_run.tag({"type": "decision_prompt",
                                                     "goal": _dp.get("goal", ""), "options": _dp.get("options", [])}))
             elif isinstance(_pp, dict):
-                await websocket.send_json(_run.tag({"type": "plan_prompt", "agenda": _pp.get("payload")}))
+                await websocket.send_json(_run.tag({"type": "plan_prompt", "agenda": _pp.get("payload"),
+                                                    "plan": {"estimate": _pp.get("estimate")}}))
             # Its expiry warning, if it was given, after it, with the time actually left.
             _expires = _pp.get("expires_at") if isinstance(_pp, dict) else None
             if isinstance(_expires, (int, float)):
@@ -12271,7 +12292,7 @@ async def ws_endpoint(websocket: WebSocket, connection_id: str) -> None:
 
 
 # The upload receiver stops at the complete-file handoff to the existing staging queue.
-from .tus_upload import router as tus_router
+from .tus_upload import router as tus_router  # noqa: E402 - registered after app initialization
 app.include_router(tus_router)
 
 # --- static frontend -------------------------------------------------------

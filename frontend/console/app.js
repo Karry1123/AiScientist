@@ -2873,7 +2873,7 @@ const STREAM_TYPES = new Set([
 // window's run never streams into, cancels, or shows a plan card in this one.
 const RUN_SCOPED = new Set([...STREAM_TYPES,
   "chat_start", "plan_prompt", "plan_clarify", "decision_prompt", "plan_done",
-  "plan_status", "plan_expiring",
+  "plan_status", "plan_expiring", "run_usage",
   // Context occupancy belongs to the conversation that asked, so another chat's turn never
   // rewrites this one's meter. Deliberately NOT in STREAM_TYPES: it is a standing status, not
   // part of the assistant bubble being replayed.
@@ -2932,6 +2932,13 @@ function handleRunEvent(c, msg) {
     case "run_status": streamStatus(c, msg.text); break;
     case "step_code": streamCode(c, msg.code); break;
     case "chat_context": c.ctx = msg; if (chatVisible(c)) renderContextMeter(msg); break;
+    case "run_usage":
+      if (msg.actual) {
+        pushToSession(c.sid, { role: "assistant", content: runUsageMarkdown(msg),
+          streamId: `usage:${msg.run_id || msg.stream_id || c.lastStreamId}` });
+        if (chatVisible(c)) renderChat();
+      }
+      break;
     case "chat_done": finishAssistantStream(c); setChatRunning(c, false); break;
     case "chat_stopped":
       if (c.run && !c.run.text) c.run.text = "_⏹ Stopped._";
@@ -3517,6 +3524,50 @@ function planStepHtml(text, n, step, revised, showWhere) {
     + meta + `</div></li>`;
 }
 
+function estimateNumber(value) {
+  return Number.isFinite(value) ? value.toLocaleString(undefined, { maximumFractionDigits: 3 }) : "—";
+}
+
+function estimateRange(values, time = false) {
+  if (!Array.isArray(values) || values.length !== 2 || !values.every(Number.isFinite)) return "—";
+  const divisor = time ? (values[1] >= 3600 ? 3600 : 60) : 1;
+  return `${time ? "~" : ""}${estimateNumber(values[0] / divisor)}–${estimateNumber(values[1] / divisor)}`
+    + (time ? (divisor === 3600 ? " hr" : " min") : "");
+}
+
+function estimateCell(value) {
+  return String(value == null ? "" : value).replace(/[|\r\n]/g, " ");
+}
+
+function planEstimateMarkdown(estimate) {
+  if (!estimate || !Array.isArray(estimate.steps)) return "";
+  const currency = estimateCell(estimate.currency || "USD");
+  const row = (entry, label, skill) => `| ${estimateCell(label)}${entry.rough ? " (rough)" : ""} | ${estimateCell(skill)} | `
+    + `${estimateRange(entry.seconds, true)} | ${estimateRange(entry.cpu_hours)} | ${estimateRange(entry.gpu_hours)} | `
+    + `${estimate.rates_configured ? estimateRange(entry.cost) + " " + currency : "Rates not configured"} |`;
+  return "\n\n**Estimated resources and cost**\n\n"
+    + "| Step | Skill | Time | CPU hours | GPU hours | Est. cost |\n| --- | --- | --- | --- | --- | --- |\n"
+    + estimate.steps.map((entry, i) => row(entry, entry.step || i + 1, entry.skill)).join("\n")
+    + (estimate.total ? "\n" + row(estimate.total, "Total", "") : "")
+    + "\n\nRough estimates have limited run history. "
+    + estimateCell(estimate.note || "HPC3 queue wait time is not included.") + "\n";
+}
+
+function runUsageMarkdown(msg) {
+  const actual = msg.actual;
+  const estimate = msg.estimate || {};
+  const total = estimate.total || {};
+  const cost = (value) => estimate.rates_configured
+    ? `${value} ${estimateCell(estimate.currency || "USD")}` : "Rates not configured";
+  return "**Run resources and cost**\n\n| | Estimated | Actual |\n| --- | --- | --- |\n"
+    + `| Time | ${estimateRange(total.seconds, true)} | ${estimateNumber(actual.seconds / 60)} min |\n`
+    + `| CPU hours | ${estimateRange(total.cpu_hours)} | ${estimateNumber(actual.cpu_hours)} |\n`
+    + `| GPU hours | ${estimateRange(total.gpu_hours)} | ${estimateNumber(actual.gpu_hours)} |\n`
+    + `| Cost | ${cost(estimateRange(total.cost))} | ${cost(estimateNumber(actual.cost))} |\n\n`
+    + (total.rough ? "Estimate: rough. " : "") + (actual.rough ? "Actual resource accounting: rough. " : "")
+    + "Time is summed tool compute time; model/report overhead and HPC3 queue wait time are excluded.";
+}
+
 // The whole card. Which steps the last revision touched comes from the server (it has just applied
 // the edit), so "what did my change actually do?" is answered on the card instead of by diffing two
 // plans by eye.
@@ -3542,6 +3593,7 @@ function planCardHtml(agenda, doc, revisedSteps) {
     + `<ol class="plan-steps">`
     + agenda.map((s, i) => planStepHtml(s, i + 1, docSteps[i], revised.has(i + 1), !onePlace)).join("")
     + `</ol>`
+    + renderMarkdown(planEstimateMarkdown(doc && doc.estimate))
     + planEditorHtml(doc)
     + `<div class="plan-actions-row">`
     + `<button class="primary" data-plan="approve">${planIcon("play_arrow")}Run this plan</button>`
@@ -3826,9 +3878,9 @@ async function submitPlan(action, feedback, planYaml, c = activeChat()) {
   if (!state.connectionId || !c) return;
   // The approved document is saved with the plan: it is what the run was held to.
   const plan = c.plan || {};
-  const docMd = (plan.doc && plan.doc.yaml)
+  const docMd = (plan.doc && plan.doc.estimate ? planEstimateMarkdown(plan.doc.estimate) : "") + ((plan.doc && plan.doc.yaml)
     ? "\n\n**Approved plan document**\n\n```yaml\n" + plan.doc.yaml.trim() + "\n```"
-    : "";
+    : "");
   const agendaMd = (plan.agenda && plan.agenda.length)
     ? "## 📋 Research plan\n\n" + plan.agenda.map((s, i) => `${i + 1}. ${s}`).join("\n") + docMd
     : null;

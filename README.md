@@ -80,6 +80,25 @@ python3 -m pytest        # the test suite: offline, no cluster, .env or network 
 - **Production:** a systemd unit on the lab server behind the Envoy ingress. The runbook is
   [`deploy/README.md`](deploy/README.md).
 
+## Plan resource estimates
+
+The plan panel shows time ranges, CPU/GPU hours and cost before approval, then compares
+estimated and actual tool compute after the run. Estimates with missing sizes or little
+history are marked rough. SLURM queue waits, model serving and report overhead are excluded;
+parallel steps may overlap.
+
+Set `AISCIENTIST_CPU_HOUR_RATE` and `AISCIENTIST_GPU_HOUR_RATE` in the gateway environment
+(USD per allocated hour; zero defaults mean unpriced). Tool calls, including failures, are
+recorded in the existing database; successful runs refine later estimates for the same tool.
+SLURM uses allocation accounting where available; other measurements use wall time and
+requested resources and remain rough. Run API records expose `compute_usage`.
+
+Tools may declare `resource_profile.json` beside `TOOL.md`: `unit` (`samples`, `cells`, `gb`),
+`baseline`, and `steps`, each with `name`, requested `cpus`, `gpus`, `mem_gb` and a two-value
+`minutes` range. See `src/aiscientist/tools/run_cellqc/resource_profile.json`. Dataset metadata
+supplies the sample count, cell count or GB for scaling; Cell Ranger library counts are inferred.
+Tools without profiles use rough defaults.
+
 ## Repository layout
 
 ```text

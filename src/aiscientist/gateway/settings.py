@@ -31,6 +31,9 @@ class HPCSettings:
     The served model is the AWQ Qwen3.6 HF repo (``AISCIENTIST_VLLM_MODEL``).
     """
 
+    cpu_hour_rate: float = 0.0
+    gpu_hour_rate: float = 0.0
+
     host: str = "hpc3.rcic.uci.edu"
     ssh_port: int = 22
 
@@ -478,7 +481,15 @@ class HPCSettings:
             except ValueError:
                 return default
 
+        def _rate(name: str) -> float:
+            import math
+
+            value = _float(name, 0.0)
+            return value if math.isfinite(value) and value >= 0 else 0.0
+
         return cls(
+            cpu_hour_rate=_rate("AISCIENTIST_CPU_HOUR_RATE"),
+            gpu_hour_rate=_rate("AISCIENTIST_GPU_HOUR_RATE"),
             host=os.environ.get("AISCIENTIST_HPC_HOST", cls.host),
             ssh_port=_int("AISCIENTIST_HPC_SSH_PORT", cls.ssh_port),
             # "" is a MEANINGFUL value here (= stage over the login node), so keep an explicitly

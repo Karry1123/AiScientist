@@ -324,3 +324,15 @@ def runs_on(where: str) -> list[ToolManifest]:
 
 def names(ms: Iterable[ToolManifest] | None = None) -> list[str]:
     return [m.name for m in (manifests() if ms is None else ms)]
+
+
+def resource_profile(name: str) -> dict[str, Any] | None:
+    """Optional per-tool resource_profile.json; unknown tools use the estimator fallback."""
+    import json
+
+    if not re.fullmatch(r"[a-zA-Z0-9_-]+", name):
+        return None
+    try:
+        return json.loads((TOOLS_DIR / name / "resource_profile.json").read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
