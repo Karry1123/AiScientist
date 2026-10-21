@@ -67,18 +67,23 @@ const sandbox = {
                { id: "B", title: "Other chat", messages: [] }],
     activeId: "A", connectionId: "conn", planCardEl: null, planStatusEl: null,
   },
-  PLANDRAFT_KEY: "draft", RUNOWNER_KEY: "owners", STREAMS_KEY: "streams", LASTRUN_KEY: "lastrun",
+  PLANDRAFT_KEY: "draft", RUNOWNER_KEY: "owners", STREAMS_KEY: "streams", LASTRUN_KEY: "lastrun", COMPOSER_KEY: "composer",
   localStorage: { getItem: (k) => (store.has(k) ? store.get(k) : null), setItem: (k, v) => store.set(k, String(v)),
                   removeItem: (k) => store.delete(k) },
   $: el, escapeHtml: __ESCAPE__, planIcon: () => "", absTime: () => "", relTime: () => "1m ago",
   toast: (t) => log.push("toast:" + t),
   updateComposerButton: () => log.push("composer"),
-  refreshDownloads() {}, syncPresetUI() {}, repaintWorking() {},
+  refreshDownloads() {}, syncPlaceholder() {}, repaintWorking() {},
+  renderChatUsage() {}, refreshChatUsage() {}, checkBudgetNotices() {}, onUsageUpdate() {},   // usage counter: not under test here
   mountStream: () => log.push("mount"),
   messageEl: (m) => ({ m }),
   ownerVisible: () => { const c = sandbox.activeChat(); return !!(c && c.run); },
   activeSession: () => sandbox.state.sessions.find((s) => s.id === sandbox.state.activeId) || null,
   showPlanPanel: drawn("plan"), showClarify: drawn("clarify"), showDecision: drawn("decision"),
+  // The side panel (its Plan tab) and the chat entry of an answered plan are drawn elsewhere.
+  renderPlanPanel() {}, selectSideTab() {}, openPlanPanel: () => log.push("panel:open"), drawAnsweredPlan() {},
+  wirePlanEntry() {}, planEntryHtml: () => "",
+  planSavedMessage: (p) => ({ role: "assistant", kind: "plan", content: "", plan: p }),
   setChatRunning: (c, r) => { c.running = r; },
   startAssistantStream: (c) => { c.run = { text: "", thinking: "", feed: [] }; },
   alreadyHaveRun: () => false, appendArtifacts() {},
@@ -220,7 +225,7 @@ def test_nothing_is_drawn_again_once_the_prompt_is_answered_or_the_run_is_over()
     run_over = out["runOver"]
     assert {k: run_over[k] for k in gone} == gone
     assert run_over["draft"] == "" and run_over["stored"] is False
-    assert run_over["placeholder"].startswith("Ask AiScientist to plan"), "the composer is no longer the plan's reply box"
+    assert run_over["placeholder"].startswith("Ask a question, or describe"), "the composer is no longer the plan's reply box"
 
 
 def test_an_unapplied_edit_and_the_open_editor_survive_a_redraw_of_the_same_plan():

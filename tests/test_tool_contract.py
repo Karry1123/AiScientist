@@ -21,6 +21,7 @@ SRC = ROOT / "src" / "aiscientist"
 PLATFORM_RELIES_ON = {
     "annotate_variants": "gateway/app.py: VCF staging and the variant executor",
     "deep_literature": "gateway/app.py, agents/quick_chat.py, agents/research_lab.py: literature steps",
+    "search_corpus": "agents/quick_chat.py, agents/research_lab.py, agents/registry.py: literature steps in a session with no served model",
     "extract_haploinsufficient_genes": "gateway/app.py: the corpus-scan line (route \"corpus\")",
     "inspect_dataset": "agents/research_lab.py: dataset triage steps",
     "literature_search": "gateway/app.py, agents/research_lab.py: literature steps and citations",
@@ -75,9 +76,12 @@ _TOOLISH = re.compile(r"`((?:run|make|map|annotate|diagnose|inspect|deep|literat
 def test_skills_and_pipelines_name_only_tools_and_skills_that_exist():
     from aiscientist.agents.skills import SKILLS
 
-    known = set(catalog.names()) | PLATFORM_TOOLS | set(SKILLS)
+    from aiscientist.agents.preset_pipelines import PIPELINES, _pipelines_dir
+
+    # A pipeline's own name is a legitimate thing for these documents to mention (`scgpt_annotation`
+    # is a pipeline, not a misspelt `scgpt_annotate`).
+    known = set(catalog.names()) | PLATFORM_TOOLS | set(SKILLS) | set(PIPELINES)
     bad = []
-    from aiscientist.agents.preset_pipelines import _pipelines_dir
     from aiscientist.agents.skills import _skills_dir
 
     for path in [*_skills_dir().rglob("*.md"), *_pipelines_dir().rglob("*.md")]:

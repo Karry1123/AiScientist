@@ -3,29 +3,34 @@
 A corpus-wide extraction over the PaperQA corpus (the RetiGene PDFs on dfs3b): which genes do the
 papers *explicitly* report as haploinsufficient in retinal disease, and where do they say so.
 
-Why this is not ``deep_literature``: PaperQA answers one question from the top-k retrieved
-passages and synthesises prose, so an exhaustive "every gene with this mechanism" request misses
-genes and loses the verbatim sentences a curator needs. This tool instead walks every paper:
+It is retrieval-augmented, in the same steps as ``search_corpus`` answering a question:
 
-1. **text** — re-extract each PDF page with PyMuPDF text blocks (narrow blocks left column then
-   right, full-width blocks after, running headers and footers dropped, hyphenation joined, the
-   paper cut at its References heading), ~1500-character chunks, sentences within each chunk.
-   Cached once in ``mechanism_cache/`` next to the papers (``scripts/build_mechanism_cache.py``).
-2. **candidates** — keep a sentence when it carries mechanism wording (keyword patterns), or when
-   its chunk is among the 1500 nearest, in PubMedBERT space, to one of six mechanism queries and
-   the sentence has at least a soft marker (heterozygous, dominant, allele, ...). ~3% of the corpus.
-3. **judge** — the session's served model reads each candidate with its neighbours and returns
-   JSON: gene, mechanism class, explicit/negated/human-retinal, the phenotype as written, and ONE
-   verbatim sentence. Thinking is off, output is forced to JSON, temperature 0.
-4. **verify + aggregate** — a quote is kept only if it is really in the paper; the gene symbol is
-   normalised through the HGNC table (approved symbols first, aliases flagged); reference-list
+1. **requests** — the model writes search requests from the definition: full sentences, each from
+   another angle (the mechanism's wording, the allele types, the evidence, the phenotypes), with no
+   gene named, so the genes come from the papers and not from the model.
+2. **retrieve** — PubMedBERT embeds each request and takes its nearest chunks of the corpus text
+   cache (``mechanism_cache/``, built once by ``scripts/build_mechanism_cache.py``), a few per paper
+   at most.
+3. **locate** — each retrieved chunk is read back as its paper, page and numbered sentences (the
+   text is re-extracted with PyMuPDF text blocks, column-aware, cut at the References heading).
+4. **read** — the model reads each chunk once and returns JSON: per gene whose disease mechanism a
+   sentence states, the mechanism class, explicit/negated/human-retinal, the phenotype as written,
+   and ONE verbatim sentence with its number. Thinking off, JSON output, temperature 0.
+5. **verify + aggregate** — a quote is kept only if it is a sentence of the paper; the gene symbol
+   is normalised through the HGNC table (approved symbols first, aliases flagged); reference-list
    look-alikes and garbled text are flagged, not silently dropped; one row per gene with up to
    three PMIDs and quotes, one row per judged sentence.
 
-This is the pipeline that produced the first delivery (Oct 2026: 1,739 papers, 426,706 sentences,
-14,535 candidates, 45 genes), moved into the platform unchanged in its rules. The model and the
-embedder are injectable (``judge_fn`` / ``embed_fn``) so the whole pipeline runs in the tests
-without HPC3, a GPU or network.
+Steps 1-4 run twice. Round one searches the whole corpus with the general requests, and also
+reads every chunk whose text states a dosage mechanism in words (``DOSAGE_WORDING``: the word
+haploinsufficiency, gene dosage, one functional copy, ...): the embedding of a 1,500-character
+chunk is dominated by its topic, so the requests alone found 50 of the corpus' 337 chunks that say
+"haploinsufficiency". Round two takes every gene round one read as haploinsufficient, has the model
+write one request about that gene, and searches only the chunks that name the gene, so the other
+papers stating that gene's mechanism are read as well.
+
+The model and the embedder are injectable (``judge_fn`` / ``embed_fn``) so the whole pipeline runs
+in the tests without HPC3, a GPU or network.
 """
 
 from __future__ import annotations
@@ -33,50 +38,31 @@ from __future__ import annotations
 import collections
 import csv
 import json
+import math
 import os
 import re
 import threading
 import time
+import unicodedata
 import urllib.error
 import urllib.request
+import uuid
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable, Iterable
 
+from .._lib.corpus import (  # noqa: F401 - re-exported: scripts/build_mechanism_cache.py imports them from here
+    CorpusPaths, chunk_vectors, l2 as _l2, load_chunks, read_manifest, sentence_transformer_embed)
+from .._lib.corpus import corpus_paths as _corpus_paths
 from ..sdk import HarnessTool
 
 _TOOL = "extract_haploinsufficient_genes"
 _OUT_SUBDIR = "haploinsufficiency"
-_CACHE_DIRNAME = "mechanism_cache"
-_DEFAULT_EMBEDDING = os.environ.get("AISCIENTIST_PAPERQA_EMBEDDING", "st-NeuML/pubmedbert-base-embeddings")
 
 # ---------------------------------------------------------------------------------------------
-# The definition (Jin Li, 2026-10-05) and the model's instructions — verbatim from the delivery run
+# The definition (Jin Li, 2026-10-05) and the model's instructions
 # ---------------------------------------------------------------------------------------------
-
-JUDGE_SYSTEM = """You are a careful curator of inherited retinal disease (IRD) genetics. You judge ONLY from the text given. Never use prior knowledge about any gene.
-
-DEFINITION. "Haploinsufficiency" means: a heterozygous loss-of-function allele (nonsense, frameshift, splice, whole-gene deletion, or a transcript degraded by nonsense-mediated decay) causes the disease because one functional copy is insufficient, i.e. a dominant loss-of-function / reduced-dosage mechanism. It is NOT dominant-negative, NOT gain-of-function, and NOT recessive (biallelic) loss of function.
-
-STRICT RULES.
-(1) Use "haploinsufficiency" ONLY when the text states BOTH: (a) the disease occurs with a heterozygous / monoallelic / dominant loss-of-function or null allele, AND (b) a dosage mechanism (haploinsufficiency, gene dosage, one functional copy insufficient, reduced protein level from the single remaining allele, NMD of the mutant allele in a dominant context).
-(2) NMD, truncation or loss of function described in a recessive / biallelic / compound-heterozygous / homozygous context is "recessive_lof", never haploinsufficiency.
-(3) "Dominant mutation causes X", "dominant-acting", "autosomal dominant inheritance" with no stated mechanism is "not_mechanism".
-(4) If the sentence says the mechanism is unknown, debated, or contrasts haploinsufficiency with dominant-negative without deciding, use "other" with explicit=false.
-(5) The gene symbol must appear in TARGET or CONTEXT; otherwise gene=null.
-
-TASK. Read TARGET (with CONTEXT before/after). For each gene whose disease MECHANISM is stated in the text, output one item. A sentence that only says a gene is mutated in / associated with / causes a disease, without saying HOW (dosage, one copy, dominant-negative...), is NOT a mechanism statement: use "not_mechanism".
-
-Return ONLY JSON: {"items":[{"gene": HGNC symbol as written in the text (null if the text says only 'the gene' and no symbol appears in TARGET or CONTEXT),
- "mechanism_class": one of "haploinsufficiency" | "dominant_negative" | "gain_of_function" | "recessive_lof" | "other" | "not_mechanism",
- "explicit": true if the text asserts the mechanism for this gene; false if hedged (may, might, suggests, possibly, could, consistent with, likely),
- "negated": true if the text says this mechanism is NOT / unlikely the cause for this gene,
- "human_retinal": true ONLY if the phenotype named for this gene is a human retinal or ocular disease (retinitis pigmentosa, cone-rod dystrophy, LCA, macular dystrophy, Stargardt, achromatopsia, CSNB, optic atrophy, aniridia, etc.); false if the phenotype is non-ocular (cardiomyopathy, epilepsy, cancer, syndromic non-eye features...) or the evidence is only from animal models or cell lines,
- "phenotype": disease name as written in the text or null,
- "quote": ONE complete sentence copied VERBATIM, character for character, from TARGET (or from CONTEXT only if that is where the mechanism is stated). Never paraphrase, never shorten, never merge sentences.}]}
-If the text is a reference-list entry or a cited paper title rather than a statement by the authors, set mechanism_class to "not_mechanism".
-If no gene mechanism is stated, return {"items":[]}."""
 
 DEFINITION = ("A heterozygous loss-of-function allele (nonsense, frameshift, splice, whole-gene deletion, or a "
               "transcript degraded by nonsense-mediated decay) causes the disease because one functional copy is "
@@ -86,40 +72,62 @@ DEFINITION = ("A heterozygous loss-of-function allele (nonsense, frameshift, spl
 MECHANISM_CLASSES = ("haploinsufficiency", "dominant_negative", "gain_of_function",
                      "recessive_lof", "other", "not_mechanism")
 
-# ---------------------------------------------------------------------------------------------
-# Candidate selection (filter_v2.py)
-# ---------------------------------------------------------------------------------------------
+# Step 1, round one. "{N}" is the number of requests asked for.
+REQUESTS_SYSTEM = """You are writing search requests for an embedding index (PubMedBERT) of full-text papers on inherited retinal disease. The goal is to find EVERY passage in which the authors state that a gene causes a retinal or ocular disease through haploinsufficiency.
 
-KW: dict[str, re.Pattern[str]] = {k: re.compile(v, re.I) for k, v in {
-    "haploinsuff": r"haplo-?\s?insuffici\w*",
-    "dosage": r"\b(gene |allele |protein )?dosage\b|dosage[- ]sensitiv\w*",
-    "nmd": r"nonsense[- ]mediated|\bNMD\b",
-    "het_lof": r"heterozyg\w*[^.]{0,80}\b(null|loss[- ]of[- ]function|LoF|truncat\w*|nonsense|frameshift|"
-               r"premature (stop|termination)|stop[- ]gain|whole[- ]gene deletion|deletion of the (entire|whole) gene)\b|"
-               r"\b(null|truncat\w*|nonsense|frameshift|loss[- ]of[- ]function|LoF)\b[^.]{0,80}heterozyg\w*",
-    "one_copy": r"\b(one|single|a single|only one) (functional|normal|wild[- ]type|intact|remaining) (copy|allele)\b|"
-                r"\bloss of (one|a single) (allele|copy)\b|"
-                r"\b(half|50 ?%) (of )?(the )?(normal|wild[- ]type) (level|amount|dose|expression|protein)",
-    "dom_lof": r"dominant[^.]{0,60}loss[- ]of[- ]function|loss[- ]of[- ]function[^.]{0,60}dominant",
-    "dn_gof": r"dominant[- ]negative|gain[- ]of[- ]function|\bGoF\b|\bDN\b (effect|mechanism|allele)",
-}.items()}
-SOFT = re.compile(r"heterozyg|dominant|allele|mutant|transcript|haplo|dosage|\bcopy\b|copies|LoF|loss of|null|"
-                  r"truncat|nonsense|frameshift|deletion|insufficien", re.I)
-SEMANTIC_QUERIES = (
-    "heterozygous loss-of-function variants cause the retinal disease through haploinsufficiency",
-    "a single functional copy of the gene is insufficient, so heterozygous null alleles cause dominant disease",
-    "the mutant transcript is degraded by nonsense-mediated decay, leaving reduced gene dosage",
-    "dominant retinal dystrophy caused by reduced gene dosage rather than a dominant-negative effect",
-    "whole-gene deletion in heterozygous state causes retinitis pigmentosa",
-    "the disease mechanism is haploinsufficiency as opposed to gain of function",
-)
-_SEMANTIC_TOPN = 1500
-# Per-candidate flags (pipeline_v2.sbatch): a journal citation in the sentence; extraction damage.
+DEFINITION. "Haploinsufficiency" means: a heterozygous loss-of-function allele (nonsense, frameshift, splice, whole-gene deletion, or a transcript degraded by nonsense-mediated decay) causes the disease because one functional copy is insufficient, i.e. a dominant loss-of-function / reduced-dosage mechanism. It is NOT dominant-negative, NOT gain-of-function, and NOT recessive (biallelic) loss of function.
+
+Write {N} DISTINCT requests. Each is ONE full sentence of the kind a passage of such a paper could contain (a statement, not a list of keywords), and together they cover different angles:
+- the words authors use for the mechanism: haploinsufficiency, reduced gene dosage, one functional copy is not enough, half the normal amount of protein;
+- the allele types: heterozygous nonsense, frameshift, splice-site or null alleles; heterozygous whole-gene or exon deletions and copy-number losses; a mutant transcript removed by nonsense-mediated decay in a dominant disease;
+- the evidence: patient cells or tissue with about half the normal transcript or protein; heterozygous knockout animals that reproduce the dominant human disease; incomplete penetrance or variable expressivity explained by dosage;
+- the contrast authors draw with a dominant-negative or gain-of-function effect;
+- the phenotypes: retinitis pigmentosa, cone and cone-rod dystrophy, macular dystrophy, optic atrophy, aniridia and other eye-development disorders, vitreoretinopathy, syndromes with eye involvement.
+Do NOT name any specific gene: the genes must come from the papers, not from you.
+
+Return ONLY JSON: {"requests": ["...", "..."]}"""
+
+# Step 1, round two: one request per gene round one read as haploinsufficient.
+GENE_REQUESTS_SYSTEM = """You are writing search requests for an embedding index of full-text papers on inherited retinal disease. A first search found passages that state or suggest haploinsufficiency for the genes listed below, each with the phenotype the passages gave. For EACH gene write ONE full sentence that would find the other passages about that gene's disease mechanism: name the gene, its phenotype, and heterozygous loss of function / haploinsufficiency. Use only the gene symbols and phenotypes given; add no other gene.
+
+Return ONLY JSON: {"requests": {"GENE": "sentence", "...": "..."}}"""
+
+# Used for a gene the model's reply left out (counted in the result's warnings).
+GENE_REQUEST_TEMPLATE = ("Heterozygous loss of function of {gene} causes {phenotype} through haploinsufficiency, "
+                         "because one functional copy of {gene} is not enough.")
+
+# Step 4: the model reads one located chunk.
+JUDGE_SYSTEM = """You are a careful curator of inherited retinal disease (IRD) genetics. You judge ONLY from the text given. Never use prior knowledge about any gene.
+
+DEFINITION. "Haploinsufficiency" means: a heterozygous loss-of-function allele (nonsense, frameshift, splice, whole-gene deletion, or a transcript degraded by nonsense-mediated decay) causes the disease because one functional copy is insufficient, i.e. a dominant loss-of-function / reduced-dosage mechanism. It is NOT dominant-negative, NOT gain-of-function, and NOT recessive (biallelic) loss of function.
+
+STRICT RULES.
+(1) Use "haploinsufficiency" ONLY when the text states BOTH: (a) the disease occurs with a heterozygous / monoallelic / dominant loss-of-function or null allele, AND (b) a dosage mechanism (haploinsufficiency, gene dosage, one functional copy insufficient, reduced protein level from the single remaining allele, NMD of the mutant allele in a dominant context).
+(2) NMD, truncation or loss of function described in a recessive / biallelic / compound-heterozygous / homozygous context is "recessive_lof", never haploinsufficiency.
+(3) "Dominant mutation causes X", "dominant-acting", "autosomal dominant inheritance" with no stated mechanism is "not_mechanism".
+(4) If the sentence says the mechanism is unknown, debated, or contrasts haploinsufficiency with dominant-negative without deciding, use "other" with explicit=false.
+(5) The gene symbol must appear in the PASSAGE; otherwise gene=null.
+
+TASK. The PASSAGE is a run of numbered sentences from one paper. Give one item for each gene and sentence where the sentence names the gene together with a heterozygous / dominant / monoallelic allele, gene dosage, nonsense-mediated decay, or a dominant-negative / gain-of-function effect, and classify the mechanism it states. A sentence that only says a gene is mutated in / associated with / causes a disease, without any of that, gets no item.
+
+Return ONLY JSON: {"items":[{"gene": HGNC symbol as written in the text (null if the text says only 'the gene' and no symbol appears in the PASSAGE),
+ "mechanism_class": one of "haploinsufficiency" | "dominant_negative" | "gain_of_function" | "recessive_lof" | "other" | "not_mechanism",
+ "explicit": true if the text asserts the mechanism for this gene; false if hedged (may, might, suggests, possibly, could, consistent with, likely),
+ "negated": true if the text says this mechanism is NOT / unlikely the cause for this gene,
+ "human_retinal": true ONLY if the phenotype named for this gene is a human retinal or ocular disease (retinitis pigmentosa, cone-rod dystrophy, LCA, macular dystrophy, Stargardt, achromatopsia, CSNB, optic atrophy, aniridia, etc.); false if the phenotype is non-ocular (cardiomyopathy, epilepsy, cancer, syndromic non-eye features...) or the evidence is only from animal models or cell lines,
+ "phenotype": disease name as written in the text or null,
+ "sentence": the number of the sentence the quote is,
+ "quote": that ONE complete sentence copied VERBATIM, character for character, from the PASSAGE. Never paraphrase, never shorten, never merge sentences.}]}
+If a sentence is a reference-list entry or a cited paper title rather than a statement by the authors, set mechanism_class to "not_mechanism".
+If no gene mechanism is stated, return {"items":[]}."""
+
+# Per-candidate flags: a journal citation in the sentence; extraction damage.
 CIT = re.compile(r"(\b(19|20)\d{2}\s*[;:]\s*\d+\s*[:(]\d|\bdoi\s*:|\b(19|20)\d{2}\)\s*\d+[:(])")
 GARBLED_MARK = re.compile(r"How to cite|Downloaded from|All rights reserved")
 
+
 # ---------------------------------------------------------------------------------------------
-# Aggregation (aggregate_final.py)
+# Aggregation
 # ---------------------------------------------------------------------------------------------
 
 AUTH = re.compile(r"^[A-Z][A-Za-z'-]+ [A-Z]{1,3}(,| and| &)|et al\.?,? \(?\d{4}\)?|et al\.?,? [A-Z][^.]{20,}, [A-Z][a-z]*\.?$")
@@ -130,6 +138,14 @@ MECH = re.compile(r"haplo-?\s?insuffici\w*|gene dosage|dosage[- ]sensitiv\w*|dos
                   r"reduced (level|amount|dosage) of [^,.;]{0,30}", re.I)
 DOM = re.compile(r"heterozyg|monoallelic|dominant|haplo-?\s?insuffici|dosage|"
                  r"(one|single|a single) (functional|normal|wild[- ]type|intact|remaining) (copy|allele)|\bcarriers?\b", re.I)
+# Round one also reads every chunk whose (ligature-folded) text says this: a dosage mechanism in words.
+DOSAGE_WORDING = re.compile(
+    r"haplo-?\s?insuffici\w*|gene[- ]dosage|dosage[- ]sensitiv\w*|dosage effect|reduced (?:gene )?dosage|"
+    r"half[- ]dosage|(?:one|single|a single|the remaining) (?:functional|normal|wild[- ]type|intact|working) "
+    r"(?:copy|allele)|loss of (?:one|a single) (?:copy|allele)|half (?:the |of the )?(?:normal )?(?:amount|level|dose)",
+    re.I)
+KEYWORD_REQUEST = ("every passage that states a dosage mechanism in words: haploinsufficiency, gene dosage, "
+                   "dosage sensitivity, one functional copy or allele, loss of one copy, half the normal amount")
 
 
 @dataclass
@@ -149,27 +165,34 @@ class Judgment:
     sid: str
     items: list[dict[str, Any]] | None   # None = the model call failed (retried on the next run)
     error: str = ""
+    raw: str = ""                        # the model's whole reply, kept to parse again offline
 
 
 @dataclass
-class CorpusPaths:
-    papers: Path
-    manifest: Path | None
-    cache: Path
-    cache_writable: bool
-    hgnc: Path | None
-    hf_cache: Path | None
-    notes: list[str] = field(default_factory=list)
+class Passage:
+    """A retrieved chunk, located: its paper, page and sentences, and the requests that found it."""
+    sid: str                  # "<pmid>:<chunk>"
+    pmid: str
+    chunk: int
+    page: int
+    sentences: list[Sentence]
+    found_by: list[str] = field(default_factory=list)   # "R3" = round-one request 3, "G:PRPF31"
 
 
 # ---------------------------------------------------------------------------------------------
-# 1. Text: PDF -> blocks -> chunks -> sentences (reparse_pdfs.py)
+# 1. Text: PDF -> blocks -> chunks -> sentences
 # ---------------------------------------------------------------------------------------------
 
 REFHEAD = re.compile(r"^\s*(references|reference list|bibliography|literature cited)\s*$", re.I)
 ABBR = re.compile(r"\b(et al|Fig|Figs|Dr|vs|e\.g|i\.e|cf|approx|No|Ref|Refs|Suppl)\.$", re.I)
 _SENT_SPLIT = re.compile(r"(?<=[.!?])\s+(?=[A-Z\(\[])")
 _CHUNK_CHARS = 1500
+
+
+def fold(t: str | None) -> str:
+    """NFKC: the PDF ligatures ("ﬁ" in "haploinsufﬁciency", in 62% of the corpus' sentences that use
+    the word) read as their letters; soft hyphens dropped."""
+    return unicodedata.normalize("NFKC", t or "").replace("­", "")
 
 
 def dehyph(t: str) -> str:
@@ -252,14 +275,6 @@ def chunk_sentences(pmid: str, ci: int, page: int, text: str) -> list[Sentence]:
             for si, s in enumerate(sents)]
 
 
-def read_manifest(path: Path | None) -> list[dict[str, str]]:
-    """The corpus manifest rows (``file_location``, ``title``, ``doc_id`` = PMID, ...)."""
-    if not path or not path.is_file():
-        return []
-    with path.open(encoding="utf-8", newline="") as fh:
-        return list(csv.DictReader(fh))
-
-
 def corpus_files(papers: Path, manifest: list[dict[str, str]]) -> list[tuple[str, Path]]:
     """``(pmid, pdf)`` for every paper: the manifest's order and PMIDs when there is one, else
     every PDF under ``papers`` filed under the digits in its name."""
@@ -329,104 +344,154 @@ def load_sentences(sent_path: Path, pmids: set[str] | None = None) -> list[Sente
     return out
 
 
-def load_chunks(chunk_path: Path) -> list[dict[str, Any]]:
-    with chunk_path.open(encoding="utf-8") as fh:
-        return [json.loads(line) for line in fh]
-
-
 # ---------------------------------------------------------------------------------------------
-# 2. Candidates
+# 2. Requests and retrieval
 # ---------------------------------------------------------------------------------------------
 
-def keyword_hits(text: str) -> list[str]:
-    return [k for k, rx in KW.items() if rx.search(text)]
+# A request takes at most this many chunks from one paper, so one long review cannot fill its k.
+_MAX_PER_PAPER = 3
+# Genes per round-two request-writing call.
+_GENE_BATCH = 25
 
 
-def is_garbled(text: str) -> bool:
-    return bool(GARBLED_MARK.search(text)) or len(re.findall(r"[a-z]- [a-z]", text)) >= 2
-
-
-def _l2(v: Any) -> Any:
-    import numpy as np  # noqa: PLC0415
-    v = np.asarray(v, dtype="float32")
-    n = np.linalg.norm(v, axis=-1, keepdims=True)
-    n[n == 0] = 1.0
-    return v / n
-
-
-def chunk_vectors(chunks: list[dict[str, Any]], cache_dir: Path, embed_fn: Callable[[list[str]], Any],
-                  writable: bool, log: Callable[[str], None]) -> Any:
-    """PubMedBERT vectors for every chunk (cached as ``chunk_vecs.npy`` beside the text cache)."""
-    import numpy as np  # noqa: PLC0415
-    path = cache_dir / "chunk_vecs.npy"
-    if path.exists():
-        vecs = np.load(path, mmap_mode="r")
-        if vecs.shape[0] == len(chunks):
-            return vecs
-        log(f"chunk_vecs.npy has {vecs.shape[0]} rows for {len(chunks)} chunks; re-embedding")
-    t0 = time.time()
-    parts = []
-    for i in range(0, len(chunks), 256):
-        parts.append(_l2(embed_fn([c["text"] for c in chunks[i:i + 256]])))
-        if (i // 256) % 20 == 0:
-            log(f"embedded {min(i + 256, len(chunks))}/{len(chunks)} chunks")
-    vecs = np.concatenate(parts) if parts else np.zeros((0, 1), dtype="float32")
-    log(f"embedding done in {time.time() - t0:.0f}s")
-    if writable:
+def _json_object(text: str) -> dict[str, Any] | None:
+    """The JSON object in a model reply: the reply itself, else the outermost ``{...}`` in it (a
+    model that writes a line before its JSON is still read)."""
+    text = re.sub(r"^```(json)?|```$", "", (text or "").strip(), flags=re.M).strip()
+    for cand in (text, text[text.find("{"):text.rfind("}") + 1] if "{" in text else ""):
+        if not cand:
+            continue
         try:
-            np.save(path, vecs)
-        except OSError as exc:
-            log(f"could not cache vectors: {exc}")
-    return vecs
+            data = json.loads(cand)
+        except ValueError:
+            continue
+        if isinstance(data, dict):
+            return data
+    return None
 
 
-def select_candidates(sentences: list[Sentence], chunks: list[dict[str, Any]], vecs: Any | None,
-                      embed_fn: Callable[[list[str]], Any] | None, topn: int = _SEMANTIC_TOPN,
-                      ) -> tuple[list[Sentence], dict[str, dict[str, Any]]]:
-    """The sentences the model will read, with their flags: keyword tags, semantic hit, cite_like,
-    garbled. Keyword hits, plus every sentence with a soft marker inside a chunk among the
-    ``topn`` nearest to any mechanism query."""
+def request_messages(n: int) -> list[dict[str, str]]:
+    return [{"role": "system", "content": REQUESTS_SYSTEM.replace("{N}", str(n))},
+            {"role": "user", "content": f"Write the {n} search requests."}]
+
+
+def parse_requests(text: str, n: int) -> list[str] | None:
+    """The model's round-one requests: distinct full sentences, at most ``n``. None when the reply
+    is not the JSON asked for or holds fewer than three usable requests."""
+    data = _json_object(text)
+    raw = data.get("requests") if data else None
+    if not isinstance(raw, list):
+        return None
+    out: list[str] = []
+    seen: set[str] = set()
+    for r in raw:
+        if not isinstance(r, str):
+            continue
+        r = " ".join(r.split())
+        if len(r.split()) < 4 or len(r) > 400 or r.lower() in seen:
+            continue
+        seen.add(r.lower())
+        out.append(r)
+    return out[:n] if len(out) >= min(3, n) else None
+
+
+def gene_request_messages(genes: dict[str, list[str]]) -> list[dict[str, str]]:
+    lines = [f"{g} — {'; '.join(ph[:3]) if ph else 'phenotype not given'}" for g, ph in genes.items()]
+    return [{"role": "system", "content": GENE_REQUESTS_SYSTEM}, {"role": "user", "content": "\n".join(lines)}]
+
+
+def parse_gene_requests(text: str, genes: Iterable[str]) -> dict[str, str] | None:
+    """``gene -> request`` for the genes asked about; None when the reply holds none of them."""
+    data = _json_object(text)
+    raw = data.get("requests") if data else None
+    if not isinstance(raw, dict):
+        return None
+    want = {g.upper(): g for g in genes}
+    out: dict[str, str] = {}
+    for k, v in raw.items():
+        g = want.get(str(k).strip().upper())
+        if g and isinstance(v, str) and len(v.split()) >= 4:
+            out[g] = " ".join(v.split())[:400]
+    return out or None
+
+
+def nearest_chunks(q_vec: Any, vecs: Any, chunks: list[dict[str, Any]], k: int,
+                   candidates: Iterable[int] | None = None, max_per_paper: int = _MAX_PER_PAPER) -> list[int]:
+    """The ``k`` chunks nearest one request (cosine: both sides are L2-normalised), at most
+    ``max_per_paper`` from one paper. ``candidates`` limits the search to those chunk indices."""
     import numpy as np  # noqa: PLC0415
-    flags: dict[str, dict[str, Any]] = {}
-    for s in sentences:
-        tags = keyword_hits(s.text)
-        if tags:
-            flags[s.sid] = {"kw": tags, "sem": False}
-    if vecs is not None and embed_fn is not None and len(chunks):
-        q = _l2(embed_fn(list(SEMANTIC_QUERIES)))
-        sims = np.asarray(vecs) @ q.T                      # chunks x queries
-        hot: set[tuple[str, int]] = set()
-        for j in range(sims.shape[1]):
-            for i in np.argsort(-sims[:, j])[:topn]:
-                hot.add((chunks[int(i)]["pmid"], int(chunks[int(i)]["chunk"])))
-        for s in sentences:
-            if (s.pmid, s.chunk) in hot and SOFT.search(s.text):
-                flags.setdefault(s.sid, {"kw": [], "sem": False})["sem"] = True
-    by_sid = {s.sid: s for s in sentences}
-    cands = [by_sid[sid] for sid in flags]
-    for s in cands:
-        flags[s.sid]["cite_like"] = bool(CIT.search(s.text))
-        flags[s.sid]["garbled"] = is_garbled(s.text)
-    return cands, flags
+    if candidates is None:
+        idx = None
+        scores = vecs @ q_vec
+    else:
+        idx = np.asarray(sorted(candidates), dtype=int)
+        if not len(idx):
+            return []
+        scores = vecs[idx] @ q_vec
+    out: list[int] = []
+    per_paper: dict[str, int] = {}
+    for o in np.argsort(-scores, kind="stable"):        # ties keep the corpus order
+        i = int(o) if idx is None else int(idx[o])
+        pmid = str(chunks[i]["pmid"])
+        if per_paper.get(pmid, 0) >= max_per_paper:
+            continue
+        per_paper[pmid] = per_paper.get(pmid, 0) + 1
+        out.append(i)
+        if len(out) >= k:
+            break
+    return out
+
+
+def keyword_chunks(chunks: list[dict[str, Any]]) -> list[int]:
+    """The chunks whose text states a dosage mechanism in words (``DOSAGE_WORDING``, ligatures folded),
+    in corpus order. Jin's brief asks for genes the papers report EXPLICITLY, and a request's nearest
+    chunks miss most of them: a chunk's vector is its topic, and one word of 250 barely moves it."""
+    return [i for i, c in enumerate(chunks) if DOSAGE_WORDING.search(fold(c.get("text", "")))]
+
+
+def chunks_naming(terms: dict[str, set[str]], chunks: list[dict[str, Any]]) -> dict[str, set[int]]:
+    """For each gene, the chunks that contain one of its symbols (``terms``) as a word. Case-sensitive:
+    gene symbols are written in capitals, and a lower-case word is not the gene."""
+    owner = {t: g for g, ts in terms.items() for t in ts if t}
+    out: dict[str, set[int]] = {g: set() for g in terms}
+    if not owner:
+        return out
+    rx = re.compile(r"(?<![A-Za-z0-9])(" + "|".join(re.escape(t) for t in sorted(owner, key=len, reverse=True))
+                    + r")(?![A-Za-z0-9])")
+    for i, c in enumerate(chunks):
+        for m in set(rx.findall(c.get("text", ""))):
+            out[owner[m]].add(i)
+    return out
 
 
 # ---------------------------------------------------------------------------------------------
-# 3. Judge: one bounded JSON completion per candidate (judge.py)
+# 3. Locate and read: one bounded JSON completion per retrieved chunk
 # ---------------------------------------------------------------------------------------------
 
-def judge_prompt(s: Sentence) -> list[dict[str, str]]:
-    user = (f"CONTEXT BEFORE: {s.prev or '(none)'}\nTARGET: {s.text}\nCONTEXT AFTER: {s.next or '(none)'}")
-    return [{"role": "system", "content": JUDGE_SYSTEM}, {"role": "user", "content": user}]
+def locate(found: dict[int, list[str]], chunks: list[dict[str, Any]],
+           sents_by_chunk: dict[tuple[str, int], list[Sentence]]) -> list[Passage]:
+    """The retrieved chunks as passages (paper, page, numbered sentences), in retrieval order. A
+    chunk with no sentence long enough to state anything is left out."""
+    out: list[Passage] = []
+    for i, labels in found.items():
+        c = chunks[i]
+        pmid, ci = str(c["pmid"]), int(c["chunk"])
+        sents = sents_by_chunk.get((pmid, ci), [])
+        if sents:
+            out.append(Passage(f"{pmid}:{ci}", pmid, ci, int(c.get("page") or sents[0].page), sents, list(labels)))
+    return out
+
+
+def passage_prompt(p: Passage) -> list[dict[str, str]]:
+    lines = [f"PAPER: PMID {p.pmid}, page {p.page}", "PASSAGE:"]
+    lines += [f"[{k + 1}] {s.text}" for k, s in enumerate(p.sentences)]
+    return [{"role": "system", "content": JUDGE_SYSTEM}, {"role": "user", "content": "\n".join(lines)}]
 
 
 def parse_items(text: str) -> list[dict[str, Any]] | None:
     """The model's ``items``, or None when the reply is not the JSON asked for."""
-    text = re.sub(r"^```(json)?|```$", "", text.strip(), flags=re.M).strip()
-    try:
-        data = json.loads(text)
-    except ValueError:
-        return None
-    if not isinstance(data, dict):
+    data = _json_object(text)
+    if data is None:
         return None
     items = data.get("items", [])
     if not isinstance(items, list):
@@ -434,9 +499,9 @@ def parse_items(text: str) -> list[dict[str, Any]] | None:
     return [it for it in items if isinstance(it, dict)]
 
 
-def openai_judge_fn(base_url: str, model: str, timeout: float = 180.0, max_tokens: int = 700,
+def openai_judge_fn(base_url: str, model: str, timeout: float = 180.0, max_tokens: int = 2000,
                     ) -> Callable[[list[dict[str, str]]], str]:
-    """``messages -> text`` against an OpenAI-compatible ``/v1`` (the session's vLLM Qwen):
+    """``messages -> text`` against an OpenAI-compatible ``/v1`` (the scan job's vLLM):
     thinking OFF, JSON object output, temperature 0."""
     url = base_url.rstrip("/") + "/chat/completions"
     key = os.environ.get("AISCIENTIST_LLM_API_KEY", "sk-no-key-required")
@@ -455,10 +520,106 @@ def openai_judge_fn(base_url: str, model: str, timeout: float = 180.0, max_token
     return call
 
 
-# After this many candidates IN A ROW fail to reach the model, the endpoint is taken as gone (the
-# serve job was preempted or hit its time limit) and the pass stops at once, instead of retrying
-# every remaining sentence against a dead port — 14,535 refused connections cost three hours once.
+# ---------------------------------------------------------------------------------------------
+# A model the gateway calls for the job (the user's own API key): the relay
+# ---------------------------------------------------------------------------------------------
+#
+# A key never leaves the Eye Server, so a scan on an API model cannot call it from HPC3. The job
+# writes each prompt as a file under ``<relay>/req/``; the gateway reads it, calls the model with
+# the user's key (recording the call and its cost against the user's budget) and writes the reply
+# to ``<relay>/resp/``. Both sides write a temporary name and rename it into place.
+
+RELAY_REQ, RELAY_RESP = "req", "resp"
+_RELAY_POLL_S = 0.5          # how often the job looks for a reply
+
+
+class ScanStopped(Exception):
+    """The gateway declined to call the model, and not because of a fault: the spending cap was
+    reached or the run was stopped. The pass ends at once; every passage read so far is kept."""
+
+
+@dataclass
+class Meter:
+    """The model calls the gateway made for this scan and what they cost (as the gateway priced
+    them). Empty on a model the job serves itself: that has no per-call price."""
+    calls: int = 0
+    cost_usd: float = 0.0
+    input_tokens: int = 0
+    output_tokens: int = 0
+    _lock: threading.Lock = field(default_factory=threading.Lock, repr=False)
+
+    def add(self, usage: dict[str, Any] | None, cost_usd: Any) -> None:
+        u = usage or {}
+        with self._lock:
+            self.calls += 1
+            self.input_tokens += int(u.get("prompt_tokens") or 0)
+            self.output_tokens += int(u.get("completion_tokens") or 0)
+            try:
+                self.cost_usd += float(cost_usd or 0)
+            except (TypeError, ValueError):
+                pass
+
+    def public(self) -> dict[str, Any]:
+        with self._lock:
+            return {"calls": self.calls, "input_tokens": self.input_tokens,
+                    "output_tokens": self.output_tokens, "cost_usd": round(self.cost_usd, 6)}
+
+
+def relay_judge_fn(relay_dir: Path, meter: Meter, *, max_tokens: int, timeout: float = 900.0,
+                   poll: float | None = None) -> Callable[[list[dict[str, str]]], str]:
+    """``messages -> text`` through the gateway (see the section comment). A reply that carries an
+    error raises what the passage loop expects: ``ScanStopped`` ends the pass, a transport error
+    counts toward the dead-endpoint streak, any other error is retried like an unparsable reply.
+    No reply within ``timeout`` (the gateway went away) is a transport error."""
+    req, resp = Path(relay_dir) / RELAY_REQ, Path(relay_dir) / RELAY_RESP
+    req.mkdir(parents=True, exist_ok=True)
+    resp.mkdir(parents=True, exist_ok=True)
+    poll = _RELAY_POLL_S if poll is None else poll
+
+    def call(messages: list[dict[str, str]]) -> str:
+        rid = uuid.uuid4().hex
+        tmp = req / f".{rid}.tmp"
+        tmp.write_text(json.dumps({"id": rid, "messages": messages, "max_tokens": max_tokens}),
+                       encoding="utf-8")
+        os.replace(tmp, req / f"{rid}.json")
+        answer = resp / f"{rid}.json"
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            if answer.is_file():
+                try:
+                    data = json.loads(answer.read_text(encoding="utf-8"))
+                except (OSError, ValueError):
+                    time.sleep(poll)          # seen before the rename landed everywhere: read again
+                    continue
+                answer.unlink(missing_ok=True)
+                if data.get("usage") or data.get("cost_usd"):
+                    meter.add(data.get("usage"), data.get("cost_usd"))
+                err = str(data.get("error") or "")
+                if not err:
+                    return str(data.get("text") or "")
+                kind = str(data.get("kind") or "")
+                if kind == "stop":
+                    raise ScanStopped(err)
+                if kind == "transport":
+                    raise urllib.error.URLError(err)
+                raise ValueError(err)
+            time.sleep(poll)
+        # Withdraw the prompt, so a gateway that comes back late does not pay for an unread answer.
+        (req / f"{rid}.json").unlink(missing_ok=True)
+        raise urllib.error.URLError(f"no answer from the gateway within {timeout:.0f} s")
+
+    return call
+
+
+# After this many passages IN A ROW fail to reach the model, the endpoint is taken as gone (the
+# job's model died) and the pass stops at once, instead of retrying every remaining passage
+# against a dead port.
 _DEAD_AFTER = 20
+# How a pass that the gateway stopped (``ScanStopped``) reports itself, as opposed to a model that died.
+STOPPED = "stopped: "
+# Everything one model call can raise that fails that call, not the pass. IndexError / TypeError /
+# AttributeError: a 200 whose body is not a completion (no choices, a null message).
+_CALL_ERRORS = (urllib.error.URLError, OSError, ValueError, KeyError, IndexError, TypeError, AttributeError)
 
 
 def _connection_error(exc: BaseException) -> bool:
@@ -469,13 +630,35 @@ def _connection_error(exc: BaseException) -> bool:
     return isinstance(exc, (urllib.error.URLError, ConnectionError, TimeoutError, OSError))
 
 
-def judge_candidates(cands: list[Sentence], judge_fn: Callable[[list[dict[str, str]]], str],
-                     out_path: Path, concurrency: int = 16, log: Callable[[str], None] = lambda s: None,
-                     should_stop: Callable[[], bool] | None = None, attempts: int = 3,
-                     dead_after: int | None = None) -> tuple[dict[str, Judgment], str]:
-    """Judge every candidate not already judged in ``out_path`` (a line whose items are null is a
-    failed call and is retried on the next run). Returns ``(judgments, unreachable)``: the second
-    is empty normally, else the error that made the pass give the endpoint up for dead."""
+def _ask(fn: Callable[[list[dict[str, str]]], str], messages: list[dict[str, str]],
+         parse: Callable[[str], Any], attempts: int = 3) -> tuple[Any, str, bool]:
+    """One request-writing call: ``(parsed, error, unreachable)``. ``unreachable`` is true when every
+    attempt failed in transport (the model is gone, not confused)."""
+    err, transport = "", True
+    for attempt in range(attempts):
+        try:
+            got = parse(fn(messages))
+            if got is not None:
+                return got, "", False
+            err, transport = "not the JSON asked for", False
+        except ScanStopped as exc:
+            return None, f"{STOPPED}{exc}", True
+        except _CALL_ERRORS as exc:
+            err = f"{type(exc).__name__}: {str(exc)[:200]}"
+            transport = transport and _connection_error(exc)
+        time.sleep(2 * (attempt + 1))
+    return None, err, transport
+
+
+def judge_passages(passages: list[Passage], judge_fn: Callable[[list[dict[str, str]]], str],
+                   out_path: Path, concurrency: int = 16, log: Callable[[str], None] = lambda s: None,
+                   should_stop: Callable[[], bool] | None = None, attempts: int = 3,
+                   dead_after: int | None = None) -> tuple[dict[str, Judgment], str]:
+    """Read every passage not already read in ``out_path``. Each line keeps the model's whole reply
+    (``raw``): a line whose reply did not parse is parsed again first, so a parser fix costs no
+    model call, and only a line with no usable reply is sent again. Returns ``(judgments,
+    unreachable)``: the second is empty normally, else the error that made the pass give the
+    endpoint up for dead."""
     dead_after = dead_after or _DEAD_AFTER
     done: dict[str, Judgment] = {}
     if out_path.exists():
@@ -485,10 +668,13 @@ def judge_candidates(cands: list[Sentence], judge_fn: Callable[[list[dict[str, s
                     d = json.loads(line)
                 except ValueError:
                     continue
-                if d.get("items") is not None:
-                    done[d["sid"]] = Judgment(d["sid"], d["items"])
-    todo = [s for s in cands if s.sid not in done]
-    log(f"judging {len(todo)} candidates ({len(done)} already done)")
+                items = d.get("items")
+                if items is None and d.get("raw"):
+                    items = parse_items(str(d["raw"]))
+                if items is not None:
+                    done[d["sid"]] = Judgment(d["sid"], items, raw=str(d.get("raw") or ""))
+    todo = [p for p in passages if p.sid not in done]
+    log(f"reading {len(todo)} passages ({len(passages) - len(todo)} already read)")
     lock = threading.Lock()
     t0 = time.time()
     n = 0
@@ -496,25 +682,29 @@ def judge_candidates(cands: list[Sentence], judge_fn: Callable[[list[dict[str, s
     dead_reason = ""
     streak = 0                      # consecutive transport failures, reset by any answer
 
-    def one(s: Sentence) -> Judgment:
+    def one(p: Passage) -> Judgment:
         nonlocal streak, dead_reason
-        err = ""
+        err, raw = "", ""
         for attempt in range(attempts):
             if dead.is_set():
-                return Judgment(s.sid, None, "model unreachable")
+                return Judgment(p.sid, None, "model unreachable")
             if should_stop and should_stop():
-                return Judgment(s.sid, None, "stopped")
+                return Judgment(p.sid, None, "stopped")
             try:
-                items = parse_items(judge_fn(judge_prompt(s)))
+                raw = judge_fn(passage_prompt(p))
+                items = parse_items(raw)
                 with lock:
                     streak = 0
                 if items is not None:
-                    return Judgment(s.sid, items)
+                    return Judgment(p.sid, items, raw=raw)
                 err = "not the JSON asked for"
-            # IndexError / TypeError / AttributeError: a 200 whose body is not a completion (no
-            # choices, a null message). One odd reply fails its sentence, not the whole pass.
-            except (urllib.error.URLError, OSError, ValueError, KeyError, IndexError, TypeError,
-                    AttributeError) as exc:
+            except ScanStopped as exc:
+                with lock:
+                    if not dead.is_set():
+                        dead_reason = f"{STOPPED}{exc}"
+                        dead.set()
+                return Judgment(p.sid, None, "stopped")
+            except _CALL_ERRORS as exc:
                 err = f"{type(exc).__name__}: {str(exc)[:200]}"
                 if _connection_error(exc):
                     with lock:
@@ -524,35 +714,122 @@ def judge_candidates(cands: list[Sentence], judge_fn: Callable[[list[dict[str, s
                             dead.set()
                     continue        # a refused connection is not a transient the next second cures
             time.sleep(2 * (attempt + 1))
-        return Judgment(s.sid, None, err)
+        return Judgment(p.sid, None, err, raw=raw)
 
     out_path.parent.mkdir(parents=True, exist_ok=True)
     with out_path.open("a", encoding="utf-8") as fh, ThreadPoolExecutor(max_workers=max(1, concurrency)) as pool:
-        futures = [pool.submit(one, s) for s in todo]
+        futures = [pool.submit(one, p) for p in todo]
         for fut in as_completed(futures):
             j = fut.result()
             with lock:
-                # A sentence that was never really judged (the endpoint had died) is not written:
-                # a null-items line would be retried anyway, and the file stays a record of answers.
+                # A passage that was never really read (the endpoint had died) is not written:
+                # the file stays a record of the model's answers.
                 if not (j.items is None and j.error in ("model unreachable", "stopped")):
-                    fh.write(json.dumps({"sid": j.sid, "items": j.items, "error": j.error}) + "\n")
+                    fh.write(json.dumps({"sid": j.sid, "items": j.items, "error": j.error, "raw": j.raw}) + "\n")
                     fh.flush()
                 done[j.sid] = j
                 n += 1
-                if n % 500 == 0:
-                    log(f"judged {n}/{len(todo)} in {time.time() - t0:.0f}s")
+                if n % 200 == 0:
+                    log(f"read {n}/{len(todo)} in {time.time() - t0:.0f}s")
     if dead.is_set():
-        log(f"the model stopped answering ({dead_reason}); {sum(1 for j in done.values() if j.items is not None)} "
-            f"of {len(cands)} judged so far")
+        log(f"the model stopped answering ({dead_reason}); "
+            f"{sum(1 for p in passages if done.get(p.sid) and done[p.sid].items is not None)} "
+            f"of {len(passages)} passages read so far")
     return done, dead_reason if dead.is_set() else ""
 
 
+def _int(v: Any) -> int | None:
+    try:
+        return int(str(v).strip())
+    except (TypeError, ValueError):
+        return None
+
+
+def locate_items(p: Passage, items: list[dict[str, Any]]) -> list[tuple[Sentence, dict[str, Any]]]:
+    """Each item with the sentence of the passage its quote is: the sentence that holds the quote
+    (or is held by it), else the sentence number the model gave, else a blank stand-in. The quote is
+    verified afterwards against the sentence and its neighbours, so a wrong pick fails it."""
+    out: list[tuple[Sentence, dict[str, Any]]] = []
+    for it in items:
+        q = nz(str(it.get("quote") or ""))
+        hit = None
+        if q:
+            hit = next((s for s in p.sentences if q in nz(s.text)), None) \
+                or next((s for s in p.sentences if len(nz(s.text)) > 20 and nz(s.text) in q), None)
+        if hit is None:
+            k = _int(it.get("sentence"))
+            if k is not None and 1 <= k <= len(p.sentences):
+                hit = p.sentences[k - 1]
+        if hit is None:
+            hit = Sentence(sid=f"{p.sid}:-", pmid=p.pmid, chunk=p.chunk, sent=-1, page=p.page, text="")
+        out.append((hit, it))
+    return out
+
+
+def sentence_judgments(passages: list[Passage], judgments: dict[str, Judgment],
+                       ) -> tuple[dict[str, Judgment], dict[str, Sentence], dict[str, dict[str, Any]]]:
+    """The passages' items regrouped per sentence, as ``aggregate`` reads them: ``(judgments by
+    sentence id, sentences by id, per-sentence flags)``."""
+    out: dict[str, Judgment] = {}
+    by_sid: dict[str, Sentence] = {}
+    flags: dict[str, dict[str, Any]] = {}
+    for p in passages:
+        j = judgments.get(p.sid)
+        if j is None or not j.items:
+            continue
+        for s, it in locate_items(p, j.items):
+            by_sid[s.sid] = s
+            flags.setdefault(s.sid, {"cite_like": bool(CIT.search(s.text)), "garbled": is_garbled(s.text)})
+            out.setdefault(s.sid, Judgment(s.sid, [])).items.append(it)  # type: ignore[union-attr]
+    return out, by_sid, flags
+
+
+# A word that can be a gene symbol as written: 2-15 letters, digits or hyphens, one capital at least
+# ("PRPF31", "Prpf31"), so a lower-case word the model put in the gene field never becomes a search term.
+_SYMBOL_LIKE = re.compile(r"(?=[A-Za-z0-9-]*[A-Z])[A-Za-z0-9-]{2,15}")
+
+
+def round_two_genes(passages: list[Passage], judgments: dict[str, Judgment], hgnc: "Hgnc",
+                    ) -> dict[str, dict[str, Any]]:
+    """The genes round one read as haploinsufficient (not negated; hedged and non-retinal included,
+    since another paper may state them plainly) whose symbol HGNC knows, or every symbol-like one
+    without an HGNC table: ``symbol -> {"terms": symbols to search for, "phenotypes": as written}``,
+    in the order first read."""
+    out: dict[str, dict[str, Any]] = {}
+    for p in passages:
+        j = judgments.get(p.sid)
+        for it in (j.items if j and j.items else []):
+            if it.get("mechanism_class") != "haploinsufficiency" or it.get("negated"):
+                continue
+            written = re.sub(r"[^A-Za-z0-9-]", "", str(it.get("gene") or ""))
+            sym, status = hgnc.norm(it.get("gene"))
+            if not sym or status in ("missing", "unknown") or not _SYMBOL_LIKE.fullmatch(written):
+                continue
+            g = out.setdefault(sym, {"terms": {sym}, "phenotypes": []})
+            g["terms"].add(written)
+            ph = " ".join(str(it.get("phenotype") or "").split())
+            if ph and ph not in g["phenotypes"]:
+                g["phenotypes"].append(ph)
+    return out
+
+
+def is_garbled(text: str) -> bool:
+    return bool(GARBLED_MARK.search(text)) or len(re.findall(r"[a-z]- [a-z]", text)) >= 2
+
+
 # ---------------------------------------------------------------------------------------------
-# 4. Verify, normalise, aggregate (aggregate_final.py)
+# 4. Verify, normalise, aggregate
 # ---------------------------------------------------------------------------------------------
 
+# Whitespace, hyphens and dashes of every kind, and control characters: a PDF can extract "60–80%"
+# as "60\x0180%", and the model types the dash back in.
+_NZ_DROP = re.compile("[\\s­\\-‐-―−\x00-\x1f\x7f]+")
+
+
 def nz(s: str | None) -> str:
-    return re.sub(r"[\s­-]+", "", (s or "").lower())
+    """Text for comparing quotes: ligatures folded, lower case, no whitespace, dashes or control
+    characters."""
+    return _NZ_DROP.sub("", fold(s).lower())
 
 
 class Hgnc:
@@ -613,7 +890,8 @@ def make_is_cite(titles: Iterable[str]) -> Callable[[str, str, str], bool]:
 
 HIT_COLUMNS = ("pmid", "page", "gene", "gene_as_written", "gene_status", "gene_in_quote", "gene_in_context",
                "mechanism_class", "explicit", "negated", "human_retinal", "phenotype", "mechanism_statement",
-               "quote", "quote_verified", "cite_like", "dominance_marker", "garbled", "sentence_id", "eligible")
+               "quote", "quote_verified", "cite_like", "dominance_marker", "garbled", "sentence_id", "found_by",
+               "eligible")
 GENE_COLUMNS = ("gene", "phenotype", "mechanism_statement", "n_papers", "n_hits", "hedged_hits",
                 "conflicting_mechanism", "flag_only_cited_titles", "flag_no_dominance_marker",
                 "flag_gene_not_in_quote", "flag_gene_alias_or_unknown", "gene_status", "gene_as_written",
@@ -646,7 +924,7 @@ def aggregate(judgments: dict[str, Judgment], by_sid: dict[str, Sentence], flags
             q = str(it.get("quote") or "")
             gene, gstat = hgnc.norm(it.get("gene"))
             gw = str(it.get("gene") or "").strip()
-            m = MECH.search(q) or MECH.search(s.text)
+            m = MECH.search(fold(q)) or MECH.search(fold(s.text))
             h = {"pmid": s.pmid, "page": s.page, "gene": gene, "gene_as_written": gw, "gene_status": gstat,
                  "gene_in_quote": _word(gw, q), "gene_in_context": _word(gw, ctx),
                  "mechanism_class": it.get("mechanism_class"), "explicit": bool(it.get("explicit")),
@@ -654,7 +932,7 @@ def aggregate(judgments: dict[str, Judgment], by_sid: dict[str, Sentence], flags
                  "phenotype": it.get("phenotype"), "mechanism_statement": m.group(0).strip() if m else "",
                  "quote": q, "quote_verified": bool(q) and nz(q) in nz(ctx),
                  "cite_like": bool(fl.get("cite_like")) or is_cite(q, s.prev, s.next) or is_cite(s.text, s.prev, s.next),
-                 "dominance_marker": bool(DOM.search(q + " " + ctx)), "garbled": bool(fl.get("garbled")),
+                 "dominance_marker": bool(DOM.search(fold(q + " " + ctx))), "garbled": bool(fl.get("garbled")),
                  "sentence_id": sid}
             h["eligible"] = eligible(h)
             hits.append(h)
@@ -676,7 +954,7 @@ def aggregate(judgments: dict[str, Judgment], by_sid: dict[str, Sentence], flags
         # Quotes: body sentences before reference entries, clean before garbled, the gene in the
         # quote, the word "haploinsufficiency" itself, then the longer sentence.
         hs = sorted(hs, key=lambda h: (h["cite_like"], h["garbled"], not h["gene_in_quote"],
-                                       "haploinsuffic" not in h["quote"].lower(), -len(h["quote"])))
+                                       "haploinsuffic" not in fold(h["quote"]).lower(), -len(h["quote"])))
         picked: list[dict[str, Any]] = []
         seen: set[str] = set()
         for h in hs:
@@ -719,36 +997,9 @@ def write_csv(path: Path, rows: list[dict[str, Any]], columns: tuple[str, ...]) 
 # Deployment: where the corpus, cache, HGNC table and model are
 # ---------------------------------------------------------------------------------------------
 
-def corpus_paths(ctx: Any) -> CorpusPaths | None:
-    papers = os.environ.get("AISCIENTIST_PAPERQA_PAPERS", "")
-    if not papers or not Path(papers).is_dir():
-        return None
-    papers_p = Path(papers)
-    root = papers_p.parent
-    manifest = os.environ.get("AISCIENTIST_PAPERQA_MANIFEST", "")
-    manifest_p = Path(manifest) if manifest and Path(manifest).is_file() else None
-    notes: list[str] = []
-    shared = Path(os.environ.get("AISCIENTIST_MECHANISM_CACHE", "") or root / _CACHE_DIRNAME)
-    ws = getattr(ctx, "workspace", None)
-    if (shared / "chunks.jsonl").is_file():
-        cache, writable = shared, os.access(shared, os.W_OK)
-    elif ws:
-        cache, writable = Path(ws) / "work" / _OUT_SUBDIR / _CACHE_DIRNAME, True
-        notes.append(f"No corpus cache at {shared}; extracting the PDFs into the run's work/ "
-                     "(build it once with scripts/build_mechanism_cache.py to make this fast).")
-    else:
-        cache, writable = shared, os.access(root, os.W_OK)
-    hgnc = os.environ.get("AISCIENTIST_HGNC_TABLE", "") or str(root / "hgnc_complete_set.txt")
-    hgnc_p = Path(hgnc) if Path(hgnc).is_file() else None
-    if hgnc_p is None:
-        notes.append("No HGNC table (hgnc_complete_set.txt next to the papers, or AISCIENTIST_HGNC_TABLE): "
-                     "gene symbols are reported as written and gene_status is 'unchecked'.")
-    hf = root / "hf_cache"
-    return CorpusPaths(papers_p, manifest_p, cache, writable, hgnc_p, hf if hf.is_dir() else None, notes)
-
-
 def local_endpoint(ctx: Any) -> tuple[str, str] | None:
-    """``(model, api_base)`` for the session's served model, the way deep_literature finds it."""
+    """``(model, api_base)`` of the model to judge with: the args' endpoint, else
+    ``AISCIENTIST_PAPERQA_LLM_BASE_URL`` (set inside the scan's own GPU job), else a tunnel port."""
     model = getattr(ctx, "model", None)
     if not model:
         return None
@@ -761,40 +1012,35 @@ def local_endpoint(ctx: Any) -> tuple[str, str] | None:
     return str(model), f"http://127.0.0.1:{port}/v1"
 
 
-def sentence_transformer_embed(hf_cache: Path | None) -> Callable[[list[str]], Any] | None:
-    """The corpus embedding model (PubMedBERT, offline from the corpus' hf_cache), or None."""
-    try:
-        from sentence_transformers import SentenceTransformer  # noqa: PLC0415
-    except ImportError:
-        return None
-    name = _DEFAULT_EMBEDDING.split("st-", 1)[-1]
-    if hf_cache:
-        os.environ.setdefault("HF_HOME", str(hf_cache))
-        os.environ.setdefault("HF_HUB_CACHE", str(hf_cache / "hub"))
-        os.environ.setdefault("HF_HUB_OFFLINE", "1")
-        os.environ.setdefault("TRANSFORMERS_OFFLINE", "1")
-    try:
-        model = SentenceTransformer(name)
-    except Exception:  # noqa: BLE001 - offline cache missing: keyword candidates only
-        return None
-    return lambda texts: model.encode(texts, batch_size=32, show_progress_bar=False, normalize_embeddings=True)
-
-
 # ---------------------------------------------------------------------------------------------
 # The executor
 # ---------------------------------------------------------------------------------------------
 
 PARAMS: dict[str, tuple[Any, str]] = {
+    "n_requests": (16, "how many search requests the model writes for the first round"),
+    "k_per_request": (50, "passages (chunks) each first-round request retrieves"),
+    "keyword_round": (1, "1 = round one also reads every passage that states a dosage mechanism in words "
+                         "(haploinsufficiency, gene dosage, one functional copy, ...); 0 = the requests alone"),
+    "k_per_gene": (15, "passages each second-round gene request retrieves, among the chunks that name the gene"),
     "max_quotes_per_gene": (3, "how many papers (PMID + verbatim quote) genes.csv lists per gene"),
-    "concurrency": (16, "parallel requests to the served model while judging sentences"),
-    "max_candidates": (0, "judge only the first N candidate sentences (0 = all); for a smoke test"),
+    "concurrency": (16, "parallel requests to the model while it reads the passages"),
+    "max_passages": (0, "read only the first N retrieved passages (0 = all); for a smoke test"),
+    "pilot_fraction": (0.01, "share of round one's passages read first as a pilot (at least 5, at most 25): the "
+                             "scan stops before the rest when half of them fail, or when the cost they project "
+                             "is above max_cost_usd (0 = no pilot)"),
+    "max_cost_usd": (0.0, "stop before the full pass when the pilot projects a model cost above this, in USD "
+                          "(0 = no cap; only a model the gateway calls for the scan has a price)"),
 }
+# Pilot size bounds: 1% of 857 passages is 9; a small scan still gets 5, a huge one at most 25.
+_PILOT_MIN, _PILOT_MAX = 5, 25
+REQUEST_COLUMNS = ("id", "round", "gene", "request", "n_passages")
 
 
 def _schema() -> dict[str, Any]:
     props: dict[str, Any] = {}
     for name, (default, meaning) in PARAMS.items():
-        props[name] = {"type": "integer", "default": default, "description": meaning}
+        props[name] = {"type": "number" if isinstance(default, float) else "integer", "default": default,
+                       "description": meaning}
     props["pmids"] = {"type": "array", "items": {"type": "string"},
                       "description": "restrict the scan to these PMIDs (empty = the whole corpus)"}
     return {"type": "object", "properties": props}
@@ -805,39 +1051,71 @@ def _p(name: str, args: dict[str, Any]) -> Any:
     return PARAMS[name][0] if v is None else v
 
 
+def pilot_sample(passages: list[Passage], fraction: float) -> list[Passage]:
+    """About ``fraction`` of the passages (``_PILOT_MIN`` to ``_PILOT_MAX``), spread evenly over the
+    list, so the pilot sees passages of every request and of the keyword round."""
+    if not passages or fraction <= 0:
+        return []
+    n = min(len(passages), max(_PILOT_MIN, min(_PILOT_MAX, math.ceil(len(passages) * fraction))))
+    step = len(passages) / n
+    return [passages[int(i * step)] for i in range(n)]
+
+
+def _save_json(path: Path, data: Any) -> None:
+    tmp = path.with_suffix(".tmp")
+    tmp.write_text(json.dumps(data, indent=1), encoding="utf-8")
+    os.replace(tmp, path)
+
+
 def run_extract(args: dict[str, Any], ctx: Any, *, judge_fn: Callable[[list[dict[str, str]]], str] | None = None,
                 embed_fn: Callable[[list[str]], Any] | None = None, log: Callable[[str], None] | None = None,
                 ) -> dict[str, Any]:
-    """The whole pipeline for one run. ``judge_fn`` / ``embed_fn`` default to the session's served
-    model and the corpus' PubMedBERT; the tests pass fakes."""
+    """The whole pipeline for one run. ``judge_fn`` / ``embed_fn`` default to the scan job's model
+    and the corpus' PubMedBERT; the tests pass fakes. A rerun in the same workspace resumes: the
+    requests and every passage already read are kept in ``work/haploinsufficiency/``."""
+    import numpy as np  # noqa: PLC0415
     log = log or (lambda s: print(f"[{_TOOL}] {s}", flush=True))
     ws = getattr(ctx, "workspace", None)
     if not ws:
         return {"status": "error", "step": "literature", "error": f"{_TOOL} needs a run workspace"}
     ws = Path(ws)
-    paths = corpus_paths(ctx)
+    paths = _corpus_paths(ctx, work_subdir=_OUT_SUBDIR)
     if paths is None:
         return {"status": "not_enabled", "step": "literature",
                 "note": (f"{_TOOL} reads the PaperQA corpus on HPC3 (AISCIENTIST_PAPERQA_PAPERS), which is "
                          "not available where this step ran. It runs as an HPC3 literature job.")}
     warnings = list(paths.notes)
-    if judge_fn is None:
+    write_fn = judge_fn
+    meter = Meter()
+    relay = getattr(ctx, "llm_relay_dir", None)
+    if judge_fn is None and relay:
+        # The user's API model, called by the gateway with the user's key (see relay_judge_fn). It
+        # may think before it answers, so the reply gets room beyond the JSON.
+        judge_fn = write_fn = relay_judge_fn(Path(relay), meter, max_tokens=8000)
+        log(f"model {getattr(ctx, 'model', None) or '?'} through the gateway (relay {relay})")
+    elif judge_fn is None:
         ep = local_endpoint(ctx)
         if ep is None:
             return {"status": "not_enabled", "step": "literature",
-                    "note": "no served model on this session (model / llm_base_url unset); the sentences "
-                            "cannot be judged. Start the session's model and rerun."}
+                    "note": "no model to read with (model / llm_base_url unset); the corpus cannot be read."}
         model, base = ep
         judge_fn = openai_judge_fn(base, model)
+        write_fn = openai_judge_fn(base, model, max_tokens=2500)
         log(f"model {model} at {base}")
 
     work = ws / "work" / _OUT_SUBDIR
     art = ws / "artifacts" / _OUT_SUBDIR
     work.mkdir(parents=True, exist_ok=True)
-    genes_csv, hits_csv = art / "genes.csv", art / "hits.csv"
+    genes_csv, hits_csv, requests_csv = art / "genes.csv", art / "hits.csv", art / "requests.csv"
     pmids = {str(p) for p in (args.get("pmids") or []) if str(p).strip()} or None
+    n_req = max(1, int(_p("n_requests", args)))
+    k1, k2 = max(1, int(_p("k_per_request", args))), max(0, int(_p("k_per_gene", args)))
+    max_p = int(_p("max_passages", args) or 0)
+    concurrency = int(_p("concurrency", args))
+    stop = getattr(ctx, "should_cancel", None)
+    should_stop = stop if callable(stop) else None
 
-    # 1. text
+    # The corpus: text cache, sentences per chunk, chunk vectors.
     t0 = time.time()
     sent_path, chunk_path = paths.cache / "sentences.jsonl", paths.cache / "chunks.jsonl"
     if not chunk_path.is_file():
@@ -850,92 +1128,278 @@ def run_extract(args: dict[str, Any], ctx: Any, *, judge_fn: Callable[[list[dict
     if pmids:
         chunks = [c for c in chunks if c["pmid"] in pmids]
     n_papers = len({s.pmid for s in sentences})
-    log(f"{n_papers} papers, {len(sentences)} sentences ({time.time() - t0:.0f}s)")
-    if not sentences:
+    log(f"{n_papers} papers, {len(chunks)} chunks, {len(sentences)} sentences ({time.time() - t0:.0f}s)")
+    if not sentences or not chunks:
         return {"status": "failed", "step": "literature", "error": "no text extracted from the corpus",
                 "warnings": warnings}
-
-    # 2. candidates
+    sents_by_chunk: dict[tuple[str, int], list[Sentence]] = collections.defaultdict(list)
+    for s in sentences:
+        sents_by_chunk[(s.pmid, s.chunk)].append(s)
+    for v in sents_by_chunk.values():
+        v.sort(key=lambda s: s.sent)
+    embed = embed_fn if embed_fn is not None else sentence_transformer_embed(paths.hf_cache)
+    if embed is None:
+        return {"status": "failed", "step": "literature",
+                "error": ("The scan finds its passages with PubMedBERT (sentence-transformers and the embedding "
+                          "model in the corpus' hf_cache), which is not available where this step ran."),
+                "warnings": warnings}
+    raw_vecs = (chunk_vectors(chunks, paths.cache, embed, paths.cache_writable, log) if not pmids
+                else _l2(embed([c["text"] for c in chunks])))
+    vecs = np.asarray(raw_vecs, dtype="float32")
+    hgnc = Hgnc(paths.hgnc)
     manifest = read_manifest(paths.manifest)
     titles = [str(r.get("title") or "") for r in manifest]
-    embed = embed_fn if embed_fn is not None else sentence_transformer_embed(paths.hf_cache)
-    vecs = None
-    if embed is not None and not pmids:
-        vecs = chunk_vectors(chunks, paths.cache, embed, paths.cache_writable, log)
-    elif embed is not None:
-        vecs = _l2(embed([c["text"] for c in chunks])) if chunks else None
-    else:
-        warnings.append("sentence-transformers / the PubMedBERT model are not available here: candidates "
-                        "were chosen by keyword only (the semantic pass was skipped).")
-    cands, flags = select_candidates(sentences, chunks, vecs, embed)
-    max_c = int(_p("max_candidates", args) or 0)
-    if max_c > 0:
-        cands = cands[:max_c]
-    log(f"{len(cands)} candidate sentences in {len({s.pmid for s in cands})} papers")
-    with (work / "candidates.jsonl").open("w", encoding="utf-8") as fh:
-        for s in cands:
-            fh.write(json.dumps({**s.__dict__, **flags.get(s.sid, {})}) + "\n")
+    store_path = work / "requests.json"
+    stored: dict[str, Any] = {}
+    if store_path.is_file():
+        try:
+            stored = json.loads(store_path.read_text(encoding="utf-8"))
+        except ValueError:
+            stored = {}
+    judgments_path = work / "judgments.jsonl"
 
-    # 3. judge
-    stop = getattr(ctx, "should_cancel", None)
-    judgments, unreachable = judge_candidates(cands, judge_fn, work / "judgments.jsonl",
-                                              int(_p("concurrency", args)), log,
-                                              should_stop=stop if callable(stop) else None)
-    n_ok = sum(1 for sid, j in judgments.items() if j.items is not None and sid in flags)
+    def counts(passages: list[Passage], judgments: dict[str, Judgment]) -> dict[str, Any]:
+        n_ok = sum(1 for p in passages if judgments.get(p.sid) and judgments[p.sid].items is not None)
+        return {"n_papers": n_papers, "n_sentences": len(sentences), "n_passages": len(passages), "n_judged": n_ok}
+
+    def gone(reason: str, passages: list[Passage], judgments: dict[str, Judgment]) -> dict[str, Any]:
+        # The job's model went away (out of memory, a lost node). Keep what was read and say so:
+        # the gateway submits the job again, and the rerun picks up where this one stopped.
+        c = counts(passages, judgments)
+        if reason.startswith(STOPPED):
+            # The gateway declined (the spending cap, a stop): not a fault, and not to be retried.
+            return {"status": "failed", "step": "literature", "stopped": True,
+                    "error": (f"The scan was stopped: {reason[len(STOPPED):]}. {c['n_judged']} of "
+                              f"{len(passages)} retrieved passages are read and kept; a rerun reads only "
+                              "the rest."),
+                    **c, **({"api_usage": meter.public()} if meter.calls else {}), "warnings": warnings}
+        return {"status": "failed", "step": "literature", "model_unreachable": True,
+                "error": (f"The model stopped answering ({reason}); {c['n_judged']} of {len(passages)} "
+                          "retrieved passages are read. Rerun once the model is back: the requests and "
+                          "every passage read are kept, and only the rest are read."),
+                **c, **({"api_usage": meter.public()} if meter.calls else {}), "warnings": warnings}
+
+    # Round one: the model writes the requests; each takes its nearest chunks of the whole corpus.
+    requests = stored.get("round1")
+    if not (isinstance(requests, list) and requests):
+        requests, err, unreachable = _ask(write_fn, request_messages(n_req), lambda t: parse_requests(t, n_req))
+        if requests is None:
+            if unreachable:
+                return gone(err, [], {})
+            return {"status": "failed", "step": "literature",
+                    "error": f"The model did not write usable search requests ({err}).", "warnings": warnings}
+        stored["round1"] = requests
+        _save_json(store_path, stored)
+    log(f"round one: {len(requests)} requests")
+    found: dict[int, list[str]] = {}
+    hits_per_request: dict[str, int] = {}
+    for r, qv in enumerate(_l2(embed(list(requests)))):
+        got = nearest_chunks(qv, vecs, chunks, k1)
+        hits_per_request[f"R{r + 1}"] = len(got)
+        for i in got:
+            found.setdefault(i, []).append(f"R{r + 1}")
+    keyword_only = 0
+    if int(_p("keyword_round", args)):
+        worded = keyword_chunks(chunks)
+        hits_per_request["K"] = len(worded)
+        for i in worded:
+            keyword_only += i not in found
+            found.setdefault(i, []).append("K")
+        log(f"round one: {len(worded)} passages state a dosage mechanism in words, {keyword_only} of them "
+            "found by no request")
+    passages = locate(found, chunks, sents_by_chunk)
+    if max_p > 0:
+        passages = passages[:max_p]
+    log(f"round one: {len(passages)} passages in {len({p.pmid for p in passages})} papers")
+
+    # The pilot: about 1% of the passages first. A model that cannot do the job (an endpoint that
+    # answers with errors, a reply the parser cannot read) is found after a few calls, not after
+    # the whole corpus has been paid for; on a priced model its cost projects the scan's.
+    pilot = pilot_sample(passages, float(_p("pilot_fraction", args) or 0))
+    pilot_info: dict[str, Any] | None = None
+    if pilot:
+        before = meter.public()
+        judgments, unreachable = judge_passages(pilot, judge_fn, judgments_path, concurrency, log, should_stop)
+        if unreachable:
+            return gone(unreachable, passages, judgments)
+        bad = [p for p in pilot if not (judgments.get(p.sid) and judgments[p.sid].items is not None)]
+        after = meter.public()
+        calls, spent = after["calls"] - before["calls"], after["cost_usd"] - before["cost_usd"]
+        pilot_info = {"passages": len(pilot), "read": len(pilot) - len(bad), "calls": calls,
+                      "cost_usd": round(spent, 6)}
+        if calls and spent > 0:
+            # Round two reads about as many passages again (857 then 766 in the 2026-10-20 scan).
+            pilot_info["estimated_total_usd"] = round(spent / calls * 2 * len(passages), 4)
+        log(f"pilot: {pilot_info['read']} of {len(pilot)} passages read"
+            + (f", ${spent:.4f}; projected for the scan ${pilot_info['estimated_total_usd']:.2f}"
+               if "estimated_total_usd" in pilot_info else ""))
+        if 2 * len(bad) >= len(pilot):
+            first = next((judgments[p.sid].error for p in bad if judgments.get(p.sid) and judgments[p.sid].error),
+                         "no reply")
+            return {"status": "failed", "step": "literature", "pilot_failed": True,
+                    "error": (f"The pilot failed: {len(bad)} of its {len(pilot)} passages (about 1% of the "
+                              f"{len(passages)} retrieved) could not be read ({first}). The rest was not read, "
+                              "so nothing more was spent; fix the model or its endpoint and rerun."),
+                    **counts(passages, judgments), "pilot": pilot_info,
+                    **({"api_usage": meter.public()} if meter.calls else {}), "warnings": warnings}
+        cap = float(_p("max_cost_usd", args) or 0)
+        if cap > 0 and pilot_info.get("estimated_total_usd", 0) > cap:
+            return {"status": "failed", "step": "literature", "stopped": True, "over_budget": True,
+                    "error": (f"The pilot projects about ${pilot_info['estimated_total_usd']:.2f} for the scan, "
+                              f"above the ${cap:.2f} it may spend. Only the pilot's {len(pilot)} passages were "
+                              "read; raise the budget or the cap and rerun (they are kept)."),
+                    **counts(passages, judgments), "pilot": pilot_info,
+                    "api_usage": meter.public(), "warnings": warnings}
+
+    judgments, unreachable = judge_passages(passages, judge_fn, judgments_path, concurrency, log, should_stop)
     if unreachable:
-        # The served model went away (its Slurm job was preempted or expired). Nothing to aggregate
-        # that a rerun would not improve: say so, keep the judgments made, and let the caller bring
-        # the model back and call again — the next run picks up where this one stopped.
-        return {"status": "failed", "step": "literature", "model_unreachable": True,
-                "error": (f"The served model stopped answering ({unreachable}); {n_ok} of {len(cands)} "
-                          "candidate sentences are judged. Rerun once the model is back — finished "
-                          "judgments are kept and only the rest are judged."),
-                "n_papers": n_papers, "n_sentences": len(sentences), "n_candidates": len(cands),
-                "n_judged": n_ok, "warnings": warnings}
-    failed = len(cands) - n_ok
-    if failed:
-        warnings.append(f"{failed} of {len(cands)} sentences could not be judged (model errors); rerun the "
-                        "tool to retry them — finished judgments are kept.")
-    if cands and n_ok == 0:
-        return {"status": "failed", "step": "literature", "model_unreachable": True,
-                "error": "None of the candidate sentences could be judged (every model call failed). "
-                         "Check the served model and rerun.", "n_candidates": len(cands), "n_judged": 0,
-                "warnings": warnings}
+        return gone(unreachable, passages, judgments)
 
-    # 4. aggregate
-    by_sid = {s.sid: s for s in cands}
-    genes, hits = aggregate({k: v for k, v in judgments.items() if k in by_sid}, by_sid, flags,
-                            Hgnc(paths.hgnc), titles, int(_p("max_quotes_per_gene", args)))
+    # Round two: one request per gene round one read as haploinsufficient, searched only among the
+    # chunks that name the gene; the passages not read yet are read.
+    genes2 = round_two_genes(passages, judgments, hgnc) if k2 else {}
+    gene_requests: dict[str, str] = dict(stored.get("round2") or {})
+    todo = [g for g in genes2 if g not in gene_requests]
+    templated = 0
+    for b in range(0, len(todo), _GENE_BATCH):
+        batch = {g: genes2[g]["phenotypes"] for g in todo[b:b + _GENE_BATCH]}
+        got, err, unreachable = _ask(write_fn, gene_request_messages(batch),
+                                     lambda t, gs=list(batch): parse_gene_requests(t, gs))
+        if got is None and unreachable:
+            stored["round2"] = gene_requests
+            _save_json(store_path, stored)
+            return gone(err, passages, judgments)
+        for g, ph in batch.items():
+            if got and g in got:
+                gene_requests[g] = got[g]
+            else:
+                gene_requests[g] = GENE_REQUEST_TEMPLATE.format(gene=g, phenotype=ph[0] if ph else "retinal disease")
+                templated += 1
+    if todo:
+        stored["round2"] = gene_requests
+        _save_json(store_path, stored)
+    if templated:
+        warnings.append(f"The model's reply left out {templated} of {len(todo)} genes for round two; their "
+                        "requests were written from a fixed template.")
+    seen_chunks = {(p.pmid, p.chunk) for p in passages}
+    found2: dict[int, list[str]] = {}
+    round_one = {p.sid: p for p in passages}
+    if genes2:
+        naming = chunks_naming({g: genes2[g]["terms"] for g in genes2}, chunks)
+        for g, qv in zip(genes2, _l2(embed([gene_requests[g] for g in genes2]))):
+            got = nearest_chunks(qv, vecs, chunks, k2, candidates=naming.get(g, set()))
+            hits_per_request[f"G:{g}"] = len(got)
+            for i in got:
+                key = (str(chunks[i]["pmid"]), int(chunks[i]["chunk"]))
+                if key in seen_chunks:
+                    p1 = round_one.get(f"{key[0]}:{key[1]}")
+                    if p1 is not None and f"G:{g}" not in p1.found_by:
+                        p1.found_by.append(f"G:{g}")
+                else:
+                    found2.setdefault(i, []).append(f"G:{g}")
+    passages2 = locate(found2, chunks, sents_by_chunk)
+    if max_p > 0:
+        passages2 = passages2[:max(0, max_p - len(passages))]
+    if passages2:
+        log(f"round two: {len(genes2)} gene requests, {len(passages2)} more passages")
+        judgments, unreachable = judge_passages(passages2, judge_fn, judgments_path, concurrency, log, should_stop)
+        if unreachable:
+            return gone(unreachable, passages + passages2, judgments)
+    passages_all = passages + passages2
+
+    # Verify and aggregate.
+    c = counts(passages_all, judgments)
+    failed = len(passages_all) - c["n_judged"]
+    if failed:
+        warnings.append(f"{failed} of {len(passages_all)} passages could not be read (model errors); rerun the "
+                        "tool to retry them: finished passages are kept.")
+    if passages_all and c["n_judged"] == 0:
+        return {"status": "failed", "step": "literature", "model_unreachable": True,
+                "error": "None of the retrieved passages could be read (every model call failed). "
+                         "Check the model and rerun.", **c, "warnings": warnings}
+    by_sent, by_sid, flags = sentence_judgments(passages_all, judgments)
+    genes, hits = aggregate(by_sent, by_sid, flags, hgnc, titles, int(_p("max_quotes_per_gene", args)))
+    found_by = {p.sid: "|".join(p.found_by) for p in passages_all}
+    for h in hits:
+        h["found_by"] = found_by.get(str(h["sentence_id"]).rsplit(":", 1)[0], "")
+    hits.sort(key=lambda h: (str(h["pmid"]), str(h["sentence_id"])))
     write_csv(genes_csv, genes, GENE_COLUMNS)
     write_csv(hits_csv, hits, HIT_COLUMNS)
+    req_rows = [{"id": f"R{i + 1}", "round": 1, "gene": "", "request": q,
+                 "n_passages": hits_per_request.get(f"R{i + 1}", 0)} for i, q in enumerate(requests)]
+    if "K" in hits_per_request:
+        req_rows.append({"id": "K", "round": 1, "gene": "", "request": KEYWORD_REQUEST,
+                         "n_passages": hits_per_request["K"]})
+    req_rows += [{"id": f"G:{g}", "round": 2, "gene": g, "request": gene_requests[g],
+                  "n_passages": hits_per_request.get(f"G:{g}", 0)} for g in genes2]
+    write_csv(requests_csv, req_rows, REQUEST_COLUMNS)
     n_elig = sum(1 for h in hits if h["eligible"])
-    log(f"{n_elig} eligible hits -> {len(genes)} genes ({time.time() - t0:.0f}s total)")
+    log(f"{c['n_judged']} passages read -> {n_elig} eligible hits -> {len(genes)} genes "
+        f"({time.time() - t0:.0f}s total)")
     flag_keys = [k for k in GENE_COLUMNS if k.startswith("flag_")]
     return {
-        "status": "ok", "step": "literature",
-        "n_papers": n_papers, "n_sentences": len(sentences), "n_candidates": len(cands),
-        "n_judged": len(cands) - failed, "n_hits_eligible": n_elig, "n_genes": len(genes),
+        "status": "ok", "step": "literature", **c,
+        "n_requests": len(requests), "n_gene_requests": len(genes2),
+        "n_keyword_passages": hits_per_request.get("K", 0), "n_keyword_only_passages": keyword_only,
+        "n_hits_eligible": n_elig, "n_genes": len(genes),
         "genes": [{"gene": g["gene"], "n_papers": g["n_papers"], "phenotype": (g["phenotype"] or "")[:80],
                    "flags": [k[5:] for k in flag_keys if g[k]]} for g in genes],
         "genes_flagged_for_review": [g["gene"] for g in genes if any(g[k] for k in flag_keys)],
-        "files": {"genes_csv": str(genes_csv.relative_to(ws)), "hits_csv": str(hits_csv.relative_to(ws))},
+        "requests": list(requests),
+        "files": {"genes_csv": str(genes_csv.relative_to(ws)), "hits_csv": str(hits_csv.relative_to(ws)),
+                  "requests_csv": str(requests_csv.relative_to(ws))},
         "definition": DEFINITION,
+        "pilot": pilot_info,
+        **({"api_usage": meter.public()} if meter.calls else {}),
         "warnings": warnings,
         "raw_data_to_llm": False,
     }
+
+
+# ---------------------------------------------------------------------------------------------
+# The rules as one fingerprint
+# ---------------------------------------------------------------------------------------------
+
+# Bump when a code change alters which passages are retrieved, how a reply is read, or how
+# judgments become rows (``nearest_chunks``, ``chunks_naming``, ``round_two_genes``, ``parse_items``,
+# ``locate_items``, ``eligible``, ``aggregate``). The constants below are fingerprinted as they
+# are, so editing them needs no bump.
+RULES_REVISION = 3
+
+
+def rules_digest() -> str:
+    """A fingerprint of everything that decides the scan's tables besides the corpus and the model:
+    the definition, the model's instructions, the retrieval settings and the table columns. A stored
+    scan whose digest differs was made under other rules (gateway/corpus_scan.py does not reuse it)."""
+    import hashlib  # noqa: PLC0415
+
+    sample = Passage("p:0", "p", 0, 1, [Sentence(sid="p:0:0", pmid="p", chunk=0, sent=0, page=1, text="TEXT")])
+    parts = [
+        str(RULES_REVISION), JUDGE_SYSTEM, REQUESTS_SYSTEM, GENE_REQUESTS_SYSTEM, GENE_REQUEST_TEMPLATE,
+        DEFINITION, ",".join(MECHANISM_CLASSES),
+        passage_prompt(sample)[1]["content"], request_messages(1)[1]["content"],
+        *(rx.pattern for rx in (CIT, GARBLED_MARK, AUTH, CITN, MECH, DOM, DOSAGE_WORDING)), KEYWORD_REQUEST,
+        f"max_per_paper={_MAX_PER_PAPER}", f"gene_batch={_GENE_BATCH}",
+        *(f"{k}={PARAMS[k][0]}" for k in ("n_requests", "k_per_request", "keyword_round", "k_per_gene",
+                                          "max_quotes_per_gene")),
+        ",".join(HIT_COLUMNS), ",".join(GENE_COLUMNS), ",".join(REQUEST_COLUMNS),
+    ]
+    return hashlib.sha256("\x1f".join(parts).encode("utf-8")).hexdigest()[:16]
 
 
 def make_tool() -> HarnessTool:
     """The ``extract_haploinsufficient_genes`` record for the catalog (see ``TOOL.md``)."""
     return HarnessTool(
         _TOOL,
-        "Scan EVERY paper of the indexed literature corpus for genes the papers explicitly report as "
+        "Search the indexed literature corpus for genes the papers explicitly report as "
         "HAPLOINSUFFICIENT in retinal disease (a heterozygous loss-of-function allele causes disease "
         "because one copy is not enough; not dominant-negative, not gain-of-function, not recessive). "
-        "Writes genes.csv (one row per gene: HGNC symbol, phenotype and mechanism in the paper's words, "
-        "up to 3 PMIDs with verbatim quotes, review flags) and hits.csv (every judged sentence). Use it "
-        "when the user wants the complete list with evidence as a table; for one focused question use "
-        "deep_literature. Slow (about an hour): call it once per run.",
+        "The model writes search requests, PubMedBERT retrieves the passages, the model reads each "
+        "passage, and every quote is checked against the paper. Writes genes.csv (one row per gene: "
+        "HGNC symbol, phenotype and mechanism in the paper's words, up to 3 PMIDs with verbatim "
+        "quotes, review flags), hits.csv (every judged sentence) and requests.csv (the search "
+        "requests). Use it when the user wants the list with evidence as a table; for one focused "
+        "question use search_corpus or deep_literature. Slow: call it once per run.",
         _schema(),
         run_extract,
         reads_private_data=False, category="literature", requires=("paper-qa",),

@@ -111,7 +111,7 @@ function matches(el, sel) {
   for (const part of rest.match(/\.[\w-]+|\[[^\]]+\]|:last-child/g) || []) {
     if (part[0] === ".") { if (!el.classList.contains(part.slice(1))) return false; }
     else if (part === ":last-child") { const sib = el.parent ? el.parent.children : []; if (sib[sib.length - 1] !== el) return false; }
-    else { const a = /^\[([^=\]]+)(?:="([^"]*)")?\]$/.exec(part); if (el.getAttribute(a[1]) !== (a[2] === undefined ? el.getAttribute(a[1]) : a[2])) return false; }
+    else { const a = /^\[([^=\]]+)(?:="([^"]*)")?\]$/.exec(part); const v = el.getAttribute(a[1]); if (a[2] === undefined ? v === null : v !== a[2]) return false; }
   }
   return true;
 }
@@ -127,14 +127,17 @@ const sandbox = {
                { id: "B", title: "Other chat", messages: [] }],
     activeId: "A", connectionId: "conn", planCardEl: null, planStatusEl: null,
   },
-  PLANDRAFT_KEY: "draft", RUNOWNER_KEY: "owners", STREAMS_KEY: "streams", LASTRUN_KEY: "lastrun",
+  PLANDRAFT_KEY: "draft", RUNOWNER_KEY: "owners", STREAMS_KEY: "streams", LASTRUN_KEY: "lastrun", COMPOSER_KEY: "composer",
   localStorage: { getItem: (k) => (store.has(k) ? store.get(k) : null), setItem: (k, v) => store.set(k, String(v)),
                   removeItem: (k) => store.delete(k) },
   document: { createElement: (t) => makeEl(String(t).toLowerCase()) },
   $: (id) => els[id] || (els[id] = makeEl("div")),
   escapeHtml, renderMarkdown: (s) => "<p>" + escapeHtml(s) + "</p>", absTime: () => "", relTime: () => "1m ago",
   toast: (t) => log.push("toast:" + t), updateComposerButton() {}, mountStream() {}, repaintWorking() {},
-  refreshDownloads() {}, syncPresetUI() {}, messageEl: () => makeEl("div"),
+  refreshDownloads() {}, syncPlaceholder() {}, messageEl: () => makeEl("div"),
+  renderChatUsage() {}, refreshChatUsage() {}, checkBudgetNotices() {}, onUsageUpdate() {},   // usage counter: not under test here
+  setPanel() {},   // the side panel opening for a plan; its tab and contents are drawn into $() elements
+  getComputedStyle: () => ({ lineHeight: "" }),   // no layout here: every step keeps its chevron
   activeSession: () => sandbox.state.sessions.find((x) => x.id === sandbox.state.activeId) || null,
   pushToSession: (sid) => log.push("saved:" + sid), appendArtifacts() {},
   ownerVisible: () => false, setChatRunning: (c, r) => { c.running = r; },

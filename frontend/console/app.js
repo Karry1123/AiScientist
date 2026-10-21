@@ -8,6 +8,14 @@ const RUNOWNER_KEY = "bioagent_runowner_v1"; // {connId, sids}: the chats whose 
 const LASTRUN_KEY = "bioagent_lastrun_v1";   // last COMPLETED run_id — survives a refresh so we can still recognise this conn's own run
 const STREAMS_KEY = "aiscientist_streams_v1"; // stream ids of answers this browser already saved — a reconnect replay of one is dropped
 const PLANDRAFT_KEY = "aiscientist_plandraft_v1"; // {<chat id>: {run, base, text, open}}: each plan editor's unapplied text — survives a reload while that plan is still waiting
+const COMPOSER_KEY = "aiscientist_composer_v1";   // {<chat id>: {draft, bound, roles}}: each chat's composer — survives a reload
+// Every request runs the same way (RCHENLAB/AiScientist issue 21): the agent routes it (a literature
+// search or an analysis: route "auto"), proposes a plan the user reviews before anything runs, no
+// review gate is skipped, the PI chooses one scientist or a team and the pipeline, and what the run
+// hands on is saved to the user's data. The server fixes the same values; they are sent too, so a
+// page served beside an older server still gets a plan to review.
+const FIXED_RUN_OPTIONS = Object.freeze({ plan_mode: true, autonomous: false, mode: "auto", save_results: true,
+                                          presets: [], skills: [], preset_prompt: null, route: "auto" });
 
 const state = {
   connectionId: null,
@@ -21,11 +29,7 @@ const state = {
   // Each chat's run and dialog live in its own record (see chatOf below), not here. What stays
   // here is the one visible chat's DOM: the live bubble of its run and its plan card.
   streamDom: null,      // {body, think, thinkBody, feed} DOM refs of the visible chat's live bubble
-  presets: {},                 // key -> {key, label, prompt, tools} from /api/presets (preset pipelines)
-  presetOrder: [],             // preset-pipeline keys in load order (for the Pipelines & skills picker)
-  skills: {},                  // name -> {name, summary} from /api/skills (atomic skills)
-  skillOrder: [],              // atomic-skill names in load order (for the Pipelines & skills picker)
-  datasets: [],                // uploaded files/folders this session: {name, path, kind}
+  datasets: [],                // uploaded files/folders this session: {name, path, kind}, newest first
   serverRoots: [],             // server folders a dataset can be bound from by path (empty = off)
   serverOfferDismissed: new Set(),   // pasted server paths the user said "Not now" to
   serverBoundTyped: new Set(),       // pasted server paths already bound (as typed, before resolving)
@@ -34,6 +38,10 @@ const state = {
   leftAutoCollapsed: false,    // collapse the connect panel once, on first ready
   planCardEl: null,            // the visible chat's live plan / clarify / decision card
   planStatusEl: null,          // the resolved plan card's status line, updated as the PI works
+  planAnsweredEl: null,        // the visible chat's entry for a plan it answered (drawAnsweredPlan)
+  planView: null,              // a saved plan opened from the chat into the side panel ({agenda, doc, status})
+  planStepOpen: new Map(),     // step text -> shown in full (true) or as two lines (false), as the person left it
+  sideTab: "results",         // which of the side panel's two tabs is showing: "plan" | "results"
 };
 
 const $ = (id) => document.getElementById(id);
@@ -67,14 +75,20 @@ function newChatRecord(sid) {
     planDraftYaml: "",     // what is typed in the plan editor and not applied (or an edit just sent)
     planDraftBase: "",     // the plan document (its YAML) that text and the open editor belong to
     planEditorOpen: false, // the plan editor is open on the waiting card
+    planWords: "",         // a change to the plan typed in the side panel's box and not sent yet
+    planShown: "",        // which version of the waiting plan has opened the side panel already
+    answered: null,        // the plan as it stood when it was answered and the PI took it back (a reply
+                           // in words, an edit, a cancel, a review the server closed): {agenda, doc,
+                           // revised, status}. Its entry and the side panel show it, read-only, until
+                           // the next prompt or the chat's next run.
     bound: [],             // the BIND-SET (feature ②): the server paths of every data file attached
                            // for the next run (a VCF + a BED panel + a 2nd VCF). Ordered by attach;
                            // the server re-ranks to pick the primary. Posted as `datasets`.
     roles: {},             // path -> role the user set on a bound file ("reference" = comparison
                            // data such as a cell-type atlas; never picked as the primary).
     primary: null,         // the PRIMARY of the bind-set (highest-ranked), posted as `dataset_path`
-    caseNote: null,        // the attached clinical description: {name, text} — held as TEXT, not
-                           // uploaded: its only consumer (map_phenotype_to_hpo) runs on the gateway.
+    caseNote: null,        // a clinical description attached as TEXT: {name, text}. The composer no
+                           // longer attaches one (issue 21: it goes in the message); nothing sets it.
     draft: "",             // what was typed in the composer and not sent yet
     ctx: null,             // the last context-occupancy report of this chat's fast-chat turn
   };
@@ -84,7 +98,7 @@ function chatOf(sid) {
   if (!sid) return null;
   sid = String(sid);
   let c = chats.get(sid);
-  if (!c) { c = newChatRecord(sid); chats.set(sid, c); }
+  if (!c) { c = newChatRecord(sid); restoreComposer(c); chats.set(sid, c); }
   return c;
 }
 function activeChat() { return chatOf(state.activeId); }
@@ -116,6 +130,58 @@ for (const [key, field] of Object.entries({ planDoc: "doc", planProblems: "probl
     get() { const c = activeChat(); const v = c && c.plan ? c.plan[field] : undefined; return v === undefined ? emptyChatField(field) : v; },
     set(v) { const c = activeChat(); if (c) { c.plan = c.plan || {}; c.plan[field] = v; } },
   });
+}
+
+// ---- each chat's composer, kept across a reload -------------------------------------------------
+// What was typed and not sent, the data attached for the next run and the run options belong to the
+// chat they were set in (RCHENLAB/AiScientist issue 7). This browser keeps them per chat, so a reload
+// gives every chat back its own and nothing of another's. The case note is not kept: it is a
+// patient's clinical text, held only while the page is open. Logging out clears them all.
+function readComposers() {
+  let all = null;
+  try { all = JSON.parse(localStorage.getItem(COMPOSER_KEY) || "null"); } catch {}
+  return all && typeof all === "object" && !Array.isArray(all) ? all : {};
+}
+function writeComposers(all) {
+  try {
+    if (Object.keys(all).length) localStorage.setItem(COMPOSER_KEY, JSON.stringify(all));
+    else localStorage.removeItem(COMPOSER_KEY);
+  } catch { /* private mode or a full store: the chat keeps its composer until the page closes */ }
+}
+// Only what differs from a new chat is stored; a chat with nothing of its own has no entry.
+function saveComposer(c) {
+  if (!c) return;
+  const entry = {};
+  if (c.draft) entry.draft = c.draft;
+  if (c.bound.length) entry.bound = [...c.bound];
+  const roles = Object.entries(c.roles).filter(([p]) => c.bound.includes(p));
+  if (roles.length) entry.roles = Object.fromEntries(roles);
+  const all = readComposers();
+  if (Object.keys(entry).length) all[c.sid] = entry; else delete all[c.sid];
+  writeComposers(all);
+}
+function restoreComposer(c) {
+  const e = readComposers()[c.sid];
+  if (!e || typeof e !== "object") return;
+  if (typeof e.draft === "string") c.draft = e.draft;
+  if (Array.isArray(e.bound)) c.bound = e.bound.filter((p) => typeof p === "string" && p);
+  for (const [p, role] of Object.entries((e.roles && typeof e.roles === "object") ? e.roles : {})) {
+    if (c.bound.includes(p) && typeof role === "string") c.roles[p] = role;
+  }
+}
+// What an older page stored beside a chat's composer (its engine, Plan first, Bypass, Save results,
+// mode) is no longer read, and the chat's next save drops it.
+function forgetComposer(sid) {
+  const all = readComposers();
+  delete all[String(sid)];
+  writeComposers(all);
+}
+// Entries of chats that no longer exist (deleted elsewhere, or another account's on this browser) go.
+function pruneComposers(sessions) {
+  const keep = new Set(sessions.map((s) => String(s.id)));
+  const all = readComposers();
+  for (const sid of Object.keys(all)) if (!keep.has(sid)) delete all[sid];
+  writeComposers(all);
 }
 
 // The chats whose run is in flight, kept across a reload so their replayed results land in them.
@@ -172,6 +238,7 @@ const EMOJI_SYMBOL = {
   "🙋": "front_hand", "✋": "front_hand", "⚠": "warning", "❗": "priority_high", "✂": "content_cut",
   "✏": "edit", "📏": "straighten", "🗜": "compress", "📚": "menu_book", "🔀": "alt_route",
   "❓": "help", "📥": "download", "📤": "upload", "🔴": "error", "🟢": "check_circle", "⏳": "hourglass_empty",
+  "💲": "payments",
 };
 // Match any mapped emoji, swallowing a trailing variation-selector (U+FE0F) so "⚠️" maps cleanly.
 const EMOJI_RE = new RegExp("(" + Object.keys(EMOJI_SYMBOL).join("|") + ")️?", "g");
@@ -411,18 +478,36 @@ function renderMarkdown(text) {
       stash('<pre class="md-code"><code>' + escapeHtml(body.replace(/\n+$/, "")) + "</code></pre>"))
     .replace(/`([^`\n]+)`/g, (_m, c) => stash("<code>" + escapeHtml(c) + "</code>"));
   s = mdTables(escapeHtml(s))
+    .replace(/^#### (.+)$/gm, "<h4>$1</h4>")
     .replace(/^### (.+)$/gm, "<h3>$1</h3>")
     .replace(/^## (.+)$/gm, "<h2>$1</h2>")
     .replace(/^# (.+)$/gm, "<h2>$1</h2>")
+    .replace(/^[ \t]*(?:-{3,}|\*{3,}|_{3,})[ \t]*$/gm, "<hr>")
+    // "> " lines (escaped to &gt; above) become one quote block
+    .replace(/(?:^&gt; ?.*(?:\n|$))+/gm, (block) =>
+      "<blockquote>" + block.replace(/\n$/, "").split("\n").map((l) => l.replace(/^&gt; ?/, "")).join("\n") + "</blockquote>")
     // group consecutive "- " / "* " lines into a real bullet list
     .replace(/(?:^[ \t]*[-*] .+(?:\n|$))+/gm, (block) =>
       "<ul>" + block.trim().split(/\n/).map((l) =>
         "<li>" + l.replace(/^[ \t]*[-*] /, "") + "</li>").join("") + "</ul>")
+    // and consecutive "1. " / "1) " lines into a numbered one, keeping the first number
+    .replace(/(?:^[ \t]*\d{1,3}[.)] .+(?:\n|$))+/gm, (block) => {
+      const items = block.trim().split(/\n/);
+      const first = parseInt(items[0], 10);
+      return (first > 1 ? `<ol start="${first}">` : "<ol>") + items.map((l) =>
+        "<li>" + l.replace(/^[ \t]*\d{1,3}[.)] /, "") + "</li>").join("") + "</ol>";
+    })
     .replace(/\*\*(.+?)\*\*/g, "<strong>$1</strong>")
     // italic: underscores NOT flanked by word chars, so snake_case identifiers stay intact
     .replace(/(?<![A-Za-z0-9_])_([^_\n]+?)_(?![A-Za-z0-9_])/g, "<em>$1</em>");
-  return withSymbols(s).replace(/￼C(\d+)￼/g, (_m, i) => codes[+i]);
+  // The answer is shown with white-space: pre-wrap, so a newline next to a block (a heading, a
+  // list, a table, a code block) would add an empty line on top of the block's own margin. Drop
+  // those newlines and let the CSS margins space the blocks.
+  return withSymbols(s).replace(/￼C(\d+)￼/g, (_m, i) => codes[+i])
+    .replace(MD_BLOCK_OPEN, "$1").replace(MD_BLOCK_CLOSE, "$1");
 }
+const MD_BLOCK_OPEN = /\n+(<(?:h2|h3|h4|ul|ol|table|pre|blockquote|hr)[\s>])/g;
+const MD_BLOCK_CLOSE = /(<\/(?:h2|h3|h4|ul|ol|table|pre|blockquote)>|<hr>)\n+/g;
 
 function isUnreachable(err) {
   return err instanceof TypeError; // fetch rejects with TypeError when the server is unreachable
@@ -464,6 +549,7 @@ async function api(method, url, body) {
 
 // Map a stored server message row -> the in-memory shape messageEl() renders.
 function msgFromServer(m) {
+  if (m.kind === "plan") return { role: m.role || "assistant", kind: "plan", content: m.content || "", plan: (m.meta || {}).plan || null };
   if (m.kind === "artifacts") {
     const meta = m.meta || {};
     return { role: m.role || "assistant", kind: "artifacts", items: meta.items || [], bundleUrl: meta.bundleUrl,
@@ -484,6 +570,7 @@ function msgFromServer(m) {
 // The payload to persist a message server-side (artifacts: text empty, blobs by URL in meta).
 function serverMsgPayload(msg) {
   // stream_id: the server keeps one copy of an answer that several windows save (see add_message).
+  if (msg.kind === "plan") return { role: msg.role || "assistant", content: msg.content || "", kind: "plan", meta: { plan: msg.plan || null } };
   if (msg.kind === "artifacts") {
     return { role: msg.role || "assistant", content: "", kind: "artifacts",
              meta: { items: msg.items || [], bundleUrl: msg.bundleUrl, ...(msg.streamId ? { stream_id: msg.streamId } : {}) } };
@@ -509,7 +596,6 @@ async function ensureMessages(s) {
     const data = await api("GET", `/api/conversations/${s.cid}`);
     s.messages = (data.messages || []).map(msgFromServer);
     s.title = data.conversation.title;
-    s.presetKeys = String(data.conversation.preset_key || "").split(",").map((x) => x.trim()).filter(Boolean);  // restore forced skills
   } catch { /* keep whatever we have */ }
   s.loaded = true;
 }
@@ -522,8 +608,9 @@ async function loadSessions() {
         id: String(c.id), cid: c.id, title: c.title, messages: [], loaded: false,
         createdAt: c.created_at, updatedAt: c.updated_at,
       }));
+      pruneComposers(state.sessions);
       if (!state.sessions.length) { await newSession(); }
-      else { state.activeId = state.sessions[0].id; await ensureMessages(activeSession()); }
+      else { state.activeId = state.sessions[0].id; showDialog(); await ensureMessages(activeSession()); }
       renderSessionList();
       renderChat();
       return;
@@ -540,7 +627,7 @@ async function loadSessions() {
     state.sessions = Array.isArray(raw) ? raw : [];
   } catch { state.sessions = []; }
   if (!state.sessions.length) newSession();
-  else state.activeId = state.sessions[0].id;
+  else { state.activeId = state.sessions[0].id; showDialog(); }
 }
 
 function persistSessions() {
@@ -560,6 +647,7 @@ async function newSession() {
       state.sessions.unshift({ id: String(c.id), cid: c.id, title: c.title, messages: [], loaded: true,
       createdAt: c.created_at, updatedAt: c.updated_at || c.created_at });
       state.activeId = String(c.id);
+      state.planView = null;
       renderSessionList();
       renderChat();
       showDialog();
@@ -569,6 +657,7 @@ async function newSession() {
   const s = { id: rid(), title: "New chat", messages: [], loaded: true, createdAt: Date.now() };
   state.sessions.unshift(s);
   state.activeId = s.id;
+  state.planView = null;
   persistSessions();
   renderSessionList();
   renderChat();
@@ -578,6 +667,7 @@ async function newSession() {
 async function selectSession(id) {
   leaveDialog();
   state.activeId = id;
+  state.planView = null;
   renderSessionList();
   showDialog();
   await ensureMessages(activeSession());
@@ -585,63 +675,24 @@ async function selectSession(id) {
 }
 
 // Keep what was typed in the chat being left; show the dialog of the chat being entered — its
-// attachments, case note, draft and context meter, never the previous chat's.
+// attachments, case note, draft, uploads and context meter, never the previous chat's.
 function leaveDialog() {
   const c = activeChat(), input = $("chatInput");
-  if (c && input) c.draft = input.value;
+  if (c && input) { c.draft = input.value; saveComposer(c); }
 }
 function showDialog() {
   const c = activeChat(), input = $("chatInput");
   if (input) input.value = (c && c.draft) || "";
   syncDatasetSelection();
-  renderCaseNoteChip();
+  renderUploadLine();
   // Occupancy is per conversation and only known once THIS chat takes a turn — the previous
   // conversation's number would be worse than showing nothing.
   if (c && c.ctx) renderContextMeter(c.ctx); else hideContextMeter();
   updateComposerButton();
 }
 
-// ---- research path / methodology context ----------------------------------
-// A preset steers the PI's plan via an editable guidance prompt (it does not bypass
-// the PI). The prompt is conversation-level context: shown, editable, sent with the
-// run, and persisted with the chat (server-side) so it survives a reload.
-
-async function loadPresets() {
-  try {
-    const data = await (await fetch("/api/presets")).json();
-    state.presets = {};
-    state.presetOrder = [];
-    for (const p of (data.presets || [])) { state.presets[p.key] = p; state.presetOrder.push(p.key); }
-  } catch { /* presets are optional */ }
-  renderMethods();
-}
-
-async function loadSkills() {
-  try {
-    const data = await (await fetch("/api/skills")).json();
-    state.skills = {};
-    state.skillOrder = [];
-    for (const s of (data.skills || [])) { state.skills[s.name] = s; state.skillOrder.push(s.name); }
-  } catch { /* skills are optional */ }
-  renderMethods();
-}
-
-// ---- pipelines & skills picker ------------------------------------------------------------------
-// By default the PI picks the best-fit preset pipeline and the agent fetches skills on demand. This
-// picker REQUIRES some for the active chat: a ticked pipeline steers every plan in it, a ticked
-// skill must be applied. It opens as a sheet so each entry can say everything it is — the whole
-// description, the tools a pipeline composes, the protocol text — and what is ticked shows as chips
-// above the composer, so a chat's requirements are visible without opening anything. (It replaces
-// an inline "Advanced" disclosure whose two 176 px lists cut all of that off.)
+// ---- pipeline and skill text, as the System page shows it ----------------------------------------
 const METHOD_DATA_TYPES = { scrna: "scRNA-seq", variants: "Variants (VCF)" };
-
-function methodPlain(text) {
-  return String(text == null ? "" : text).replace(/\*\*/g, "").replace(/`/g, "").trim();
-}
-
-function methodName(key) {
-  return String(key || "").replace(/\.py$/, "").replace(/_/g, " ");
-}
 
 // A protocol file is hard-wrapped at about 90 columns. Shown as it is, in a box of another width,
 // every line breaks twice. So the lines of one paragraph or list item are joined, and only the
@@ -661,277 +712,10 @@ function methodUnwrap(text) {
   return out.join("\n");
 }
 
-function methodPicks() {
-  const s = activeSession();
-  return { presets: new Set((s && s.presetKeys) || []), skills: new Set((s && s.skillKeys) || []) };
-}
-
-// The entries of one tab that match the search, as plain records.
-function methodEntries(tab, needle) {
-  const q = String(needle || "").trim().toLowerCase();
-  const hit = (text) => !q || text.toLowerCase().includes(q);
-  if (tab === "skills") {
-    return (state.skillOrder || []).map((name) => state.skills[name] || { name })
-      .filter((sk) => hit(`${sk.name} ${methodName(sk.name)} ${sk.summary || ""} ${sk.category || ""}`))
-      .map((sk) => ({ kind: "skill", key: sk.name, title: methodName(sk.name), text: methodPlain(sk.summary),
-                      badge: sk.category || "", tools: [], protocol: false }));
-  }
-  return (state.presetOrder || []).map((k) => state.presets[k] || { key: k })
-    .filter((pp) => hit(`${pp.key} ${pp.label || ""} ${(pp.tools || []).join(" ")} ${pp.data_type || ""}`))
-    .map((pp) => ({ kind: "preset", key: pp.key, title: methodPlain(pp.label) || methodName(pp.key), text: "",
-                    badge: METHOD_DATA_TYPES[pp.data_type] || pp.data_type || "",
-                    tools: Array.isArray(pp.tools) ? pp.tools : [], protocol: !!pp.prompt }));
-}
-
-function methodRowsHtml(tab, needle, picks) {
-  const entries = methodEntries(tab, needle);
-  if (!entries.length) {
-    return `<div class="method-empty">${needle ? "Nothing matches that search." : "Nothing to show here yet."}</div>`;
-  }
-  const chosen = tab === "skills" ? picks.skills : picks.presets;
-  return entries.map((e) => {
-    const on = chosen.has(e.key);
-    return `<div class="method-row${on ? " checked" : ""}" data-kind="${e.kind}" data-key="${escapeHtml(e.key)}">`
-      + `<label class="method-pick"><input type="checkbox"${on ? " checked" : ""} />`
-      + `<span class="method-title">${escapeHtml(e.title)}</span></label>`
-      + (e.text ? `<div class="method-text">${escapeHtml(e.text)}</div>` : "")
-      + `<div class="method-meta"><code class="method-key">${escapeHtml(e.key)}</code>`
-      + (e.badge ? `<span class="method-badge">${escapeHtml(e.badge)}</span>` : "")
-      + e.tools.map((t) => `<span class="method-tool">${escapeHtml(t)}</span>`).join("")
-      + `</div>`
-      // Filled in when opened (renderMethods): a protocol is a few kB of text per pipeline.
-      + (e.protocol ? `<details class="method-protocol"><summary>Read the protocol</summary>`
-                      + `<div class="method-protocol-body"></div></details>` : "")
-      + `</div>`;
-  }).join("");
-}
-
-function methodSummaryText(picks) {
-  const p = picks.presets.size, k = picks.skills.size;
-  if (!p && !k) return "Nothing required — the PI chooses the pipeline, and skills are fetched on demand.";
-  const bits = [];
-  if (p) bits.push(`${p} pipeline${p === 1 ? "" : "s"}`);
-  if (k) bits.push(`${k} skill${k === 1 ? "" : "s"}`);
-  return `${bits.join(" and ")} required in this chat.`;
-}
-
-function methodChipsHtml(picks) {
-  const chip = (kind, key, icon, title) =>
-    `<span class="method-chip" title="${escapeHtml(title)}">`
-    + `<span class="material-symbols-outlined msym" aria-hidden="true">${icon}</span>`
-    + `<span class="method-chip-name">${escapeHtml(methodName(key))}</span>`
-    + `<button type="button" class="method-chip-x" data-kind="${kind}" data-key="${escapeHtml(key)}" `
-    + `aria-label="Stop requiring ${escapeHtml(methodName(key))}">×</button></span>`;
-  const out = [];
-  for (const k of picks.presets) out.push(chip("preset", k, "account_tree", methodPlain((state.presets[k] || {}).label) || k));
-  for (const k of picks.skills) out.push(chip("skill", k, "extension", methodPlain((state.skills[k] || {}).summary) || k));
-  return out.length ? `<span class="method-chips-label">Required</span>` + out.join("") : "";
-}
-
-// Paint everything that shows the active chat's picks: the button's count, the chips, and — when
-// the sheet is open — its list, tab counts and summary. A tick only re-marks the rows that are
-// there (`rebuild` false): rebuilding the list would close the protocol the person is reading.
-function renderMethods(rebuild = true) {
-  const picks = methodPicks();
-  const n = picks.presets.size + picks.skills.size;
-  const count = $("methodsCount");
-  if (count) { count.textContent = String(n); count.classList.toggle("hidden", !n); }
-  const chips = $("methodChips");
-  if (chips) { chips.innerHTML = methodChipsHtml(picks); chips.classList.toggle("hidden", !n); }
-  const modal = $("methodsModal");
-  if (!modal || modal.classList.contains("hidden")) return;
-  const tab = state.methodsTab || "pipelines";
-  for (const btn of modal.querySelectorAll(".methods-tabs [data-tab]")) {
-    const mine = btn.dataset.tab === tab;
-    btn.classList.toggle("active", mine);
-    btn.setAttribute("aria-selected", mine ? "true" : "false");
-    const total = btn.dataset.tab === "skills" ? (state.skillOrder || []).length : (state.presetOrder || []).length;
-    const picked = btn.dataset.tab === "skills" ? picks.skills.size : picks.presets.size;
-    btn.querySelector(".methods-tab-n").textContent = picked ? `${picked}/${total}` : String(total);
-  }
-  const list = $("methodsList");
-  if (rebuild) {
-    list.innerHTML = methodRowsHtml(tab, $("methodsSearch").value, picks);
-  } else {
-    for (const row of list.querySelectorAll(".method-row")) {
-      const on = (row.dataset.kind === "skill" ? picks.skills : picks.presets).has(row.dataset.key);
-      row.classList.toggle("checked", on);
-      row.querySelector('input[type="checkbox"]').checked = on;
-    }
-  }
-  $("methodsSummary").textContent = methodSummaryText(picks);
-  $("methodsClear").disabled = !n;
-}
-
-function openMethods(tab) {
-  if (tab) state.methodsTab = tab;
-  $("methodsModal").classList.remove("hidden");
-  $("methodsSearch").value = "";
-  renderMethods();
-  $("methodsSearch").focus();
-}
-
-function closeMethods() {
-  $("methodsModal").classList.add("hidden");
-}
-
-// Require (or stop requiring) one pipeline or skill for this chat. Persisted per chat like the
-// mode; the run sends the keys, and the plan must follow each pipeline and apply each skill.
-function setMethodPick(kind, key, checked) {
-  const s = activeSession();
-  if (!s) return;
-  const field = kind === "skill" ? "skillKeys" : "presetKeys";
-  const set = new Set(s[field] || []);
-  checked ? set.add(key) : set.delete(key);
-  s[field] = [...set];
-  if (kind !== "skill") saveSessionContext(s);   // pipelines are part of the stored conversation
-  persistSessions();
-  renderMethods(false);
-}
-
-function clearMethodPicks() {
-  const s = activeSession();
-  if (!s) return;
-  s.presetKeys = [];
-  s.skillKeys = [];
-  saveSessionContext(s);
-  persistSessions();
-  renderMethods(false);
-}
-
-function wireMethods() {
-  const modal = $("methodsModal");
-  if (!modal) return;
-  $("methodsBtn").addEventListener("click", () => openMethods());
-  $("methodsClose").addEventListener("click", closeMethods);
-  $("methodsDone").addEventListener("click", closeMethods);
-  $("methodsClear").addEventListener("click", clearMethodPicks);
-  modal.addEventListener("click", (e) => { if (e.target === modal) closeMethods(); });
-  document.addEventListener("keydown", (e) => {
-    if (e.key === "Escape" && !modal.classList.contains("hidden")) closeMethods();
-  });
-  $("methodsSearch").addEventListener("input", () => renderMethods());
-  for (const btn of modal.querySelectorAll(".methods-tabs [data-tab]")) {
-    btn.addEventListener("click", () => { state.methodsTab = btn.dataset.tab; renderMethods(); });
-  }
-  const list = $("methodsList");
-  list.addEventListener("change", (e) => {
-    const row = e.target.closest(".method-row");
-    if (row && e.target.matches('input[type="checkbox"]')) setMethodPick(row.dataset.kind, row.dataset.key, e.target.checked);
-  });
-  // `toggle` does not bubble, hence the capture. The protocol is rendered the first time it opens.
-  list.addEventListener("toggle", (e) => {
-    const box = e.target;
-    if (!box.matches || !box.matches(".method-protocol") || !box.open) return;
-    const body = box.querySelector(".method-protocol-body");
-    const row = box.closest(".method-row");
-    if (body && !body.dataset.done && row) {
-      body.innerHTML = renderMarkdown(methodUnwrap((state.presets[row.dataset.key] || {}).prompt));
-      body.dataset.done = "1";
-    }
-  }, true);
-  $("methodChips").addEventListener("click", (e) => {
-    const x = e.target.closest(".method-chip-x");
-    if (x) setMethodPick(x.dataset.kind, x.dataset.key, false);
-  });
-}
-
-// Reflect the active chat's saved research path into the controls.
-function syncPresetUI() {
-  // Reflect the active chat's picks (preset pipelines + required skills) and run mode into the UI.
-  renderMethods();
-  const s = activeSession();
-  const modeSel = $("modeSelect");
-  if (modeSel) modeSel.value = (s && s.mode) || "auto";
-  const routeSel = $("routeSelect");
-  if (routeSel) routeSel.value = (s && s.route) || "research";
-  applyRouteUI();
-}
-
-// The user picks the MODE (single agent vs Virtual-Lab team); the PI still auto-selects
-// the skill. Saved per-chat so switching chats restores the choice.
-function onModeChange() {
-  const s = activeSession();
-  if (!s) return;
-  s.mode = $("modeSelect").value || "auto";
-  persistSessions();
-}
-
-// ---- Axis B: chat (fast path) vs research (full lab) ----------------------
-// Which ENGINE answers, independent of Axis A (`mode`, one scientist vs a Virtual-Lab team,
-// which only applies inside the research engine). Saved per-chat like `mode`, so a chat used
-// for quick questions stays in chat mode when you switch back to it. "corpus" is the exception:
-// it is saved only until its scan is sent (leaveCorpusRoute).
-function activeRoute() {
-  const s = activeSession();
-  return (s && s.route) || ($("routeSelect") && $("routeSelect").value) || "research";
-}
-
-// The research-only controls (team mode, plan review, bypass) have no meaning on the fast path —
-// there is no plan to review and no team to convene. Disable rather than hide, so the user can see
-// what switching back to Research would give them.
-function applyRouteUI() {
-  const route = activeRoute();
-  const chat = route === "chat";
-  const corpus = route === "corpus";
-  // Neither the fast path nor the corpus scan has a plan to review or a team to convene.
-  const noLab = chat || corpus;
-  for (const id of ["modeSelect", "planMode", "autonomousMode", "saveResults", "methodsBtn"]) {
-    const el = $(id);
-    if (el) { el.disabled = noLab; if (el.closest("label")) el.closest("label").classList.toggle("dimmed", noLab); }
-  }
-  const sel = $("modeSelect");
-  if (sel) sel.classList.toggle("dimmed", noLab);
+// The composer's placeholder, unless a plan is waiting in this chat (then it asks what to change).
+function syncPlaceholder() {
   const input = $("chatInput");
-  if (input && !state.planPending) {
-    input.placeholder = chat
-      ? "Ask a quick question — answers start immediately (no analysis, no report)…"
-      : corpus
-        ? "Press Send to scan the whole corpus for haploinsufficient genes (the text here is only a label for the run)…"
-        : DEFAULT_PLACEHOLDER;
-  }
-}
-
-function onRouteChange() {
-  const s = activeSession();
-  if (!s) return;
-  const next = $("routeSelect").value || "research";
-  // The engine to come back to after a corpus scan — see leaveCorpusRoute.
-  if (next !== "corpus") delete s.routeBeforeCorpus;
-  else if (s.route !== "corpus") s.routeBeforeCorpus = s.route || "research";
-  s.route = next;
-  persistSessions();
-  applyRouteUI();
-}
-
-// A corpus scan is one ACTION, not an engine a chat stays on: once the scan is sent, the chat goes
-// back to the engine it was using. Left on "corpus", the next message — usually a question ABOUT
-// the tables — would start another hour-long scan with that question as its label.
-function leaveCorpusRoute(s) {
-  if (!s || s.route !== "corpus") return;
-  s.route = s.routeBeforeCorpus || "research";
-  delete s.routeBeforeCorpus;
-  persistSessions();
-  if (s !== activeSession()) return;       // the user switched chats while the request was out
-  const sel = $("routeSelect");
-  if (sel) sel.value = s.route;
-  applyRouteUI();
-}
-
-// Optional override: force specific research path(s) (the PI auto-selects by default). We persist
-// only the KEYS — each skill's guidance body is PI-internal and never shown/edited; to refine the
-// plan the user talks to the PI in chat (plan mode), not by editing text.
-// Persist the research-path context onto the server conversation (debounced), so it
-// survives a reload/device change — it's part of the chat's stored context.
-let _ctxSaveTimer = null;
-function saveSessionContext(s) {
-  if (!authed() || !s || !s.cid) return;
-  clearTimeout(_ctxSaveTimer);
-  _ctxSaveTimer = setTimeout(() => {
-    api("PATCH", `/api/conversations/${s.cid}`, {
-      preset_key: (s.presetKeys || []).join(","), context_prompt: "",
-    }).catch(() => {});
-  }, 500);
+  if (input && !state.planPending) input.placeholder = DEFAULT_PLACEHOLDER;
 }
 
 // Pull the (owner, run_id) of every finished run a chat owns, from the artifact
@@ -994,6 +778,7 @@ async function deleteSession(id) {
   if (authed() && gone && gone.cid) api("DELETE", `/api/conversations/${gone.cid}`).catch(() => {});
   state.sessions = state.sessions.filter((s) => s.id !== id);
   chats.delete(String(id));
+  forgetComposer(id);
   saveRunOwners();
   if (state.activeId === id) {
     if (state.sessions.length) { state.activeId = state.sessions[0].id; showDialog(); await ensureMessages(activeSession()); }
@@ -1061,6 +846,8 @@ function renderChat() {
   const s = activeSession();
   const c = activeChat();
   $("chatTitle").textContent = s ? s.title || "New chat" : "New chat";
+  renderChatUsage();
+  if (c && !c.usage) refreshChatUsage(c);
   const stream = $("chatStream");
   stream.innerHTML = "";
   state.streamDom = null;
@@ -1068,13 +855,15 @@ function renderChat() {
   // waiting in this chat is drawn again below, from the chat's record.
   state.planCardEl = null;
   state.planStatusEl = null;
+  state.planAnsweredEl = null;
   // Always re-derive the downloads panel from the ACTIVE session — including the
   // empty-session case below, which used to early-return and leave the previous
   // session's downloads stranded in the panel.
   refreshDownloads();
-  syncPresetUI();   // reflect this chat's research-path context in the controls
+  syncPlaceholder();
   if (!s || (!s.messages.length && !ownerVisible() && !planPromptVisible())) {
-    stream.innerHTML = '<div class="empty-hint">Connect to a GPU-backed Qwen3 on HPC3, then ask a research question.</div>';
+    stream.innerHTML = '<div class="empty-hint">Connect to HPC3, then ask a research question.</div>';
+    renderPlanPanel();
     updateComposerButton();
     return;
   }
@@ -1086,6 +875,9 @@ function renderChat() {
   // Same for a plan, a question or a decision point that is waiting in this chat: its card with
   // its buttons comes back, instead of a composer that says a plan is pending and nothing to act on.
   drawPlanPrompt();
+  // …and the side panel's Plan tab follows the chat on screen: its waiting plan, else its last one.
+  renderPlanPanel();
+  if (c && c.plan && c.plan.kind === "plan") selectSideTab("plan");
   // The composer follows the chat on screen: its Send/Stop button and its placeholder are this
   // chat's, and both were last set for the chat that was left.
   updateComposerButton();
@@ -1100,6 +892,14 @@ function refreshDownloads() {
 }
 
 function messageEl(m) {
+  if (m.kind === "plan" && m.plan) {
+    // An approved plan: its entry, which opens the whole plan in the side panel.
+    const el = document.createElement("div");
+    el.className = "msg assistant plan-card plan-sheet plan-entry saved";
+    el.innerHTML = planEntryHtml(m.plan.agenda || [], m.plan.doc || null, { status: m.plan.status || "Approved" });
+    el.querySelector('[data-plan="open"]').addEventListener("click", () => { state.planView = m.plan; openPlanPanel(); renderPlanPanel(); });
+    return el;
+  }
   if (m.kind === "artifacts") {
     const el = document.createElement("div");
     el.className = "artifacts-block";
@@ -1387,6 +1187,7 @@ function streamCode(c, code) {
 // event at all, so the chip simply never appears — it must not render an empty or "NaN" box.
 function fmtTokens(n) {
   if (!(n >= 1000)) return String(n);
+  if (n >= 1e6) { const m = n / 1e6; return (m >= 10 ? Math.round(m) : Math.round(m * 10) / 10) + "M"; }
   const k = n / 1000;
   return (k >= 10 ? Math.round(k) : Math.round(k * 10) / 10) + "K";
 }
@@ -1452,6 +1253,7 @@ function appendArtifacts(c, items, bundleUrl) {
     $("chatStream").appendChild(messageEl(msg));
     stickToBottom();
     renderDownloads(items, bundleUrl);
+    if (!c.plan) selectSideTab("results");
   }
 }
 
@@ -1550,7 +1352,9 @@ function fmtSize(n) {
   if (!n && n !== 0) return "";
   if (n < 1024) return n + " B";
   if (n < 1024 * 1024) return (n / 1024).toFixed(0) + " KB";
-  return (n / 1024 / 1024).toFixed(1) + " MB";
+  if (n < 1024 ** 3) return (n / 1024 / 1024).toFixed(1) + " MB";
+  if (n < 1024 ** 4) return (n / 1024 ** 3).toFixed(2) + " GB";
+  return (n / 1024 ** 4).toFixed(2) + " TB";
 }
 
 // Human label + sort order for the bundle's top-level folders.
@@ -1738,9 +1542,25 @@ function reconcileRuns(summary) {
   }
 }
 
+// The header's second line: the model this session reasons with and where it runs (RCHENLAB/AiScientist
+// issue 32). Empty without a session, where the status on the right already says Disconnected.
+function sessionModelLine(summary) {
+  if (!summary || summary.status === "disconnected" || summary.status === "error") return "";
+  const ep = summary.llm_endpoint || {};
+  const name = (m) => String(m || "").replace(/\/+$/, "").split("/").pop();
+  let line;
+  if (ep.kind === "shared") line = `${name(ep.model) || "Shared model"} · lab's shared server`;
+  else if (ep.kind === "credential") line = `${name(ep.model) || ep.label || "API model"} · your API key`;
+  else if (ep.kind === "cluster") line = `${ep.cluster_label || name(summary.selected_model || ep.model) || "Cluster model"} · your GPU on HPC3`;
+  else if (ep.kind === "missing") line = ep.label || "";
+  else line = name(summary.selected_model || summary.model);
+  return line && summary.mock ? `${line} · mock` : line;
+}
+
 function applyStatus(summary) {
   const prevStatus = state.status;
   state.status = summary.status;
+  $("headerModel").textContent = sessionModelLine(summary);
   const dot = $("connDot");
   dot.className = "dot " + (summary.status === "ready" ? "ready" : summary.status === "error" ? "error" : summary.status === "disconnected" ? "muted" : "connecting");
   const labels = { connecting: "Connecting…", provisioning: "Provisioning…", ready: `Live · ${summary.model}`, error: "Error", disconnected: "Disconnected" };
@@ -1792,7 +1612,6 @@ function applyStatus(summary) {
       : "Bringing the GPU session up…";
   }
   if (isReady) {
-    renderModelOptions(summary);
     // Which LLM answers, and — when that is off-site — a banner that stays up for as long as it
     // is selected. Loaded once per session; after that the status stream keeps the picker honest.
     if (!apiKeys.creds.length && !state._apiKeysLoaded) { state._apiKeysLoaded = true; loadApiCredentials(); }
@@ -1823,6 +1642,8 @@ function applyStatus(summary) {
     }
   }
   if (summary.gpu) renderGpu(summary);
+  if (showConnected && summary.session) renderSessionState(summary.session);
+  else if (isLogin) renderSessionState(null);
   if (isLogin || isReady) hideDuoPanel();
 
   // Cold-start status card in the chat area (replaces the removed log panel as a liveness
@@ -1888,34 +1709,31 @@ function updateBoot(ev) {
   if (label) showBoot(label, { sub: BOOT_SUB });
 }
 
-function renderModelOptions(summary) {
-  const select = $("modelSelect");
-  const models = summary.available_models || [];
-  const selected = summary.selected_model || summary.model;
-  select.innerHTML = models.map((m) => `<option value="${escapeHtml(m)}" ${m === selected || m.split(":")[0] === (selected || "").split(":")[0] ? "selected" : ""}>${escapeHtml(m)}</option>`).join("");
-  if (!models.length) select.innerHTML = `<option>${escapeHtml(selected || "qwen3")}</option>`;
-}
-
-async function selectModel(model) {
-  if (!state.connectionId || !model) return;
-  try {
-    const res = await fetch("/api/model", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ connection_id: state.connectionId, model }) });
-    const d = await res.json();
-    if (!res.ok) { toast(d.error || "Model switch failed"); return; }
-    if (d.status === "pulling") toast(`Pulling ${model} … watch the log for progress.`);
-    else toast(`Model: ${model}`);
-  } catch (err) { toast(isUnreachable(err) ? "Can't reach the local server." : "Model switch failed: " + err.message); }
-}
-
 // ---- bring-your-own LLM API key -------------------------------------------
 //
-// Two axes that look similar but are not: the Model row picks among what vLLM already loaded
-// into VRAM at serve-launch, while this picks WHICH ENDPOINT answers at all. Switching endpoint
-// costs nothing and needs no reconnect — an API serves whatever the provider offers.
+// The endpoint IS the model choice: each entry names its model (the shared model, a cluster weight
+// set, a saved key's model). Switching to an API endpoint costs nothing and needs no reconnect.
 
 const apiKeys = { creds: [], providers: [], editing: null, pendingSelect: null,
                   activeId: "", connectChoice: "", models: [], storage: null,
-                  comboActive: -1, fetchedFor: "" };
+                  comboActive: -1, fetchedFor: "", shared: null };
+
+// The lab's shared model on HPC3, offered as an endpoint like a saved key. Whatever a session chooses
+// answers all of its calls: the cluster GPU's Qwen, the shared model, or the user's own API. A session
+// on the shared model holds no GPU of its own. The server lists it (`shared` on /api/llm-credentials)
+// only when it keeps one; its address and key never reach the page.
+const SHARED_ENDPOINT = "lab-shared";
+function sharedOptionHtml() {
+  const s = apiKeys.shared;
+  if (!s) return "";
+  return `<option value="${SHARED_ENDPOINT}">${escapeHtml(s.label)} · ${escapeHtml(s.model)}${s.up ? "" : " (starting…)"}</option>`;
+}
+function isEndpointValue(v) { return v === SHARED_ENDPOINT ? !!apiKeys.shared : apiKeys.creds.some((c) => c.id === v); }
+// The lab's own choices, the shared model first: where the server keeps one it is everyone's default.
+function labOptionsHtml() { return sharedOptionHtml() + clusterOptionsHtml(); }
+// What a picker falls back to when the endpoint in use goes away (a deleted key): the cluster GPU
+// where sessions may still have one, else the shared model.
+function fallbackEndpoint() { return !clusterModels.sessionGpu && apiKeys.shared ? SHARED_ENDPOINT : ""; }
 
 // The "add one" affordance belongs INSIDE the picker, not only beside it. A first-time user opens
 // the endpoint dropdown looking for their own endpoint, finds a single "Cluster GPU" entry, and
@@ -1928,7 +1746,8 @@ const ADD_KEY_OPTION = "__add_key__";
 // previous Qwen3.6 AWQ, ...), each needing its own vLLM image and flags. The picker lists them as
 // "cluster:<id>" options; the 🖥 dialog shows which are on disk and lets an admin manage the list.
 const CLUSTER_PREFIX = "cluster:";
-const clusterModels = { models: [], unregistered: null, scanned: false, canManage: false, editing: null };
+const clusterModels = { models: [], unregistered: null, scanned: false, canManage: false, editing: null,
+                        sessionGpu: true };
 
 function clusterValue(id) {
   const m = clusterModels.models.find((x) => x.id === id && x.enabled)
@@ -1939,6 +1758,7 @@ function clusterValue(id) {
 function isClusterValue(v) { return !v || v.startsWith(CLUSTER_PREFIX); }
 
 function clusterOptionsHtml() {
+  if (!clusterModels.sessionGpu) return "";   // this server offers no session a GPU of its own
   const enabled = clusterModels.models.filter((m) => m.enabled);
   if (!enabled.length) return `<option value="${CLUSTER_PREFIX}">Cluster GPU (vLLM at UCI)</option>`;
   return enabled.map((m) => `<option value="${CLUSTER_PREFIX}${escapeHtml(m.id)}">Cluster GPU · ${escapeHtml(m.label)}${m.default ? " (default)" : ""}</option>`).join("");
@@ -1952,6 +1772,7 @@ async function loadClusterModels({ scan = false } = {}) {
     clusterModels.unregistered = d.unregistered;
     clusterModels.scanned = !!d.scanned;
     clusterModels.canManage = !!d.can_manage;
+    clusterModels.sessionGpu = d.session_gpu !== false;
   } catch { /* keep the last list; the picker still works with what it has */ }
   renderEndpointSelect();
   renderConnectEndpointSelect();
@@ -1976,6 +1797,7 @@ async function loadApiCredentials() {
   try {
     const d = await (await fetch("/api/llm-credentials" + apiKeyOwnerQuery())).json();
     apiKeys.creds = d.credentials || [];
+    apiKeys.shared = d.shared || null;
     apiKeys.storage = d.storage || null;
   } catch { apiKeys.creds = []; }
   renderEndpointSelect();
@@ -1992,12 +1814,13 @@ function renderEndpointSelect(summary) {
   // a re-render then still names the model the session actually serves, not the default.
   if (current) apiKeys.lastEndpoint = current;
   const known = current || apiKeys.lastEndpoint;
-  const activeId = current && current.kind === "credential" ? current.credential_id
+  const onKey = current && (current.kind === "credential" || current.kind === "shared");
+  const activeId = onKey ? current.credential_id
     : current ? clusterValue(current.cluster_model_id) : "";
   // A refresh with no status attached (we just saved or deleted a key) must not silently move the
   // selection to "Cluster GPU" — the picker would then name an endpoint that isn't the one in use.
   const keep = summary ? activeId : (sel.value && sel.value !== ADD_KEY_OPTION ? sel.value : apiKeys.activeId);
-  const opts = [clusterOptionsHtml()];
+  const opts = [labOptionsHtml()];
   for (const c of apiKeys.creds) {
     const bad = c.last_error ? " ⚠" : "";
     opts.push(`<option value="${escapeHtml(c.id)}">${escapeHtml(c.label)} · ${escapeHtml(credRoles(c).pi || "no model")}${bad}</option>`);
@@ -2005,10 +1828,13 @@ function renderEndpointSelect(summary) {
   opts.push(ADD_KEY_HTML);
   sel.innerHTML = opts.join("");
   if (summary) apiKeys.activeId = activeId;   // what to snap back to when "＋ Add" is picked
-  if (keep && apiKeys.creds.some((c) => c.id === keep)) sel.value = keep;
+  if (keep && isEndpointValue(keep)) sel.value = keep;
   else if (keep && isClusterValue(keep) && [...sel.options].some((o) => o.value === keep)) sel.value = keep;
-  else if (!known || known.kind !== "credential") sel.value = clusterValue(known && known.cluster_model_id);
-  if (current && current.kind === "credential" && !apiKeys.creds.some((c) => c.id === activeId)) {
+  else if (!known || (known.kind !== "credential" && known.kind !== "shared")) {
+    const v = clusterValue(known && known.cluster_model_id);
+    sel.value = [...sel.options].some((o) => o.value === v) ? v : sel.options[0].value;
+  }
+  if (current && onKey && !isEndpointValue(activeId)) {
     // The status names a credential we don't have in the list (another window added it, or the
     // list predates it). Reload rather than silently showing "Cluster GPU", which would misreport
     // where prompts are going.
@@ -2023,7 +1849,7 @@ function renderEndpointSelect(summary) {
 function snapEndpointSelect() {
   const sel = $("llmEndpointSelect");
   if (!sel) return;
-  sel.value = apiKeys.activeId || clusterValue();
+  sel.value = apiKeys.activeId || fallbackEndpoint() || clusterValue();
   syncEndpointActions();
 }
 
@@ -2069,7 +1895,7 @@ async function deleteEndpointById(credId) {
     toast(isUnreachable(err) ? "Can't reach the local server." : "Delete failed: " + err.message);
     return;
   }
-  if (wasActive) await selectLlmEndpoint("");
+  if (wasActive) await selectLlmEndpoint(fallbackEndpoint());
   if (apiKeys.editing === cred.id) resetApiKeyForm();
   if (apiKeys.connectChoice === cred.id) apiKeys.connectChoice = "";
   await loadApiCredentials();
@@ -2175,14 +2001,13 @@ function renderConnectEndpointSelect() {
   const sel = $("connectLlmSelect");
   if (!sel) return;
   const keep = sel.value && sel.value !== ADD_KEY_OPTION ? sel.value : apiKeys.connectChoice;
-  const opts = [clusterOptionsHtml()];
+  const opts = [labOptionsHtml()];
   for (const c of apiKeys.creds) {
     opts.push(`<option value="${escapeHtml(c.id)}">${escapeHtml(c.label)} · ${escapeHtml(credRoles(c).pi || "no model")}</option>`);
   }
   opts.push(ADD_KEY_HTML);
   sel.innerHTML = opts.join("");
-  if (keep && (apiKeys.creds.some((c) => c.id === keep)
-               || [...sel.options].some((o) => o.value === keep))) sel.value = keep;
+  if (keep && (isEndpointValue(keep) || [...sel.options].some((o) => o.value === keep))) sel.value = keep;
   apiKeys.connectChoice = sel.value;
   renderConnectLlmHint();
   syncEndpointActions();
@@ -2196,8 +2021,16 @@ function renderConnectLlmHint() {
   if (!el) return;
   const sel = $("connectLlmSelect");
   const chosen = sel && sel.value && sel.value !== ADD_KEY_OPTION && !isClusterValue(sel.value);
-  if (chosen) {
+  if (chosen && sel.value === SHARED_ENDPOINT) {
+    el.textContent = apiKeys.shared && apiKeys.shared.up === false
+      ? "The lab's shared model is starting or being renewed right now, so a session on it cannot start yet. Try again later, or use your own API key."
+      : "Every call of this session goes to the lab's shared model on HPC3: no GPU to wait for, nothing leaves UCI, and it costs you nothing. Your HPC3 account still runs the analysis jobs.";
+  } else if (chosen) {
     el.textContent = "This session reasons on your own endpoint — no GPU queue. Your HPC3 account still runs the analysis jobs.";
+  } else if (!clusterModels.sessionGpu) {
+    el.textContent = "No API key saved yet. Add one here with 🔑 to use your own model; your HPC3 account still runs the analysis jobs.";
+  } else if (apiKeys.shared) {
+    el.textContent = "Cluster GPU runs Qwen on a card of your own for the whole session and waits for a free one, which can take hours. The shared model or your own API key start at once.";
   } else if (apiKeys.creds.length) {
     el.textContent = "Cluster GPU waits for a free card. Pick one of your own endpoints above to start in seconds — your HPC3 account still runs the analysis jobs either way.";
   } else {
@@ -2873,7 +2706,7 @@ const STREAM_TYPES = new Set([
 // window's run never streams into, cancels, or shows a plan card in this one.
 const RUN_SCOPED = new Set([...STREAM_TYPES,
   "chat_start", "plan_prompt", "plan_clarify", "decision_prompt", "plan_done",
-  "plan_status", "plan_expiring",
+  "plan_status", "plan_expiring", "run_usage",
   // Context occupancy belongs to the conversation that asked, so another chat's turn never
   // rewrites this one's meter. Deliberately NOT in STREAM_TYPES: it is a standing status, not
   // part of the assistant bubble being replayed.
@@ -2901,9 +2734,13 @@ function handleWsMessage(msg) {
   }
   switch (msg.type) {
     case "status": applyStatus(msg.connection); break;
+    case "session_state": renderSessionState(msg.session); break;   // the session's copies and state on HPC3
     case "event": appendLog(msg); updatePipelineFromEvent(msg); updateBoot(msg); break;
     case "gpu_health": renderGpu({ gpu: { health: msg.health, job_id: state.lastJobId, node: state.lastNode, gres: state.lastGres } }); break;
     case "upload_staging": onStagingEvent(msg.job); break;       // a copy to HPC3 moved on
+    case "datasets_changed": onDatasetsChanged(); break;         // a dataset moved from HPC3 to the server
+    case "result_saved": onResultSaved(msg); break;              // a result copied back from HPC3 is saved
+    case "usage_update": onUsageUpdate(msg); break;              // a model call was recorded
     case "duo_prompt": showDuoPanel(msg.prompt); break;
     case "duo_done": hideDuoPanel(); break;
     case "error": toast(msg.message); break;
@@ -2920,6 +2757,7 @@ function handleRunEvent(c, msg) {
     if (c.suppress) return;
     setChatRunning(c, true);
     startAssistantStream(c);
+    c.answered = null;
     c.run.runId = msg.run_id || null;
     c.run.streamId = c.lastStreamId = msg.stream_id || null;
     return;
@@ -2932,7 +2770,14 @@ function handleRunEvent(c, msg) {
     case "run_status": streamStatus(c, msg.text); break;
     case "step_code": streamCode(c, msg.code); break;
     case "chat_context": c.ctx = msg; if (chatVisible(c)) renderContextMeter(msg); break;
-    case "chat_done": finishAssistantStream(c); setChatRunning(c, false); break;
+    case "run_usage":
+      if (msg.actual) {
+        pushToSession(c.sid, { role: "assistant", content: runUsageMarkdown(msg),
+          streamId: `usage:${msg.run_id || msg.stream_id || c.lastStreamId}` });
+        if (chatVisible(c)) renderChat();
+      }
+      break;
+    case "chat_done": finishAssistantStream(c); setChatRunning(c, false); renderChatUsage(); checkBudgetNotices(); break;
     case "chat_stopped":
       if (c.run && !c.run.text) c.run.text = "_⏹ Stopped._";
       finishAssistantStream(c); setChatRunning(c, false);
@@ -2949,7 +2794,8 @@ function handleRunEvent(c, msg) {
     // The three prompts that wait for the user are held in the chat's record first and drawn from
     // there (holdPlanPrompt): only into their own chat, and again whenever that chat is rebuilt.
     case "plan_prompt":
-      holdPlanPrompt(c, "plan", { agenda: msg.agenda || [], doc: msg.plan || null, problems: msg.problems || [] }, msg);
+      holdPlanPrompt(c, "plan", { agenda: msg.agenda || [], doc: msg.plan || null, problems: msg.problems || [],
+                                    estimate: msg.estimate || null }, msg);
       break;
     case "plan_clarify": holdPlanPrompt(c, "clarify", { questions: msg.questions || [] }, msg); break;
     case "decision_prompt": holdPlanPrompt(c, "decision", { goal: msg.goal || "", options: msg.options || [] }, msg); break;
@@ -3039,48 +2885,470 @@ async function doStopGpu() {
   }
 }
 
-async function openStorage() {
-  if (!state.connectionId) return;
-  $("storageModal").classList.remove("hidden");
-  $("storageItems").innerHTML = '<div class="storage-loading">Loading…</div>';
-  $("storageQuota").textContent = "";
-  $("storageBase").textContent = "";
-  $("storageUsed").textContent = "—";
-  try {
-    const res = await fetch(`/api/storage/${state.connectionId}`);
-    const d = await res.json();
-    if (!res.ok) { $("storageItems").innerHTML = `<div class="storage-empty">${escapeHtml(d.error || "Could not read storage")}</div>`; return; }
-    renderStorage(d);
-  } catch (err) {
-    $("storageItems").innerHTML = `<div class="storage-empty">${isUnreachable(err) ? "Can't reach the local server." : escapeHtml(err.message)}</div>`;
+// ---- the compute session on HPC3 (RCHENLAB/AiScientist issue 6) ------------------------------
+// What this session is doing with HPC3 (staging in, running, staging out, cleaning up, closed,
+// failed), each copy's progress and every failure, from the server's `session_state` pushes and the
+// status summary after a reload. My account → Storage lists the account's recent sessions.
+const SESSION_STATE_LABEL = {
+  open: "Open", "staging-in": "Staging in", running: "Running", "staging-out": "Staging out",
+  "cleaning-up": "Cleaning up", closed: "Closed", failed: "Failed",
+};
+const SESSION_STATE_SHORT = { "staging-in": "In", "staging-out": "Out", "cleaning-up": "Cleanup", failed: "Failed" };
+
+// One copy, in words: what it copies and how far it is.
+function transferText(t) {
+  const total = t.bytes_total || 0;
+  if (t.status === "running") {
+    if (!total) return `${t.label}: starting…`;
+    const pct = t.percent != null ? t.percent : Math.round(100 * (t.bytes_done || 0) / total);
+    const files = t.files_total > 1
+      ? ` · file ${Math.min((t.files_done || 0) + 1, t.files_total)} of ${t.files_total}` : "";
+    return `${t.label}: ${fmtSize(t.bytes_done || 0)} of ${fmtSize(total)} (${pct}%)${files}`;
+  }
+  if (t.status === "failed") return `${t.label}: failed (${t.error || "unknown error"})`;
+  if (t.status === "cancelled") return `${t.label}: stopped`;
+  return `${t.label}: done` + (total ? ` (${fmtSize(total)})` : ", already there");
+}
+
+// How an ended session's HPC3 files went.
+function cleanupText(c, ttlDays) {
+  const days = ttlDays || 3;
+  if (!c) return "";
+  const kept = (c.kept_unsaved || []).length
+    ? ` Kept because a result was not saved: run ${c.kept_unsaved.join(", ")}.` : "";
+  switch (c.status) {
+    case "queued": return `Cleanup job ${c.job_id} queued on HPC3.` + kept;
+    case "done": return `Cleanup job ${c.job_id} finished` +
+      (c.removed != null ? `: ${c.removed} folder(s) removed.` : ".") + kept;
+    case "nothing": return "Nothing of it was left on HPC3." + kept;
+    case "failed": case "error": return `Cleanup: ${c.error || "failed"}. Its files go with the ${days}-day sweep.` + kept;
+    case "skipped":
+      if (c.reason === "mock") return "A mock session: nothing on HPC3.";
+      if (c.reason === "sweep") return `Ended without a disconnect: its HPC3 files go with the ${days}-day sweep.` + kept;
+      return `Its HPC3 files go with the ${days}-day sweep.` + kept;
+    default: return "";
   }
 }
 
+// The one line under the state: what is happening, or how it ended.
+function sessionHeadline(s, ttlDays) {
+  const st = s.state || "open";
+  const unresolved = s.unresolved || [];
+  if (st === "failed" && unresolved.length) {
+    const t = unresolved[unresolved.length - 1];
+    return `${t.label} failed: ${String(t.error || "unknown error").replace(/\.+$/, "")}. It is still on HPC3` +
+      (s.closed_at ? `, kept for ${ttlDays || 3} days: connect and save it again from Runs.` : ": try again from Runs.");
+  }
+  if (s.closed_at) return cleanupText(s.cleanup, ttlDays);
+  return ({
+    open: "Connected; nothing is being copied.",
+    "staging-in": "Copying a run's inputs from the server to HPC3.",
+    running: "A run is executing on HPC3.",
+    "staging-out": "Copying from HPC3 to your data on the server.",
+    "cleaning-up": "Queuing the removal of this session's files on HPC3.",
+  })[st] || "";
+}
+
+function sessionDetailHtml(s, ttlDays) {
+  const st = s.state || "open";
+  const active = (s.active || []).map((t) => {
+    const pct = t.percent != null ? t.percent : 0;
+    return `<div class="sess-transfer"><div class="sess-transfer-text">${escapeHtml(transferText(t))}</div>` +
+      (t.bytes_total ? `<div class="meter"><div class="meter-fill" style="width:${Math.max(0, Math.min(100, pct))}%"></div></div>` : "") +
+      `</div>`;
+  }).join("");
+  const recentFails = (s.transfers || []).filter((t) => t.status === "failed" && t.kind === "stage-in").slice(-2)
+    .map((t) => `<div class="sess-failure">${escapeHtml(transferText(t))}</div>`).join("");
+  return `<div class="sess-row"><span class="sess-pill ${escapeHtml(st)}">${escapeHtml(SESSION_STATE_LABEL[st] || st)}</span>` +
+    `<span class="sess-text">${escapeHtml(sessionHeadline(s, ttlDays))}</span></div>` + active + recentFails;
+}
+
+function renderSessionState(s) {
+  state.session = s || null;
+  const box = $("connSession"), chip = $("sessChip");
+  if (!s) {
+    if (box) { box.classList.add("hidden"); box.innerHTML = ""; }
+    if (chip) chip.classList.add("hidden");
+    return;
+  }
+  const st = s.state || "open";
+  if (box) { box.innerHTML = sessionDetailHtml(s, state.ttlDays); box.classList.remove("hidden"); }
+  if (chip) {
+    // Idle and running are said elsewhere (the dot, the chat); the chip is for data on the move
+    // and for what went wrong.
+    const show = ["staging-in", "staging-out", "cleaning-up", "failed"].includes(st);
+    chip.classList.toggle("hidden", !show);
+    if (show) {
+      const t = (s.active || [])[0];
+      const pct = t && t.percent != null ? ` ${t.percent}%` : "";
+      chip.className = `sess-chip ${st}`;
+      // A phone shows the short word (styles.css), so the top bar still fits at 320 px.
+      chip.innerHTML = `<span class="sc-long">${escapeHtml(SESSION_STATE_LABEL[st])}</span>` +
+        `<span class="sc-short">${escapeHtml(SESSION_STATE_SHORT[st] || st)}</span>${escapeHtml(pct)}`;
+      chip.title = sessionHeadline(s, state.ttlDays);
+    }
+  }
+  if (storageShown()) renderComputeSessions(null, s);
+}
+
+let _computeSessionRows = [];
+function renderComputeSessions(rows, live) {
+  if (rows) _computeSessionRows = rows;
+  if (live) _computeSessionRows = [live, ..._computeSessionRows.filter((r) => r.id !== live.id)];
+  const el = $("computeSessionList"); if (!el) return;
+  if (!_computeSessionRows.length) { el.innerHTML = '<div class="storage-empty">No sessions on HPC3 yet.</div>'; return; }
+  el.innerHTML = _computeSessionRows.slice(0, 8).map((r) => {
+    const when = r.closed_at ? `ended ${relTime(r.closed_at)}` : `opened ${relTime(r.opened_at)}`;
+    const now = r.connection_id === state.connectionId && !r.closed_at ? " · this session" : "";
+    return `<div class="storage-item sess-item"><div class="sess-item-main">${sessionDetailHtml(r, state.ttlDays)}` +
+      `<div class="sess-when">${escapeHtml(`${r.hpc_user || ""} · ${when}${now}`)}</div></div></div>`;
+  }).join("");
+}
+
+async function loadComputeSessions() {
+  const el = $("computeSessionList"); if (!el) return;
+  try {
+    const q = state.connectionId ? `?connection_id=${encodeURIComponent(state.connectionId)}` : "";
+    const res = await fetch(`/api/sessions${q}`);
+    const d = await res.json();
+    if (!res.ok) { el.innerHTML = `<div class="storage-empty">${escapeHtml(d.error || "Could not read the sessions")}</div>`; return; }
+    if (d.ttl_days) state.ttlDays = d.ttl_days;
+    renderComputeSessions(d.sessions || []);
+  } catch (err) {
+    el.innerHTML = `<div class="storage-empty">${isUnreachable(err) ? "Can't reach the local server." : escapeHtml(err.message)}</div>`;
+  }
+}
+
+// ---- HPC3 originals of datasets now kept on the server (issue 6) ---------------------------------
+// Two explicit steps, each a Slurm job on HPC3: a dry run that checks every original against its
+// server copy, then, on the user's confirmation, the removal of what that check found.
+let _originalsPoll = null;
+
+function originalsPending(plan) {
+  return !!plan && [plan.check, plan.remove].some((j) => j && j.status === "queued");
+}
+
+function renderOriginals(d) {
+  const box = $("originalsBox"); if (!box) return;
+  clearTimeout(_originalsPoll); _originalsPoll = null;
+  // Shown only where originals can be checked at all (accounts, a data root, a real HPC3 session).
+  const wrap = $("storeOriginals"); if (wrap) wrap.classList.toggle("hidden", !!(d && d.unavailable));
+  if (d && d.unavailable) { box.innerHTML = `<div class="storage-empty">${escapeHtml(d.unavailable)}</div>`; return; }
+  const plan = d && d.plan;
+  const checkBtn = '<button type="button" class="ghost small" data-orig="check">Check what can be removed</button>';
+  if (!plan) {
+    box.innerHTML = `<p class="storage-note">When a dataset kept only on HPC3 is copied to the server, its HPC3 original is kept. ` +
+      `A check runs as a job on HPC3 and removes nothing; you confirm the removal after it.</p>${checkBtn}`;
+    return;
+  }
+  const parts = [];
+  const check = plan.check, remove = plan.remove;
+  if (!check && !(plan.candidates || []).length) {
+    parts.push('<div class="storage-empty">No HPC3 original can be removed now.</div>');
+  } else if (check && check.status === "queued") {
+    parts.push(`<div class="orig-status">Checking ${plan.candidates.length} original(s) on HPC3 (job ${escapeHtml(check.job_id)}` +
+      `${check.slurm_state ? `, ${escapeHtml(check.slurm_state.toLowerCase())}` : ", queued"}). Nothing is removed.</div>`);
+  } else if (check && check.status === "failed") {
+    parts.push(`<div class="sess-failure">The check did not finish: ${escapeHtml(check.error || "unknown error")}.</div>`);
+  }
+  const results = ((remove && remove.results) || (check && check.results) || []);
+  if (results.length) {
+    parts.push(results.map((r) => {
+      const verdict = { would_remove: "can be removed", removed: "removed", skip: `kept: ${r.reason}` }[r.verdict] || r.verdict;
+      return `<div class="storage-item orig-item ${escapeHtml(r.verdict)}"><span class="si-name">${escapeHtml(r.path)}</span>` +
+        `<span class="si-size">${r.bytes != null ? escapeHtml(fmtSize(r.bytes)) + " · " : ""}${escapeHtml(verdict)}</span></div>`;
+    }).join(""));
+  }
+  const kept = plan.kept || [];
+  if (kept.length) {
+    parts.push(`<details class="orig-kept"><summary>${kept.length} not considered</summary>` + kept.map((k) =>
+      `<div class="storage-item"><span class="si-name">${escapeHtml(k.path || k.name)}</span><span class="si-size">${escapeHtml(k.reason)}</span></div>`
+    ).join("") + "</details>");
+  }
+  if (remove && remove.status === "queued") {
+    parts.push(`<div class="orig-status">Removing ${remove.entries} original(s) on HPC3 (job ${escapeHtml(remove.job_id)}` +
+      `${remove.slurm_state ? `, ${escapeHtml(remove.slurm_state.toLowerCase())}` : ", queued"}).</div>`);
+  } else if (remove && remove.status === "done") {
+    parts.push(`<div class="orig-status done">Removed ${plan.removed} original(s), ${escapeHtml(fmtSize(plan.removed_bytes))}.</div>`);
+  } else if (remove && remove.status === "failed") {
+    parts.push(`<div class="sess-failure">The removal did not finish: ${escapeHtml(remove.error || "unknown error")}. Check again.</div>`);
+  }
+  const canRemove = check && check.status === "done" && !remove && plan.would_remove > 0;
+  const buttons = [checkBtn];
+  if (canRemove) buttons.unshift(`<button type="button" class="ghost small danger" data-orig="remove" data-plan="${escapeHtml(plan.id)}">` +
+    `Remove ${plan.would_remove} original(s), ${escapeHtml(fmtSize(plan.would_remove_bytes))}</button>`);
+  box.innerHTML = parts.join("") + `<div class="orig-actions">${buttons.join("")}</div>`;
+  if (originalsPending(plan)) _originalsPoll = setTimeout(() => loadOriginals(plan.id), 8000);
+}
+
+async function loadOriginals(planId) {
+  if (!state.connectionId) return;
+  const q = `connection_id=${encodeURIComponent(state.connectionId)}` + (planId ? `&plan_id=${encodeURIComponent(planId)}` : "");
+  try {
+    const res = await fetch(`/api/hpc-originals?${q}`);
+    const d = await res.json();
+    if (!res.ok) { renderOriginals({ unavailable: d.error || "Not available." }); return; }
+    if (storageShown()) renderOriginals(d);
+  } catch (err) {
+    renderOriginals({ unavailable: isUnreachable(err) ? "Can't reach the local server." : err.message });
+  }
+}
+
+async function originalsAction(kind, planId) {
+  if (kind === "remove" && !confirm("Remove these HPC3 originals?\n\nEach one is checked again on HPC3 " +
+      "against its copy on the server before it is removed. This cannot be undone.")) return;
+  const url = kind === "remove" ? "/api/hpc-originals/remove" : "/api/hpc-originals/check";
+  try {
+    const res = await fetch(url, { method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ connection_id: state.connectionId, plan_id: planId || "" }) });
+    const d = await res.json();
+    if (!res.ok) { toast(d.error || "Failed"); if (d.plan) renderOriginals(d); return; }
+    renderOriginals(d);
+  } catch (err) { toast(isUnreachable(err) ? "Can't reach the local server." : err.message); }
+}
+
+// ---- My account → Storage (RCHENLAB/AiScientist issue 32) ---------------------------------------
+// Where the account's files are. On the server: its datasets and its runs' folders, kept until
+// deleted; read without an HPC3 session. On HPC3: the account's own folders there, read over this
+// session's SSH, area by area, each saying what happens to the files in it.
+let _storeServer = null;                                   // the server listing as last read
+const _storeShowAll = { datasets: false, outputs: false };
+const STORE_ROWS = 6;                                      // rows a list shows before "Show all"
+
+// True while My account → Storage is on screen: polls and redraws stop when it is not.
+function storageShown() {
+  const view = $("view-account"), pane = $("accountPane-storage");
+  return !!view && view.classList.contains("active") && !!pane && !pane.classList.contains("hidden");
+}
+
+async function loadStorageTab() {
+  loadServerStorage();
+  loadComputeSessions();
+  if (!state.connectionId) { renderStorage(null); return; }
+  $("storeHpcBody").innerHTML = '<div class="storage-loading">Loading…</div>';
+  loadOriginals();
+  loadStorageDeletes();
+  await loadStorageListing();
+}
+
+// The session chip in the header: what the session is doing with HPC3, in detail.
+function openStorageSessions() {
+  openAccount("storage");
+  const d = $("storeSessions");
+  if (d) d.open = true;
+}
+
+function fmtEpochDay(t) {
+  try { return new Date(t * 1000).toLocaleDateString("en-US", { month: "short", day: "numeric" }); } catch { return ""; }
+}
+
+// One row of either section: the name (and a line under it), its size, then its action.
+function storeRowHtml({ name, meta, bytes, title, action }) {
+  return `<div class="store-row"${title ? ` title="${escapeHtml(title)}"` : ""}><div class="store-row-main">` +
+    `<span class="store-name">${escapeHtml(name)}</span>${meta ? `<span class="store-meta">${escapeHtml(meta)}</span>` : ""}</div>` +
+    `<span class="store-size">${bytes == null ? "" : escapeHtml(fmtSize(bytes))}</span>${action || ""}</div>`;
+}
+
+// What share of the section each kind takes, as one bar and its legend.
+function storeBarHtml(parts) {
+  const total = parts.reduce((n, p) => n + (p.bytes || 0), 0);
+  const bar = total ? `<div class="store-bar" aria-hidden="true">` + parts.filter((p) => p.bytes > 0)
+    .map((p) => `<i class="${p.cls}" style="flex-grow:${p.bytes}"></i>`).join("") + `</div>` : "";
+  return bar + `<div class="store-legend">` + parts.map((p) =>
+    `<span><i class="store-dot ${p.cls}"></i>${escapeHtml(p.label)} <b>${escapeHtml(fmtSize(p.bytes || 0))}</b></span>`).join("") + `</div>`;
+}
+
+function storeListHtml(key, title, rows, empty) {
+  const all = _storeShowAll[key];
+  const more = rows.length > STORE_ROWS
+    ? `<button type="button" class="ghost small store-more" data-store-more="${key}">${all ? "Show fewer" : `Show all ${rows.length}`}</button>` : "";
+  return `<div class="store-group"><div class="store-group-head"><strong>${escapeHtml(title)}</strong>` +
+    `<span class="store-count">${rows.length}</span></div>` +
+    (rows.length ? (all ? rows : rows.slice(0, STORE_ROWS)).join("") + more : `<div class="storage-empty">${escapeHtml(empty)}</div>`) + `</div>`;
+}
+
+async function loadServerStorage() {
+  const body = $("storeServerBody");
+  try {
+    const res = await fetch("/api/storage/server");
+    const d = await res.json();
+    if (!res.ok) {
+      $("storeServerTotal").textContent = "";
+      body.innerHTML = `<div class="storage-empty">${escapeHtml(d.error || "Could not read your storage on the server.")}</div>`;
+      return;
+    }
+    const results = await loadResultHandoffs(false).catch(() => ({}));
+    renderServerStorage(d, results || {});
+  } catch (err) {
+    body.innerHTML = `<div class="storage-empty">${isUnreachable(err) ? "Can't reach the server." : escapeHtml(err.message)}</div>`;
+  }
+}
+
+function renderServerStorage(d, results) {
+  if (d) _storeServer = { d, results: results || {} };
+  if (!_storeServer) return;
+  ({ d, results } = _storeServer);
+  const datasets = d.datasets || [], outputs = d.outputs || [];
+  $("storeServerTotal").textContent = fmtSize(d.total_bytes || 0);
+  const dsRows = datasets.map((x) => storeRowHtml({
+    name: x.name, bytes: x.bytes, title: x.path || "",
+    meta: [x.kind, x.uploaded_at ? `added ${fmtDay(x.uploaded_at)}` : ""].filter(Boolean).join(" · "),
+    action: `<button type="button" class="ghost small danger" data-del="${x.id}" data-name="${escapeHtml(x.name)}" ` +
+            `data-kind="${escapeHtml(x.kind || "")}" data-location="server" data-path="${escapeHtml(x.path || "")}">Delete</button>`,
+  }));
+  const runRows = outputs.map((r) => storeRowHtml({
+    name: runTitle(r), bytes: r.bytes, title: `Run ${r.run_id}`,
+    meta: [r.status, r.created_at ? fmtDay(r.created_at) : ""].filter(Boolean).join(" · "),
+    action: r.running ? '<span class="store-meta">running</span>'
+      : `<button type="button" class="ghost small danger" data-run-del="${escapeHtml(r.run_id)}" data-name="${escapeHtml(runTitle(r))}" ` +
+        `data-kept="${keptBesideRun(results[r.run_id]) ? "1" : ""}">Delete</button>`,
+  }));
+  const notes = [];
+  if (d.linked) notes.push(`${d.linked} of your datasets only point at a shared folder on the server and take none of your space.`);
+  if (d.on_hpc3) notes.push(`${d.on_hpc3} of your datasets are still kept on HPC3. They are copied to the server when you next connect.`);
+  $("storeServerBody").innerHTML =
+    storeBarHtml([{ label: "Datasets", bytes: d.datasets_bytes, cls: "k-datasets" },
+                  { label: "Run outputs", bytes: d.outputs_bytes, cls: "k-outputs" }]) +
+    storeListHtml("datasets", "Datasets", dsRows, "No datasets yet.") +
+    storeListHtml("outputs", "Run outputs", runRows, "No run has written anything yet.") +
+    notes.map((n) => `<p class="store-note">${escapeHtml(n)}</p>`).join("");
+}
+
+async function onServerStorageClick(e) {
+  const more = e.target.closest("[data-store-more]");
+  if (more) { _storeShowAll[more.dataset.storeMore] = !_storeShowAll[more.dataset.storeMore]; renderServerStorage(); return; }
+  const ds = e.target.closest("button[data-del]");
+  if (ds) { if (await deleteDatasetRow(ds)) loadServerStorage(); return; }
+  const run = e.target.closest("button[data-run-del]");
+  if (run && await deleteRun(run)) loadServerStorage();
+}
+
+async function loadStorageListing() {
+  try {
+    const res = await fetch(`/api/storage/${state.connectionId}`);
+    const d = await res.json();
+    if (!res.ok) { $("storeHpcBody").innerHTML = `<div class="storage-empty">${escapeHtml(d.error || "Could not read your folders on HPC3.")}</div>`; return; }
+    renderStorage(d);
+  } catch (err) {
+    $("storeHpcBody").innerHTML = `<div class="storage-empty">${isUnreachable(err) ? "Can't reach the server." : escapeHtml(err.message)}</div>`;
+  }
+}
+
+// The lab's quota is a GROUP quota: RCIC reports no per-member figure.
+function quotaHtml(q) {
+  const pct = q.percent == null ? null : Math.min(100, Number(q.percent));
+  const tone = pct >= 95 ? " tone-over" : pct >= 85 ? " tone-warn" : "";
+  return `<div class="store-quota"><div class="usage-bar-legend"><span>Lab quota on ${escapeHtml(q.pool)}, shared by everyone in ${escapeHtml(q.group)}</span>` +
+    `<span>${escapeHtml(q.used)} of ${escapeHtml(q.limit)}${pct == null ? "" : ` · ${pct}%`}</span></div>` +
+    (pct == null ? "" : `<div class="usage-bar${tone}"><i style="width:${pct}%"></i></div>`) + `</div>`;
+}
+
+function storageItemHtml(i) {
+  const deleting = i.deleting || _storageDeleting[i.path];
+  const meta = [];
+  if (i.changed) meta.push(`last used ${fmtEpochDay(i.changed)}`);
+  if (i.clean_after) meta.push(i.clean_after * 1000 <= Date.now() ? "removed at the next cleanup" : `removed after ${fmtEpochDay(i.clean_after)}`);
+  const action = deleting
+    ? `<span class="si-deleting">Deletion queued (job ${escapeHtml(deleting)})</span>`
+    : `<button type="button" class="ghost small danger" data-path="${escapeHtml(i.path)}">Delete</button>`;
+  return storeRowHtml({ name: i.name, meta: meta.join(" · "), bytes: i.bytes, title: i.path, action });
+}
+
+// ``d`` = GET /api/storage/<connection>; null = no HPC3 session to read the folders with.
 function renderStorage(d) {
-  $("storageBase").textContent = d.base || "";
-  $("storageUsed").textContent = d.used || "?";
-  $("storageQuota").textContent = d.quota_raw || "";
-  const items = d.items || [];
-  if (!items.length) { $("storageItems").innerHTML = '<div class="storage-empty">No items in your directory.</div>'; return; }
-  $("storageItems").innerHTML = items.map((i) =>
-    `<div class="storage-item"><span class="si-name">${escapeHtml(i.name)}</span><span class="si-size">${escapeHtml(i.size)}</span><button class="si-del" data-path="${escapeHtml(i.path)}">Delete</button></div>`
-  ).join("");
+  _storageListing = d;
+  const body = $("storeHpcBody"); if (!body) return;
+  if (!d) {
+    $("storeHpcTotal").textContent = "";
+    $("storeOriginals").classList.add("hidden");
+    body.innerHTML = `<div class="storage-empty">Connect to HPC3 on the Research page to see your folders there. ` +
+      `Temporary run files are removed when a session ends${state.ttlDays ? `, or ${state.ttlDays} days after they were last used` : ""}.</div>`;
+    return;
+  }
+  const areas = d.areas || [];
+  $("storeHpcTotal").textContent = fmtSize(areas.reduce((n, a) => n + (a.bytes || 0), 0));
+  const parts = d.quota ? [quotaHtml(d.quota)] : [];
+  for (const a of areas) {
+    const items = a.items || [];
+    if (a.key !== "temp" && !items.length) continue;     // the older areas show only while they hold something
+    const rows = items.map(storageItemHtml).join("") || '<div class="storage-empty">Nothing here now.</div>';
+    const size = `<span class="store-size">${escapeHtml(fmtSize(a.bytes || 0))}</span>`;
+    const note = `<p class="store-note">${escapeHtml(a.note || "")}</p>`;
+    // The member's own lab folder holds their own files too: folded until they open it.
+    parts.push(a.key === "personal"
+      ? `<details class="store-group store-fold"><summary class="store-group-head"><strong>${escapeHtml(a.label)}</strong>` +
+        `<span class="store-count">${items.length}</span>${size}</summary>${note}${rows}</details>`
+      : `<div class="store-group"><div class="store-group-head"><strong>${escapeHtml(a.label)}</strong>${size}</div>${note}${rows}</div>`);
+  }
+  body.innerHTML = parts.join("");
+}
+
+// ---- a Delete on HPC3 is a Slurm job ------------------------------------------------------------
+// The server answers at once with the queued job; the Storage tab asks for its state (one sacct)
+// while it is queued or running, and reads the folders again once it has ended.
+let _storageDeletesPoll = null;
+let _storageDeleting = {};        // path -> job id, for the deletions still queued or running
+let _storageListing = null;       // the folders as last read, to redraw a row as queued
+
+function storageDeleteLine(j) {
+  const where = `<span class="si-name">${escapeHtml(j.path)}</span>`;
+  if (j.status === "queued") {
+    return `<div class="storage-item sd-item queued">${where}<span class="si-size">deleting, job ${escapeHtml(j.job_id)}` +
+      `${j.slurm_state ? ` ${escapeHtml(j.slurm_state.toLowerCase())}` : " queued"}</span></div>`;
+  }
+  if (j.status === "done") {
+    return `<div class="storage-item sd-item done">${where}<span class="si-size">deleted` +
+      `${j.note ? ` (${escapeHtml(j.note)})` : ""}</span></div>`;
+  }
+  return `<div class="storage-item sd-item failed">${where}<span class="si-size sess-failure">not deleted: ` +
+    `${escapeHtml(j.error || "unknown error")}</span></div>`;
+}
+
+function renderStorageDeletes(deletes) {
+  const box = $("storageDeletes"); if (!box) return [];
+  clearTimeout(_storageDeletesPoll); _storageDeletesPoll = null;
+  const shown = (deletes || []).filter((j) => j.job_id !== "mock").slice(-5).reverse();
+  box.innerHTML = shown.length ? `<div class="sd-head">Deletions on HPC3</div>` + shown.map(storageDeleteLine).join("") : "";
+  const before = _storageDeleting;
+  _storageDeleting = {};
+  for (const j of deletes || []) if (j.status === "queued") _storageDeleting[j.path] = j.job_id;
+  const ended = Object.keys(before).filter((path) => !(path in _storageDeleting));
+  if (Object.keys(_storageDeleting).length) _storageDeletesPoll = setTimeout(loadStorageDeletes, 8000);
+  return ended;
+}
+
+async function loadStorageDeletes() {
+  if (!state.connectionId) return;
+  try {
+    const res = await fetch(`/api/storage/${state.connectionId}/deletes`);
+    const d = await res.json();
+    if (!res.ok) {
+      if (Object.keys(_storageDeleting).length) { clearTimeout(_storageDeletesPoll); _storageDeletesPoll = setTimeout(loadStorageDeletes, 15000); }
+      return;
+    }
+    if (!storageShown()) { clearTimeout(_storageDeletesPoll); _storageDeletesPoll = null; return; }
+    const ended = renderStorageDeletes(d.deletes);
+    if (ended.length) loadStorageListing();          // a deletion ended: the folders changed
+  } catch (err) { /* the next open of the panel asks again */ }
 }
 
 async function deleteStorageItem(path) {
-  if (!confirm(`Delete on HPC3 (rm -rf):\n\n${path}\n\nThis cannot be undone. Continue?`)) return;
+  if (!confirm(`Delete on HPC3:\n\n${path}\n\nThe deletion runs as a job on HPC3, inside your own folders only. ` +
+      `This cannot be undone. Continue?`)) return;
   try {
     const res = await fetch("/api/storage/delete", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ connection_id: state.connectionId, path }) });
     const d = await res.json();
     if (!res.ok) { toast(d.error || "Delete failed"); return; }
-    toast("Deleted.");
-    renderStorage(d);
+    if (d.status === "deleted") { toast("Deleted."); renderStorage(d); return; }
+    toast(`Deletion queued on HPC3 (job ${d.job.job_id}). The list updates when it has run.`);
+    renderStorageDeletes(d.deletes);
+    if (_storageListing) renderStorage(_storageListing);      // the row now says it is queued
   } catch (err) { toast(isUnreachable(err) ? "Can't reach the local server." : "Delete failed: " + err.message); }
 }
 
 async function stopGpu() {
   if (!state.connectionId) return;
-  if (!confirm("Stop YOUR OWN Qwen3 GPU job (scancel)? Frees the GPU and stops your SU charge — only your own job, no one else is affected.")) return;
+  if (!confirm("Stop your own GPU job (scancel)? It frees the GPU and stops your SU charge. Only your own job is stopped; no one else is affected.")) return;
   await doStopGpu();
 }
 
@@ -3101,7 +3369,13 @@ async function disconnect() {
     }
   }
   try {
-    await fetch("/api/disconnect", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ connection_id: state.connectionId }) });
+    const res = await fetch("/api/disconnect", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ connection_id: state.connectionId }) });
+    const d = await res.json().catch(() => ({}));
+    // How the session's HPC3 files went: its cleanup job, or why they are left to the sweep.
+    if (res.ok && d.session && d.session.closed_at) {
+      const said = sessionHeadline(d.session, state.ttlDays);
+      if (said) toast(`Session closed. ${said}`);
+    }
   } catch (err) {
     if (isUnreachable(err)) toast("Local server was already down — clearing the session. Check HPC3 with `squeue --me`.");
   }
@@ -3180,8 +3454,7 @@ async function injectPrompt(c, text) {
 async function sendChat(e) {
   e.preventDefault();
   const input = $("chatInput");
-  // The corpus scan takes no question: an empty composer sends a default label for the run.
-  const text = input.value.trim() || (activeRoute() === "corpus" ? "Corpus scan: haploinsufficient genes in retinal disease" : "");
+  const text = input.value.trim();
   if (!text) return;
   // Everything below is about THIS chat: its plan, its run, its attachments. A message typed in a
   // chat is never feedback on another chat's plan, never a note for another chat's run — a tester
@@ -3192,11 +3465,11 @@ async function sendChat(e) {
   // While a PI plan/clarify is awaiting a decision, the composer is the "refine the plan" channel —
   // the message is natural-language feedback that re-plans (it does NOT start a new run).
   if (c.planPending) {
-    appendUserMessage(text);
     input.value = "";
     c.draft = "";
+    saveComposer(c);
     updateComposerButton();
-    submitPlan("revise", text, undefined, c);
+    revisePlanInWords(c, text);
     return;
   }
   // A run is already executing in this chat (post-plan): the message is mid-run steering — queue it
@@ -3205,6 +3478,7 @@ async function sendChat(e) {
     appendUserMessage(text);
     input.value = "";
     c.draft = "";
+    saveComposer(c);
     updateComposerButton();
     injectPrompt(c, text);
     return;
@@ -3226,9 +3500,11 @@ async function sendChat(e) {
   c.owned = true;
   input.value = "";
   c.draft = "";
+  saveComposer(c);
   setChatRunning(c, true);
   const sess = activeSession();
-  const history = sess.messages.filter((m) => !m.kind && (m.role === "user" || m.role === "assistant")).slice(0, -1).map((m) => ({ role: m.role, content: m.content }));
+  // An approved plan is part of the conversation a model is given: its steps and its document.
+  const history = sess.messages.filter((m) => (!m.kind || m.kind === "plan") && (m.role === "user" || m.role === "assistant")).slice(0, -1).map((m) => ({ role: m.role, content: m.content }));
   const dataset_path = c.primary || null;
   // The BIND-SET (feature ②): every data file attached to THIS chat, ordered as attached (the server
   // re-ranks to pick the primary). Legacy single-file runs still send `dataset_path`; both together
@@ -3237,27 +3513,32 @@ async function sendChat(e) {
     const d = state.datasets.find((x) => x.path === p) || {};
     return { path: p, name: d.name || p.split("/").pop(), role: c.roles[p] || null };
   });
-  const autonomous = !!($("autonomousMode") && $("autonomousMode").checked);
-  // Bypass mode overrides plan review — don't also send plan_mode=true (avoids a stale plan card).
-  const plan_mode = !autonomous && !!($("planMode") && $("planMode").checked);
   // DAG is the default execution model now (dependency-graph + Coordinator; no UI toggle). The
   // classic linear order is still reachable server-side via AISCIENTIST_PLANNER=linear.
   const planner = "dag";
   // A refused send leaves the chat idle and gives the text back, so it can be sent again.
   const giveBack = () => {
     setChatRunning(c, false);
-    if (chatVisible(c) && !input.value.trim()) { input.value = text; updateComposerButton(); }
+    if (chatVisible(c) && !input.value.trim()) { input.value = text; c.draft = text; updateComposerButton(); }
     else if (!c.draft) c.draft = text;
+    saveComposer(c);
   };
   try {
-    // The research lab (PI→Scientist→Critic + real scanpy/gseapy tools) is the one execution path.
-    // Manual (default): plan review + DAG decision-point pauses. Bypass (autonomous): no gates.
-    // Axis B. `route: "chat"` takes the answer-first fast path (agents/quick_chat.py) — no plan, no
-    // report; `history` gives that loop the conversation it is continuing (the research path ignores
-    // it and scopes a study by question + dataset instead). An older client omitting `route` still
-    // gets today's research behaviour, because the server defaults it.
-    const route = activeRoute();
-    const res = await fetch("/api/lab", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ connection_id: state.connectionId, conversation_id: c.sid, question: text, dataset_path, datasets, case_note: (c.caseNote && c.caseNote.text) || null, plan_mode, autonomous, save_results: !!($("saveResults") && $("saveResults").checked), planner, route, history, mode: ($("modeSelect") && $("modeSelect").value) || "auto", presets: (sess && sess.presetKeys) || [], skills: (sess && sess.skillKeys) || [], preset_prompt: null }) });
+    // One flow for every request, with the same run options (FIXED_RUN_OPTIONS): the server routes
+    // it to a literature search or to the lab, and either starts with a plan to review. `history` is
+    // the conversation so far, for a line that reads it.
+    const labBody = { connection_id: state.connectionId, conversation_id: c.sid, question: text, dataset_path, datasets, ...FIXED_RUN_OPTIONS, planner, history, tz: userTz() };
+    const postLab = () => fetch("/api/lab", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(labBody) });
+    let res = await postLab();
+    // The budget hard limit (Account › API usage): "confirm" asks once, then sends the same run again.
+    if (res.status === 409) {
+      const d = await res.clone().json().catch(() => ({}));
+      if (d.needs_budget_confirm) {
+        if (!confirm(`${d.error}\n\nThe figure is an estimate; the Claude Console has the actual spend.`)) { giveBack(); return; }
+        labBody.budget_ack = true;
+        res = await postLab();
+      }
+    }
     if (!res.ok) {
       const d = await res.json().catch(() => ({}));
       if (res.status === 404 && /unknown connection/i.test(d.error || "")) {
@@ -3273,8 +3554,6 @@ async function sendChat(e) {
       }
       giveBack();
       toast(d.error || "Run failed");
-    } else if (route === "corpus") {
-      leaveCorpusRoute(sess);     // accepted: one pick is one scan (a refused send keeps the pick)
     }
   } catch (err) {
     giveBack();
@@ -3287,7 +3566,7 @@ async function sendChat(e) {
 // Run / Cancel actions. The user refines it by typing in the composer (which re-plans);
 // an ambiguous request comes back as a clarify card with option chips. The live card is
 // ephemeral (buttons can't persist); on approval the plan is saved to history as text.
-const DEFAULT_PLACEHOLDER = "Ask AiScientist to plan or interpret an ocular bioinformatics analysis...";
+const DEFAULT_PLACEHOLDER = "Ask a question, or describe the analysis you want — the agent proposes a plan first…";
 
 // ---- the prompt that is waiting, kept apart from its card ---------------------------------------
 // A plan, a clarify question or a decision point waits for the user in ONE chat: the one that owns
@@ -3320,13 +3599,18 @@ function holdPlanPrompt(c, kind, payload, msg) {
   if (same && expiry) next.expiry = expiry;
   c.plan = next;
   c.planPending = true;
+  c.answered = null;
   if (kind === "plan") keepPlanDraft(c, next);
   saveRunOwners();
   // The prompt that is already on screen, sent again: its card stays as it is, with the caret
   // where the person left it.
   if (same && chatVisible(c) && state.planCardEl && state.planCardEl.isConnected) return;
   renderSessionList();
-  if (chatVisible(c)) { drawPlanPrompt(c); return; }
+  if (chatVisible(c)) {
+    state.planView = null;
+    drawPlanPrompt(c);
+    return;
+  }
   // Another chat is on screen. The prompt is not drawn into it (it would be a card for a plan that
   // chat never asked for, and the owning chat would then show none); it waits for its own chat.
   updateComposerButton();
@@ -3335,7 +3619,8 @@ function holdPlanPrompt(c, kind, payload, msg) {
 
 function drawPlanPrompt(c = activeChat()) {
   const p = c && c.plan;
-  if (!p || !chatVisible(c)) return;
+  if (!c || !chatVisible(c)) return;
+  if (!p) { drawAnsweredPlan(c); return; }
   if (p.kind === "clarify") showClarify(p.questions);
   else if (p.kind === "decision") showDecision(p.goal, p.options);
   else showPlanPanel(p.agenda);
@@ -3443,6 +3728,7 @@ function removePlanCard() {
 // kind: "plan" | "clarify" | "decision" — what the card waits for, which is what its expiry line says.
 function planCardShell(kind) {
   removePlanCard();
+  if (state.planAnsweredEl) { state.planAnsweredEl.remove(); state.planAnsweredEl = null; }
   const stream = $("chatStream");
   const hint = stream.querySelector(".empty-hint"); if (hint) hint.remove();
   const el = document.createElement("div");
@@ -3491,63 +3777,271 @@ function planIcon(name) {
   return `<span class="material-symbols-outlined msym" aria-hidden="true">${name}</span>`;
 }
 
+// The numbers in a step's prose are what a reviewer checks (a cut-off, a threshold, a count), so
+// they are set in bold, and a value the plan passes to the tool (one of its settings) is marked as
+// that setting. Runs over the HTML renderMarkdown made, on its text only: never inside a tag, an
+// entity (`&#039;`), a code span or a link. A digit inside a word (DDX41, log1p) is not a number.
+function planEmphasisHtml(html, settings) {
+  const s = settings || {};
+  const words = new Map();     // a text setting as it appears in the escaped prose -> its name
+  for (const [k, v] of Object.entries(s)) {
+    for (const x of Array.isArray(v) ? v : [v]) {
+      if (typeof x === "string" && x.trim().length > 1) words.set(escapeHtml(x.trim()), k);
+    }
+  }
+  const alt = [...words.keys()].sort((a, b) => b.length - a.length)
+    .map((w) => w.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")).join("|");
+  const re = new RegExp("(^|[^\\w.#&-])(?:([~≈]?\\d+(?:[.,]\\d+)*(?:%|x(?![a-z])|×|-fold)?)"
+    + (alt ? `|(${alt})` : "") + ")(?!\\w)", "g");
+  const pinOf = (num) => {
+    const n = parseFloat(num.replace(/[~≈,]/g, ""));
+    const pct = num.endsWith("%");
+    for (const [k, v] of Object.entries(s)) {
+      for (const x of Array.isArray(v) ? v : [v]) {
+        if (typeof x === "number" && (Math.abs(x - n) < 1e-9 || (pct && Math.abs(x - n / 100) < 1e-9))) return k;
+      }
+    }
+    return "";
+  };
+  let skip = 0;
+  return String(html).split(/(<[^>]*>)/).map((part) => {
+    if (part.startsWith("<")) {
+      if (/^<(code|a|pre)[\s>]/i.test(part)) skip += 1;
+      else if (/^<\/(code|a|pre)>/i.test(part)) skip = Math.max(0, skip - 1);
+      return part;
+    }
+    if (skip) return part;
+    return part.replace(re, (_m, pre, num, word) => {
+      const key = num ? pinOf(num) : words.get(word);
+      return pre + (key
+        ? `<strong class="plan-pin" title="Passed to the tool as ${escapeHtml(key)}">${num || word}</strong>`
+        : `<strong class="plan-num">${num}</strong>`);
+    });
+  }).join("");
+}
+
+// Shown in full or as its first two lines: as the person left it, else in full only when the last
+// revision rewrote it (what changed is what they need to read).
+function planStepOpen(text, revised) {
+  const kept = state.planStepOpen;
+  return kept && kept.has(text) ? kept.get(text) : !!revised;
+}
+
 // One step of the card. `step` is its entry in the plan document (tool, settings, where it runs)
-// when the server sent one; without it the step is its title and prose alone.
-function planStepHtml(text, n, step, revised, showWhere) {
+// when the server sent one; without it the step is its title and prose alone. The title, the tool
+// and the settings are always shown; the prose is two lines until the step is opened.
+// `edit`: the plan is waiting and has a document, so its title and setting values can be changed
+// in place and (`edit.remove`) the step removed (wirePlanCardEdits).
+function planStepHtml(text, n, step, revised, showWhere, edit) {
   const parts = planStepParts(text);
   const settings = (step && step.settings) || {};
+  const editable = !!(edit && step && step.id);
+  const editAttrs = (what, key) => editable
+    ? ` data-edit="${what}"${key ? ` data-key="${escapeHtml(key)}"` : ""} tabindex="0" role="button" `
+      + `title="${what === "title" ? "Change the title" : `Change ${escapeHtml(key)}`}"`
+    : "";
   const chips = Object.keys(settings).map((k) =>
     `<span class="plan-setting" title="Passed to the tool exactly as written">`
     + `<span class="plan-setting-k">${escapeHtml(k)}</span>`
-    + `<span class="plan-setting-v">${escapeHtml(planSettingText(settings[k]))}</span></span>`).join("");
+    + `<span class="plan-setting-v${editable ? " editable" : ""}"${editAttrs("setting", k)}>`
+    + `${escapeHtml(planSettingText(settings[k]))}</span></span>`).join("");
   const where = showWhere ? planRunsOnText(step && step.runs_on) : "";
   const meta = (chips || where)
     ? `<div class="plan-step-meta">${chips}`
       + (where ? `<span class="plan-where">${planIcon(where.startsWith("Runs on") ? "dns" : "memory")}${escapeHtml(where)}</span>` : "")
       + `</div>`
     : "";
-  return `<li class="plan-step${revised ? " revised" : ""}">`
+  const open = !!parts.body && planStepOpen(text, revised);
+  return `<li class="plan-step${revised ? " revised" : ""}${open ? " open" : ""}"`
+    + (editable ? ` data-id="${escapeHtml(step.id)}"` : "") + `>`
     + `<span class="plan-step-num">${n}</span>`
     + `<div class="plan-step-main">`
-    + `<div class="plan-step-head"><span class="plan-step-title">${renderMarkdown(parts.title)}</span>`
+    + `<div class="plan-step-head"><span class="plan-step-title${editable ? " editable" : ""}"${editAttrs("title")}>`
+    + `${renderMarkdown(parts.title)}</span>`
     + (revised ? `<span class="plan-step-flag">Revised</span>` : "")
     + (step && step.tool ? `<code class="plan-step-tool">${escapeHtml(step.tool)}</code>` : "")
-    + `</div>`
-    + (parts.body ? `<div class="plan-step-body">${renderMarkdown(parts.body)}</div>` : "")
+    + `<span class="plan-step-acts">`
+    + (editable && edit.remove ? `<button type="button" class="plan-step-remove" data-step-remove `
+      + `aria-label="Remove step ${n}" title="Remove this step">${planIcon("delete")}</button>` : "")
+    + (parts.body ? `<button type="button" class="plan-step-more" data-step-more aria-expanded="${open}" `
+      + `aria-label="Show the whole step" title="Show the whole step">${planIcon("expand_more")}</button>` : "")
+    + `</span></div>`
+    + (parts.body ? `<div class="plan-step-body">${planEmphasisHtml(renderMarkdown(parts.body), settings)}</div>` : "")
     + meta + `</div></li>`;
 }
 
-// The whole card. Which steps the last revision touched comes from the server (it has just applied
-// the edit), so "what did my change actually do?" is answered on the card instead of by diffing two
-// plans by eye.
-function planCardHtml(agenda, doc, revisedSteps) {
-  const docSteps = (doc && doc.steps) || [];
-  const revised = new Set((revisedSteps || []).map(Number));
+// One decimal from 1 up, two below it: an estimate is a range, and 2.667 hours claims more than it knows.
+function estimateNumber(value) {
+  return Number.isFinite(value)
+    ? value.toLocaleString(undefined, { maximumFractionDigits: Math.abs(value) >= 1 ? 1 : 2 }) : "—";
+}
+
+function estimateRange(values, time = false) {
+  if (!Array.isArray(values) || values.length !== 2 || !values.every(Number.isFinite)) return "—";
+  const divisor = time ? (values[1] >= 3600 ? 3600 : 60) : 1;
+  const [lo, hi] = values.map((v) => estimateNumber(v / divisor));
+  return `${time ? "~" : ""}${lo === hi ? lo : `${lo}–${hi}`}` + (time ? (divisor === 3600 ? " hr" : " min") : "");
+}
+
+function estimateCell(value) {
+  return String(value == null ? "" : value).replace(/[|\r\n]/g, " ");
+}
+
+function planEstimateMarkdown(estimate) {
+  if (!estimate || !Array.isArray(estimate.steps)) return "";
+  const currency = estimateCell(estimate.currency || "USD");
+  const row = (entry, label, skill) => `| ${estimateCell(label)}${entry.rough ? " (rough)" : ""} | ${estimateCell(skill)} | `
+    + `${estimateRange(entry.seconds, true)} | ${estimateRange(entry.cpu_hours)} | ${estimateRange(entry.gpu_hours)} | `
+    + `${estimate.rates_configured ? estimateRange(entry.cost) + " " + currency : "—"} |`;
+  return "\n\n**Estimated resources and cost**\n\n"
+    + "| Step | Skill | Time | CPU hours | GPU hours | Est. cost |\n| --- | --- | --- | --- | --- | --- |\n"
+    + estimate.steps.map((entry, i) => row(entry, entry.step || i + 1, entry.skill)).join("\n")
+    + (estimate.total ? "\n" + row(estimate.total, "Total", "") : "")
+    + "\n\nRough estimates have limited run history. "
+    + (estimate.rates_configured ? "" : "Rates not configured: no cost is shown. ")
+    + estimateCell(estimate.note || "HPC3 queue wait time is not included.") + "\n";
+}
+
+function runUsageMarkdown(msg) {
+  const actual = msg.actual;
+  const estimate = msg.estimate || {};
+  const total = estimate.total || {};
+  const cost = (value) => estimate.rates_configured
+    ? `${value} ${estimateCell(estimate.currency || "USD")}` : "—";
+  return "**Run resources and cost**\n\n| | Estimated | Actual |\n| --- | --- | --- |\n"
+    + `| Time | ${estimateRange(total.seconds, true)} | ${estimateNumber(actual.seconds / 60)} min |\n`
+    + `| CPU hours | ${estimateRange(total.cpu_hours)} | ${estimateNumber(actual.cpu_hours)} |\n`
+    + `| GPU hours | ${estimateRange(total.gpu_hours)} | ${estimateNumber(actual.gpu_hours)} |\n`
+    + `| Cost | ${cost(estimateRange(total.cost))} | ${cost(estimateNumber(actual.cost))} |\n\n`
+    + (total.rough ? "Estimate: rough. " : "") + (actual.rough ? "Actual resource accounting: rough. " : "")
+    + (estimate.rates_configured ? "" : "Rates not configured: no cost is shown. ")
+    + "Time is summed tool compute time; model/report overhead and HPC3 queue wait time are excluded.";
+}
+
+// The estimate on the plan card: the same table the approved plan keeps in the chat, in a block of
+// its own so a narrow side panel scrolls it sideways instead of widening.
+function planEstimateHtml(estimate) {
+  const md = planEstimateMarkdown(estimate);
+  return md ? `<div class="plan-estimate">${renderMarkdown(md)}</div>` : "";
+}
+
+// The line under a plan's title: how many steps, how many settings the plan fixes, and where the
+// steps run when that is the same for all of them (a step only carries its own line when the plan
+// mixes places).
+function planSub(agenda, docSteps) {
   const fixed = docSteps.reduce((n, st) => n + Object.keys((st && st.settings) || {}).length, 0);
-  // Where the steps run is said once, under the title, when it is the same for all of them; a
-  // step only carries its own line when the plan mixes places.
   const places = [...new Set(docSteps.map((st) => planRunsOnText(st && st.runs_on)).filter(Boolean))];
   const onePlace = places.length === 1 ? places[0] : "";
   const sub = `${agenda.length} step${agenda.length === 1 ? "" : "s"}`
     + (fixed ? ` · ${fixed} setting${fixed === 1 ? "" : "s"} passed to the tools as written` : "")
     + (onePlace ? ` · ${onePlace.startsWith("Runs") ? onePlace.toLowerCase() : "runs as " + onePlace.replace(/ job /, " jobs ")}` : "");
-  const note = revised.size
-    ? `<div class="plan-note">${planIcon("edit")}<span>Step${revised.size > 1 ? "s" : ""} `
-      + `${[...revised].sort((x, y) => x - y).join(", ")} ${revised.size > 1 ? "were" : "was"} revised — `
-      + `every other step is unchanged.</span></div>`
-    : "";
-  return `<div class="plan-head"><span class="plan-head-icon">${planIcon("checklist")}</span>`
-    + `<div><div class="plan-title">Proposed plan</div><div class="plan-sub">${sub}</div></div></div>`
-    + note
-    + `<ol class="plan-steps">`
-    + agenda.map((s, i) => planStepHtml(s, i + 1, docSteps[i], revised.has(i + 1), !onePlace)).join("")
-    + `</ol>`
+  return { sub, onePlace };
+}
+
+// Which steps the last revision touched comes from the server (it has just applied the edit), so
+// "what did my change actually do?" is answered on the plan instead of by diffing two plans by eye.
+function planRevisedNote(revised) {
+  if (!revised.size) return "";
+  return `<div class="plan-note">${planIcon("edit")}<span>Step${revised.size > 1 ? "s" : ""} `
+    + `${[...revised].sort((x, y) => x - y).join(", ")} ${revised.size > 1 ? "were" : "was"} revised — `
+    + `every other step is unchanged.</span></div>`;
+}
+
+// The whole plan, as the side panel shows it. `opts.mode`:
+//   "review" (default) — waiting for a decision: the document's editor and Run / Cancel;
+//   "status"           — answered, the PI has it: `opts.status` instead of the buttons;
+//   "saved"            — a plan this chat approved: read-only, with its document.
+// `opts.expiry` is the waiting plan's expiry line.
+function planCardHtml(agenda, doc, revisedSteps, opts) {
+  const o = opts || {};
+  const mode = o.mode || "review";
+  const docSteps = (doc && doc.steps) || [];
+  const revised = new Set((revisedSteps || []).map(Number));
+  const { sub, onePlace } = planSub(agenda, docSteps);
+  const prose = agenda.map((s, i) => [s, i + 1]).filter(([s]) => planStepParts(s).body);
+  const allOpen = prose.length > 0 && prose.every(([s, n]) => planStepOpen(s, revised.has(n)));
+  const head = `<div class="plan-head"><span class="plan-head-icon">${planIcon("checklist")}</span>`
+    + `<div><div class="plan-title">${mode === "saved" ? "Plan" : "Proposed plan"}</div><div class="plan-sub">${sub}</div></div>`
+    + (prose.length ? `<button type="button" class="plan-expand" data-plan-expand>${allOpen ? "Collapse all" : "Expand all"}</button>` : "")
+    + `</div>`;
+  // A waiting plan with a document is changed on its cards; one step is never removed (to run
+  // nothing, the plan is cancelled).
+  const edit = mode === "review" && doc && doc.yaml ? { remove: agenda.length > 1 } : null;
+  const steps = `<ol class="plan-steps">`
+    + agenda.map((s, i) => planStepHtml(s, i + 1, docSteps[i], revised.has(i + 1), !onePlace, edit)).join("")
+    + `</ol>`;
+  if (mode !== "review") {
+    return head + steps + planEstimateHtml(o.estimate) + planDocumentHtml(doc)
+      + `<div class="plan-actions-row"><span class="plan-actions-status">${escapeHtml(o.status || "")}</span></div>`;
+  }
+  const tip = edit ? `<div class="plan-edit-tip">${planIcon("edit")}<span>Click a title or a value to change it, `
+    + `or remove a step. Applied as written, without the model; the other steps stay as they are.</span></div>` : "";
+  return head + planRevisedNote(revised) + tip + steps
+    + planEstimateHtml(o.estimate)
+    + planReviseHtml(o.words)
     + planEditorHtml(doc)
     + `<div class="plan-actions-row">`
+    + (o.expiry ? `<div class="plan-expiry" role="status">${planIcon("hourglass_bottom")}<span>${escapeHtml(o.expiry)}</span></div>` : "")
     + `<button class="primary" data-plan="approve">${planIcon("play_arrow")}Run this plan</button>`
     + (doc && doc.yaml ? `<button class="secondary" data-plan="yaml">${planIcon("data_object")}<span>Edit as YAML</span></button>` : "")
-    + `<button class="secondary quiet" data-plan="cancel">Cancel</button>`
-    + `<span class="plan-actions-hint">or reply below to change it</span></div>`;
+    + `<button class="secondary quiet" data-plan="cancel">Cancel</button></div>`;
+}
+
+// The two ways to change a waiting plan sit together in the panel: say what to change, here or in
+// the chat (the PI makes the change), or edit the document itself (Edit as YAML, applied by code).
+// `words` is what was typed here and not sent, so a redraw of the panel keeps it.
+function planReviseHtml(words) {
+  return `<div class="plan-revise">`
+    + `<div class="plan-revise-head">${planIcon("chat")}<span>Change it in words</span></div>`
+    + `<div class="plan-revise-row"><textarea class="plan-revise-text" rows="2" `
+    + `aria-label="Tell the PI what to change in the plan" `
+    + `placeholder="e.g. drop the enrichment step, and cluster at resolution 0.8">${escapeHtml(words || "")}</textarea>`
+    + `<button class="secondary small" data-plan="revise" disabled>${planIcon("send")}<span>Send</span></button></div>`
+    + `<div class="plan-revise-draft" hidden>${planIcon("info")}<span>Your YAML edit is not applied yet: it is applied `
+    + `first, and the PI changes the plan with it.</span></div>`
+    + `<div class="plan-revise-tip">The PI changes the plan as it stands, with your own changes, and shows it to you `
+    + `again; nothing runs until you run it. A question gets an answer and leaves the plan as it is. Same as replying `
+    + `in the chat.</div></div>`;
+}
+
+// The document of a plan that is no longer waiting: there to read and copy, not to edit.
+function planDocumentHtml(doc) {
+  if (!doc || !doc.yaml) return "";
+  return `<details class="plan-yaml plan-yaml-read"><summary class="plan-yaml-file">${planIcon("data_object")}plan.yaml</summary>`
+    + `<div class="plan-yaml-code"><pre class="plan-yaml-hl">${planYamlHtml(doc.yaml)}</pre></div></details>`;
+}
+
+// The plan as the chat shows it: the step titles and the tool each one runs, with the decision
+// beside them. The prose, the settings and the document are one click away in the side panel's Plan
+// tab, so the chat stays a conversation and a long plan does not push it off the screen. `opts`:
+// `pending` (waiting: Run / Open plan / Cancel), else `status` (what happened to it) with View plan;
+// `revised`, `problems` (why the last edit of the document was refused), `dirty` (the document holds
+// an edit that was not applied, so Run would run the plan without it).
+function planEntryHtml(agenda, doc, opts) {
+  const o = opts || {};
+  const docSteps = (doc && doc.steps) || [];
+  const revised = new Set((o.revised || []).map(Number));
+  const { sub } = planSub(agenda, docSteps);
+  const rows = agenda.map((s, i) => `<li class="plan-entry-step${revised.has(i + 1) ? " revised" : ""}">`
+    + `<span class="plan-entry-num">${i + 1}</span>`
+    + `<span class="plan-entry-title">${escapeHtml(planStepParts(s).title.replace(/[*`]/g, ""))}</span>`
+    + (docSteps[i] && docSteps[i].tool ? `<code class="plan-step-tool">${escapeHtml(docSteps[i].tool)}</code>` : "")
+    + `</li>`).join("");
+  const refused = (o.problems || []).length
+    ? `<div class="plan-note bad">${planIcon("error")}<span>Your edit was not applied — the plan is unchanged. Open the plan to see why.</span></div>`
+    : "";
+  const actions = o.pending
+    ? `<button class="primary" data-plan="approve"${o.dirty ? ' disabled title="Apply or reset your edit first"' : ""}>${planIcon("play_arrow")}Run this plan</button>`
+      + `<button class="secondary" data-plan="open">${planIcon("right_panel_open")}<span>Open plan</span></button>`
+      + `<button class="secondary quiet" data-plan="cancel">Cancel</button>`
+      + `<span class="plan-actions-hint">or reply below to change it</span>`
+    : `<span class="plan-actions-status">${escapeHtml(o.status || "")}</span>`
+      + `<button class="secondary small" data-plan="open">${planIcon("right_panel_open")}<span>View plan</span></button>`;
+  return `<div class="plan-head"><span class="plan-head-icon">${planIcon("checklist")}</span>`
+    + `<div><div class="plan-title">${o.pending ? "Proposed plan" : "Plan"}</div><div class="plan-sub">${sub}</div></div></div>`
+    + (o.pending ? planRevisedNote(revised) + refused : "")
+    + `<ol class="plan-entry-steps">${rows}</ol>`
+    + `<div class="plan-actions-row">${actions}</div>`;
 }
 
 // The plan document's editor. Present only when the server sends the plan as a document (`plan`
@@ -3576,22 +4070,278 @@ function planEditorHtml(doc) {
     + `<span class="plan-yaml-tip">Change a setting, reword, remove, reorder or add a step. `
     + `Your edit is applied exactly as written; nothing else in the plan changes.</span></div>`
     + banner
+    // The text is typed into the textarea and read from the highlighted copy under it: the textarea's
+    // own text is transparent, and the copy follows its scrolling (wirePlanEditor).
+    + `<div class="plan-yaml-code plan-yaml-stack">`
+    + `<pre class="plan-yaml-hl" aria-hidden="true">${planYamlHtml(text)}</pre>`
     + `<textarea class="plan-yaml-text" rows="${rows}" spellcheck="false" autocapitalize="off" `
-    + `autocomplete="off" aria-label="The plan as YAML">${escapeHtml(text)}</textarea>`
+    + `autocomplete="off" aria-label="The plan as YAML">${escapeHtml(text)}</textarea></div>`
     + `<div class="plan-yaml-actions"><button class="secondary small" data-plan="edit" disabled>Apply edits</button>`
     + `<button class="secondary quiet small" data-plan="reset">Reset</button></div></div>`;
 }
 
+// The plan document as text to read: keys quiet, and what a reviewer looks for — each step's id and
+// title, its tool, the settings passed to it — in bold. Line by line, character for character: the
+// editor draws this under its own (transparent) text, so it must never add or drop one.
+function planYamlHtml(text) {
+  let block = -1;      // column of the key whose block scalar (`does: >-`) the deeper lines belong to
+  let settings = -1;   // column of `settings:`; the keys under it are the tool's arguments
+  const VALUE = { id: "y-id", title: "y-title", tool: "y-tool", plan: "y-meta", request: "y-meta", runs_on: "y-meta" };
+  return String(text == null ? "" : text).split("\n").map((line) => {
+    const col = line.length - line.trimStart().length;
+    if (block >= 0 && (!line.trim() || col > block)) return line.trim() ? `<span class="y-prose">${escapeHtml(line)}</span>` : escapeHtml(line);
+    block = -1;
+    if (line.trimStart().startsWith("#")) return `<span class="y-c">${escapeHtml(line)}</span>`;
+    const m = /^(\s*)(-\s+)?([^\s:#"'][^:#]*?):(?=\s|$)(\s*)(.*)$/.exec(line);
+    if (!m) return escapeHtml(line);
+    const [, sp, dash = "", key, gap, rest] = m;
+    const keyCol = sp.length + dash.length;
+    if (settings >= 0 && keyCol <= settings) settings = -1;
+    const inSettings = settings >= 0;
+    if (key === "settings" && !rest) settings = keyCol;
+    const c = /^([^"'#]*?)(\s+#.*)$/.exec(rest);
+    const value = c ? c[1] : rest;
+    const scalar = /^[>|][+-]?\d*$/.test(value);
+    if (scalar) block = keyCol;
+    const cls = inSettings ? "y-val" : scalar ? "y-ind" : (VALUE[key] || "y-v");
+    return escapeHtml(sp)
+      + (dash ? `<span class="y-d">-</span>${escapeHtml(dash.slice(1))}` : "")
+      + `<span class="${inSettings ? "y-sk" : "y-k"}">${escapeHtml(key)}</span><span class="y-p">:</span>${escapeHtml(gap)}`
+      + (value ? `<span class="${cls}">${escapeHtml(value)}</span>` : "")
+      + (c ? `<span class="y-c">${escapeHtml(c[2])}</span>` : "");
+  }).join("\n");
+}
+
+// ---- changing the plan on its cards ----------------------------------------------------------------
+// A title, a setting's value or a removed step is written into the plan DOCUMENT, line by line, and
+// sent as an edit: the server parses it, checks it against the tools and applies it by code, with no
+// model, exactly like an edit made in the YAML editor. Every other line stays as the server wrote it,
+// so the edit holds this one change and nothing else.
+
+function planYamlUnquote(text) {
+  const s = String(text == null ? "" : text).trim();
+  if (s.startsWith('"')) { try { return String(JSON.parse(s)); } catch { return s; } }
+  if (s.startsWith("'") && s.endsWith("'") && s.length > 1) return s.slice(1, -1).replace(/''/g, "'");
+  return s;
+}
+
+const PLAN_YAML_NUMBER = /^[-+]?(\d+(\.\d*)?|\.\d+)([eE][-+]?\d+)?$/;
+
+// A number as the server's YAML reader reads one: `1e-07` would be a STRING to it, `1.0e-07` a float.
+function planYamlNumber(n, float) {
+  if (!float && Number.isInteger(n)) return String(n);
+  const s = String(n).toLowerCase();
+  if (s.includes("e")) {
+    let [m, e] = s.split("e");
+    if (!m.includes(".")) m += ".0";
+    if (!/^[-+]/.test(e)) e = "+" + e;
+    return `${m}e${e}`;
+  }
+  return s.includes(".") ? s : s + ".0";
+}
+
+function planYamlItem(text) {
+  if (PLAN_YAML_NUMBER.test(text)) return planYamlNumber(Number(text), /[.eE]/.test(text));
+  if (/^(true|false)$/i.test(text)) return text.toLowerCase();
+  return JSON.stringify(text);
+}
+
+// What was typed for a setting, written as the same kind of value the document had there: a number
+// stays a number (and a float a float), a list a list, true/false a boolean; anything else is a
+// quoted string. {text} or {error}.
+function planYamlValue(literal, typed) {
+  const raw = String(typed == null ? "" : typed).trim();
+  const was = String(literal == null ? "" : literal).trim();
+  if (/^\[.*\]$/.test(was)) {
+    const items = raw.split(",").map((x) => x.trim()).filter(Boolean);
+    return items.length ? { text: "[" + items.map(planYamlItem).join(", ") + "]" }
+      : { error: "Give at least one value, separated by commas." };
+  }
+  if (/^(true|false)$/i.test(was)) {
+    return /^(true|false)$/i.test(raw) ? { text: raw.toLowerCase() } : { error: "true or false is expected." };
+  }
+  if (PLAN_YAML_NUMBER.test(was)) {
+    return raw && PLAN_YAML_NUMBER.test(raw) ? { text: planYamlNumber(Number(raw), /[.eE]/.test(was)) }
+      : { error: "A number is expected." };
+  }
+  return raw ? { text: JSON.stringify(raw) } : { error: "A value is expected." };
+}
+
+// The plan document with one change made to it. `change`: {id, title} | {id, setting, value} (the
+// value as typed) | {id, remove: true}. {yaml} or {error}: a value of the wrong kind, or a document
+// edited by hand into a shape where the line is not where the server writes it.
+function planYamlEdit(yaml, change) {
+  const lines = String(yaml == null ? "" : yaml).split("\n");
+  const indent = (l) => l.length - l.trimStart().length;
+  const start = lines.findIndex((l) => {
+    const m = /^\s*-\s+id:\s*(.*?)\s*$/.exec(l);
+    return !!m && planYamlUnquote(m[1]) === String(change.id);
+  });
+  if (start < 0) return { error: "This step is no longer in the plan document." };
+  const dash = indent(lines[start]);
+  const keyCol = lines[start].indexOf("id:");
+  let end = start + 1;
+  while (end < lines.length && (!lines[end].trim() || indent(lines[end]) > dash)) end += 1;
+  while (end > start + 1 && !lines[end - 1].trim()) end -= 1;
+  if (change.remove) {
+    lines.splice(start, end - start);
+    return { yaml: lines.join("\n") };
+  }
+  if (change.title !== undefined) {
+    const title = String(change.title).replace(/\s+/g, " ").trim();
+    if (!title) return { error: "A step needs a title." };
+    for (let i = start + 1; i < end; i += 1) {
+      const m = /^(\s*)title:\s*(.*)$/.exec(lines[i]);
+      if (!m || indent(lines[i]) !== keyCol) continue;
+      if (/^[>|]/.test(m[2])) break;
+      lines[i] = `${m[1]}title: ${JSON.stringify(title)}`;
+      return { yaml: lines.join("\n") };
+    }
+    return { error: "The title is not where the plan document keeps it: change it in the YAML editor." };
+  }
+  let settings = -1;
+  for (let i = start + 1; i < end; i += 1) {
+    if (settings < 0) {
+      if (indent(lines[i]) === keyCol && /^\s*settings:\s*$/.test(lines[i])) settings = keyCol;
+      continue;
+    }
+    if (lines[i].trim() && indent(lines[i]) <= settings) break;
+    const m = /^(\s*)("[^"]*"|'[^']*'|[^\s:#"'][^:#]*?):(\s+)(.*)$/.exec(lines[i]);
+    if (!m || planYamlUnquote(m[2]) !== String(change.setting)) continue;
+    const c = /^["']/.test(m[4]) ? null : /^(.*?)(\s+#.*)$/.exec(m[4]);
+    const value = planYamlValue(c ? c[1] : m[4], change.value);
+    if (value.error) return value;
+    lines[i] = `${m[1]}${m[2]}:${m[3]}${value.text}${c ? c[2] : ""}`;
+    return { yaml: lines.join("\n") };
+  }
+  return { error: `${change.setting} is not where the plan document keeps it: change it in the YAML editor.` };
+}
+
+// Make a change on the cards of the plan waiting in chat `c`, and send it. An edit typed in the YAML
+// editor and not applied yet is part of what the person has: the change is made on it, and both go
+// together. Returns why it could not be made, or "".
+function commitPlanChange(c, change) {
+  const doc = c && c.plan && c.plan.kind === "plan" ? c.plan.doc : null;
+  if (!doc || !doc.yaml) return "This plan has no document to change.";
+  const out = planYamlEdit(c.planDraftYaml || doc.yaml, change);
+  if (out.error) return out.error;
+  submitPlan("edit", "", out.yaml, c);
+  return "";
+}
+
+// A title or a setting's value turned into a text box. Enter (or leaving the box) applies a change,
+// Escape puts the value back. A value that cannot be written stays open with the reason on Enter.
+function planInlineEdit(li, el, initial, label, commit) {
+  if (el.querySelector("input")) return;
+  const before = el.innerHTML;
+  const input = document.createElement("input");
+  input.className = "plan-inline-input";
+  input.value = initial;
+  input.setAttribute("aria-label", label);
+  input.spellcheck = false;
+  if (el.classList.contains("plan-setting-v")) input.style.width = `${Math.max(6, String(initial).length + 2)}ch`;
+  el.innerHTML = "";
+  el.appendChild(input);
+  el.classList.add("editing");
+  input.focus();
+  input.select();
+  let done = false;
+  const restore = () => { el.innerHTML = before; el.classList.remove("editing"); };
+  const finish = (save, leaving) => {
+    if (done) return;
+    if (save && input.value.trim() !== String(initial).trim()) {
+      // Sending draws the panel again at once, which takes the focus from this box: `done` first,
+      // so that blur does not send the change a second time.
+      done = true;
+      const why = commit(input.value);
+      if (!why) return;
+      if (!leaving) { done = false; planStepError(li, why); input.focus(); return; }
+      restore();
+      planStepError(li, why);
+      return;
+    }
+    done = true;
+    restore();
+    planStepError(li, "");
+  };
+  input.addEventListener("keydown", (ev) => {
+    if (ev.key === "Enter") { ev.preventDefault(); finish(true, false); }
+    else if (ev.key === "Escape") { ev.preventDefault(); finish(false, false); }
+  });
+  // Leaving the box applies the change, but a box that left because the panel was drawn again (an
+  // expiry warning, a status line) is not the person leaving it: nothing is sent for that.
+  input.addEventListener("blur", () => setTimeout(() => { if (input.isConnected) finish(true, true); }, 0));
+}
+
+function planStepError(li, why) {
+  const main = li.querySelector(".plan-step-main");
+  let line = main.querySelector(".plan-step-error");
+  if (!why) { if (line) line.remove(); return; }
+  if (!line) {
+    line = document.createElement("div");
+    line.className = "plan-step-error";
+    line.setAttribute("role", "alert");
+    main.appendChild(line);
+  }
+  line.textContent = why;
+}
+
+function wirePlanCardEdits(host, c, doc) {
+  const steps = (doc && doc.steps) || [];
+  host.querySelectorAll(".plan-step[data-id]").forEach((li) => {
+    const id = li.dataset.id;
+    const step = steps.find((s) => s.id === id) || {};
+    li.querySelectorAll("[data-edit]").forEach((el) => {
+      const isTitle = el.dataset.edit === "title";
+      const key = el.dataset.key || "";
+      const start = () => planInlineEdit(li, el,
+        isTitle ? (step.title || el.textContent) : planSettingText((step.settings || {})[key]),
+        isTitle ? "The step's title" : `The value of ${key}`,
+        (value) => commitPlanChange(c, isTitle ? { id, title: value } : { id, setting: key, value }));
+      el.addEventListener("click", start);
+      el.addEventListener("keydown", (ev) => {
+        if (ev.target !== el || (ev.key !== "Enter" && ev.key !== " ")) return;
+        ev.preventDefault();
+        start();
+      });
+    });
+    const remove = li.querySelector("[data-step-remove]");
+    if (!remove) return;
+    remove.addEventListener("click", () => {
+      const main = li.querySelector(".plan-step-main");
+      if (main.querySelector(".plan-step-confirm")) return;
+      const ask = document.createElement("div");
+      ask.className = "plan-step-confirm";
+      ask.innerHTML = `<span>Remove this step from the plan?</span>`
+        + `<button type="button" class="secondary small" data-yes>Remove</button>`
+        + `<button type="button" class="secondary quiet small" data-no>Keep</button>`;
+      main.appendChild(ask);
+      ask.querySelector("[data-no]").addEventListener("click", () => ask.remove());
+      ask.querySelector("[data-yes]").addEventListener("click", () => {
+        const why = commitPlanChange(c, { id, remove: true });
+        if (why) { ask.remove(); planStepError(li, why); }
+      });
+      ask.querySelector("[data-yes]").focus();
+    });
+  });
+}
+
+// The waiting plan: its entry in the chat (titles, Run / Open plan / Cancel) and the whole plan, with
+// its document's editor, in the side panel.
 function showPlanPanel(agenda) {
   const el = planCardShell("plan");
-  el.classList.add("plan-sheet");
+  el.classList.add("plan-sheet", "plan-entry");
   state.planAgenda = agenda || [];
-  el.innerHTML = planCardHtml(state.planAgenda, state.planDoc, state.planRevisedSteps);
-  const c = activeChat();     // the card's buttons answer THIS chat's run, whatever is on screen later
-  el.querySelector('[data-plan="approve"]').addEventListener("click", () => submitPlan("approve", undefined, undefined, c));
-  el.querySelector('[data-plan="cancel"]').addEventListener("click", () => submitPlan("cancel", undefined, undefined, c));
-  wirePlanEditor(el, c);
+  const c = activeChat();     // the buttons answer THIS chat's run, whatever is on screen later
+  el.innerHTML = planEntryHtml(state.planAgenda, state.planDoc, { pending: true, revised: state.planRevisedSteps,
+    problems: state.planProblems, dirty: !!state.planDraftYaml });
+  wirePlanEntry(el, c);
   drawPlanExpiry();
+  // The whole plan is in the side panel: it opens the first time each version of the plan is shown
+  // in its chat (also when it arrived while another chat was on screen), not on every redraw.
+  const seen = JSON.stringify([state.planAgenda, (state.planDoc && state.planDoc.yaml) || ""]);
+  if (c && c.planShown !== seen) { c.planShown = seen; openPlanPanel(); }
+  renderPlanPanel();
   $("chatInput").placeholder = "Tell the PI what to change (e.g. 'drop the enrichment step')…";
   $("chatStream").scrollTop = $("chatStream").scrollHeight;
   updateComposerButton();
@@ -3601,20 +4351,27 @@ function wirePlanEditor(el, c) {
   const panel = el.querySelector(".plan-yaml");
   if (!panel) return;
   const box = panel.querySelector(".plan-yaml-text");
+  const shown = panel.querySelector(".plan-yaml-hl");
   const original = state.planDoc.yaml;
   const apply = panel.querySelector('[data-plan="edit"]');
-  const approve = el.querySelector('[data-plan="approve"]');
+  const runButtons = () => [el.querySelector('[data-plan="approve"]'),
+    chatVisible(c) && state.planCardEl ? state.planCardEl.querySelector('[data-plan="approve"]') : null].filter(Boolean);
   const toggle = el.querySelector('[data-plan="yaml"]');
   const label = () => { toggle.querySelector("span:last-child").textContent = panel.classList.contains("hidden") ? "Edit as YAML" : "Hide YAML"; };
   // While the box holds an edit that has not been applied, "Run this plan" would run the plan
   // WITHOUT it. So the edit becomes the primary action and Run waits for Apply or Reset.
+  const follow = () => { if (shown) { shown.scrollTop = box.scrollTop; shown.scrollLeft = box.scrollLeft; } };
   const sync = () => {
+    if (shown) { shown.innerHTML = planYamlHtml(box.value); follow(); }
     const dirty = notePlanDraft(box.value, c);
     apply.disabled = !dirty;
     apply.classList.toggle("primary", dirty);
     apply.classList.toggle("secondary", !dirty);
-    approve.disabled = dirty;
-    approve.title = dirty ? "Apply or reset your edit first" : "";
+    for (const run of runButtons()) {
+      run.disabled = dirty;
+      run.title = dirty ? "Apply or reset your edit first" : "";
+    }
+    refreshPlanRevise(el, c);
   };
   toggle.addEventListener("click", () => {
     panel.classList.toggle("hidden");
@@ -3623,6 +4380,7 @@ function wirePlanEditor(el, c) {
     if (!panel.classList.contains("hidden")) box.focus();
   });
   box.addEventListener("input", sync);
+  box.addEventListener("scroll", follow);
   // Tab indents (YAML is indentation) instead of leaving the box.
   box.addEventListener("keydown", (ev) => {
     if (ev.key !== "Tab" || ev.shiftKey || ev.altKey || ev.ctrlKey || ev.metaKey) return;
@@ -3637,6 +4395,196 @@ function wirePlanEditor(el, c) {
   });
   label();
   sync();
+}
+
+// The chat entry's own buttons. They answer THIS chat's run, whatever is on screen when clicked.
+function wirePlanEntry(el, c) {
+  const on = (name, fn) => { const b = el.querySelector(`[data-plan="${name}"]`); if (b) b.addEventListener("click", fn); };
+  on("approve", () => submitPlan("approve", undefined, undefined, c));
+  on("cancel", () => submitPlan("cancel", undefined, undefined, c));
+  on("open", () => { state.planView = null; openPlanPanel(); renderPlanPanel(); });
+}
+
+// A plan this chat answered (a reply in words, an edit, a cancel, or a review the server closed):
+// its entry, with what happened to it and "View plan", drawn again from the chat's record.
+// It is not a card waiting for anything (`state.planCardEl` stays empty); the next prompt's card
+// takes its place (planCardShell), so a review is one entry however many rounds it takes.
+function drawAnsweredPlan(c = activeChat()) {
+  const a = c && c.answered;
+  if (!a || !chatVisible(c)) return;
+  if (state.planAnsweredEl) state.planAnsweredEl.remove();
+  const stream = $("chatStream");
+  const el = document.createElement("div");
+  el.className = "msg assistant plan-card plan-sheet plan-entry";
+  el.dataset.prompt = "plan";
+  el.innerHTML = planEntryHtml(a.agenda, a.doc, { status: a.status });
+  stream.appendChild(el);
+  wirePlanEntry(el, c);
+  state.planAnsweredEl = el;
+  state.planStatusEl = el.querySelector(".plan-actions-status");
+}
+
+// ---- the side panel's "Plan" tab ------------------------------------------------------------------
+// What the panel shows for the chat on screen: a saved plan the person opened from the chat
+// (`state.planView`), else the plan waiting in this chat, else the one it answered and the PI has,
+// else the last plan this chat approved.
+function chatPlanView(c = activeChat()) {
+  if (state.planView) return { mode: "saved", ...state.planView };
+  if (c && c.plan && c.plan.kind === "plan") {
+    return { mode: "review", agenda: c.plan.agenda || [], doc: c.plan.doc || null, revised: c.plan.revised || [],
+             estimate: c.plan.estimate || null,
+             expiry: c.plan.expiry ? planExpiryText("plan", c.plan.expiry.at) : "" };
+  }
+  if (c && c.answered) return { mode: "status", ...c.answered };
+  const s = activeSession();
+  const saved = s && [...s.messages].reverse().find((m) => m.kind === "plan" && m.plan);
+  return saved ? { mode: "saved", ...saved.plan } : null;
+}
+
+function renderPlanPanel() {
+  const host = $("planPanel");
+  if (!host) return;
+  const c = activeChat();
+  const tab = $("sideTabPlan");
+  if (tab) tab.classList.toggle("waiting", !!(c && c.plan && c.plan.kind === "plan"));
+  const view = chatPlanView(c);
+  if (!view) {
+    host.innerHTML = '<div class="downloads-empty">No plan in this chat yet. When the PI proposes one it opens here: every step and the settings it fixes. You can change it in words, or edit it as a YAML document.</div>';
+    return;
+  }
+  host.innerHTML = `<div class="plan-card plan-sheet plan-panel-card" data-prompt="plan">`
+    + planCardHtml(view.agenda || [], view.doc || null, view.revised || [],
+                   { mode: view.mode, status: view.status || "", expiry: view.expiry || "", estimate: view.estimate || null,
+                     words: (c && c.planWords) || "" })
+    + `</div>`;
+  wirePlanSteps(host, view.agenda || []);
+  if (view.mode !== "review") return;
+  host.querySelector('[data-plan="approve"]').addEventListener("click", () => submitPlan("approve", undefined, undefined, c));
+  host.querySelector('[data-plan="cancel"]').addEventListener("click", () => submitPlan("cancel", undefined, undefined, c));
+  wirePlanRevise(host, c);
+  wirePlanCardEdits(host, c, view.doc);
+  wirePlanEditor(host, c);
+}
+
+// The panel's "Change it in words" box. Enter sends (Shift+Enter is a new line). An edit in the YAML
+// editor that is not applied goes with the words (revisePlanInWords), and the box says so.
+function wirePlanRevise(host, c) {
+  const box = host.querySelector(".plan-revise-text");
+  const send = host.querySelector('[data-plan="revise"]');
+  if (!box || !send) return;
+  const go = () => {
+    const text = box.value.trim();
+    if (!text || send.disabled) return;
+    box.value = "";
+    revisePlanInWords(c, text);
+  };
+  box.addEventListener("input", () => { c.planWords = box.value; refreshPlanRevise(host, c); });
+  box.addEventListener("keydown", (ev) => {
+    if (ev.key !== "Enter" || ev.shiftKey || ev.isComposing) return;
+    ev.preventDefault();
+    go();
+  });
+  send.addEventListener("click", go);
+  refreshPlanRevise(host, c);
+}
+
+function refreshPlanRevise(host, c) {
+  const box = host.querySelector(".plan-revise-text");
+  const send = host.querySelector('[data-plan="revise"]');
+  if (!box || !send) return;
+  send.disabled = !box.value.trim();
+  const note = host.querySelector(".plan-revise-draft");
+  if (note) note.hidden = !(c && c.planDraftYaml);
+}
+
+// A step opens and closes by its chevron, or opens by a click on its two lines; "Expand all" does
+// every step. What the person chose is kept per step text, so a redraw (a status line, an expiry
+// warning, a revision that left the step alone) does not fold it again.
+function wirePlanSteps(host, agenda) {
+  const items = [...host.querySelectorAll(".plan-step")];
+  const setOpen = (li, i, open) => {
+    li.classList.toggle("open", open);
+    const more = li.querySelector("[data-step-more]");
+    if (more) more.setAttribute("aria-expanded", String(open));
+    state.planStepOpen.set(agenda[i], open);
+  };
+  items.forEach((li, i) => {
+    const body = li.querySelector(".plan-step-body");
+    const more = li.querySelector("[data-step-more]");
+    if (!body || !more) return;
+    more.addEventListener("click", () => { setOpen(li, i, !li.classList.contains("open")); fitPlanSteps(host); });
+    body.addEventListener("click", () => {
+      if (li.classList.contains("open") || !planStepFoldable(li) || String(window.getSelection() || "")) return;
+      setOpen(li, i, true);
+      fitPlanSteps(host);
+    });
+  });
+  const all = host.querySelector("[data-plan-expand]");
+  if (all) {
+    all.addEventListener("click", () => {
+      const open = items.filter(planStepFoldable).some((li) => !li.classList.contains("open"));
+      items.forEach((li, i) => { if (planStepFoldable(li)) setOpen(li, i, open); });
+      fitPlanSteps(host);
+    });
+  }
+  // The panel slides open after it is drawn, and its width changes with the window: whether a step's
+  // prose fits in two lines is measured again whenever its size does.
+  if (!host.planFitObserver && typeof ResizeObserver === "function") {
+    host.planFitObserver = new ResizeObserver(() => fitPlanSteps(host));
+    host.planFitObserver.observe(host);
+  }
+  fitPlanSteps(host);
+}
+
+function planStepFoldable(li) {
+  return !!li.querySelector(".plan-step-body") && !li.classList.contains("fits");
+}
+
+// Prose that fits in two lines has nothing to open, so its step has no chevron. Measured only while
+// the panel is laid out: hidden, every step keeps its chevron.
+function fitPlanSteps(host) {
+  const items = [...host.querySelectorAll(".plan-step")];
+  for (const li of items) {
+    const body = li.querySelector(".plan-step-body");
+    if (!body) continue;
+    const lh = parseFloat(getComputedStyle(body).lineHeight);
+    li.classList.toggle("fits", body.clientWidth > 0 && lh > 0 && body.scrollHeight <= lh * 2 + 2);
+  }
+  const all = host.querySelector("[data-plan-expand]");
+  if (!all) return;
+  const foldable = items.filter(planStepFoldable);
+  all.hidden = !foldable.length;
+  all.textContent = foldable.every((li) => li.classList.contains("open")) ? "Collapse all" : "Expand all";
+}
+
+// The right-hand panel holds two things, one at a time: the plan and the results.
+function selectSideTab(name) {
+  state.sideTab = name === "plan" ? "plan" : "results";
+  const plan = state.sideTab === "plan";
+  $("planPanel").classList.toggle("hidden", !plan);
+  $("resultsPane").classList.toggle("hidden", plan);
+  $("sideTabPlan").classList.toggle("active", plan);
+  $("sideTabResults").classList.toggle("active", !plan);
+  $("layout").classList.toggle("side-plan", plan);   // a plan is prose: the panel gets more room for it
+}
+
+// Open the side panel on the plan. Not remembered as the panel's own setting: a plan arriving must
+// not turn "results panel collapsed" into "always open" for the next visit.
+function openPlanPanel() {
+  selectSideTab("plan");
+  setPanel("right", true, false);
+}
+
+// The approved plan as the chat keeps it. `content` is what a model reading this conversation later
+// is given (the steps, and the document with the settings that ran); `plan` is what the entry and
+// the side panel are drawn from.
+function planSavedMessage(p) {
+  const docMd = planEstimateMarkdown(p.estimate) + ((p.doc && p.doc.yaml)
+    ? "\n\n**Approved plan document**\n\n```yaml\n" + p.doc.yaml.trim() + "\n```"
+    : "");
+  return { role: "assistant", kind: "plan",
+           content: "## 📋 Research plan\n\n" + p.agenda.map((s, i) => `${i + 1}. ${s}`).join("\n") + docMd,
+           plan: { agenda: p.agenda, doc: p.doc || null, estimate: p.estimate || null, status: "Approved" } };
 }
 
 function showClarify(questions) {
@@ -3732,8 +4680,25 @@ async function submitDecision(choice, c = activeChat()) {
 
 // Resolve the live plan/clarify card with a short status line (drop the buttons), and on
 // approval persist the plan to history so it survives a reload.
-function finalizePlanCard(note, persistMarkdown, c = activeChat()) {
-  if (state.planCardEl && chatVisible(c)) {
+function finalizePlanCard(note, persist, c = activeChat()) {
+  const p = c && c.plan;
+  const saved = !persist ? null : typeof persist === "string" ? { role: "assistant", content: persist } : persist;
+  // A plan answered in words, by an edit or by a cancel stays readable — in its entry and in the side
+  // panel — while the PI works on the answer. An approved plan is saved instead (below).
+  if (c && p && p.kind === "plan") c.answered = saved ? null : { agenda: p.agenda || [], doc: p.doc || null, revised: p.revised || [], status: note };
+  if (state.planCardEl && chatVisible(c) && p && p.kind === "plan") {
+    const entry = state.planCardEl;
+    if (saved && saved.kind === "plan") {
+      const fresh = messageEl(saved);
+      if (typeof entry.replaceWith === "function") entry.replaceWith(fresh); else entry.remove();
+    } else {
+      entry.innerHTML = planEntryHtml(p.agenda || [], p.doc || null, { status: note });
+      wirePlanEntry(entry, c);
+      state.planStatusEl = entry.querySelector(".plan-actions-status");
+      state.planAnsweredEl = entry;
+    }
+    state.planCardEl = null;
+  } else if (state.planCardEl && chatVisible(c)) {
     // A resolved card is a record: its editor goes with its buttons, or "Apply edits" would stay
     // clickable on a plan that is no longer waiting for anything.
     const editor = state.planCardEl.querySelector(".plan-yaml");
@@ -3748,7 +4713,8 @@ function finalizePlanCard(note, persistMarkdown, c = activeChat()) {
     state.planStatusEl = row ? row.querySelector(".plan-actions-status") : null;
     state.planCardEl = null;
   }
-  if (persistMarkdown && c) pushToSession(c.sid, { role: "assistant", content: persistMarkdown });
+  if (saved && c) pushToSession(c.sid, saved);
+  if (chatVisible(c)) renderPlanPanel();
 }
 
 // Correct the resolved card's status line as the server learns what the reply actually was.
@@ -3758,6 +4724,8 @@ function finalizePlanCard(note, persistMarkdown, c = activeChat()) {
 // one of the two for every question asked, for the 10-20 minutes an answer takes.
 function setPlanStatus(text) {
   if (state.planStatusEl && text) state.planStatusEl.textContent = text;
+  const c = activeChat();
+  if (c && c.answered && text) { c.answered.status = text; renderPlanPanel(); }
 }
 
 // ---- the waiting prompt's expiry warning ----------------------------------------------------------
@@ -3773,7 +4741,7 @@ function notePlanExpiring(c, msg) {
   if (!p) return;   // nothing is waiting, so there is nothing for it to be about
   const secs = Number(msg && msg.seconds_left);
   p.expiry = { at: Number.isFinite(secs) && secs >= 0 ? Date.now() + secs * 1000 : null };
-  if (chatVisible(c)) drawPlanExpiry();
+  if (chatVisible(c)) { drawPlanExpiry(); renderPlanPanel(); }
   else toast(`What is waiting in “${chatTitle(c.sid).trim()}” expires soon — open that chat to answer it.`);
 }
 
@@ -3815,9 +4783,26 @@ function hidePlanPanel(c = activeChat()) {
   // plan_done (any resolution). Card finalization happens in submitPlan; here we only
   // clear the pending state + restore the composer (idempotent).
   if (!c) return;
+  // A plan still held here was not answered on this page: the review expired or the run stopped.
+  const closed = c.plan && c.plan.kind === "plan" ? c.plan : null;
+  if (closed) c.answered = { agenda: closed.agenda || [], doc: closed.doc || null, revised: closed.revised || [],
+                             status: "This plan is no longer waiting for a decision." };
   releasePlanPrompt(c);
+  if (closed && chatVisible(c)) { removePlanCard(); drawAnsweredPlan(c); renderPlanPanel(); }
   if (chatVisible(c)) $("chatInput").placeholder = DEFAULT_PLACEHOLDER;
   updateComposerButton();
+}
+
+// A change to the waiting plan asked for in words, typed in the composer or in the side panel's box:
+// it shows in the chat as the person's message and goes to the PI as feedback. The PI answers a
+// question and sends the plan back as it was, or makes the change on the plan document and sends
+// it back for review; nothing runs until the person runs it. Words are always about the plan as the
+// person has it: an edit of the document they have not applied yet goes with them, and the server
+// applies it first (by code) and makes the change on the edited plan.
+function revisePlanInWords(c, text) {
+  c.planWords = "";
+  if (chatVisible(c)) appendUserMessage(text);
+  submitPlan("revise", text, c.planDraftYaml || "", c);
 }
 
 // action: "approve" | "revise" | "edit" | "cancel"; feedback only for "revise", planYaml only
@@ -3826,12 +4811,7 @@ async function submitPlan(action, feedback, planYaml, c = activeChat()) {
   if (!state.connectionId || !c) return;
   // The approved document is saved with the plan: it is what the run was held to.
   const plan = c.plan || {};
-  const docMd = (plan.doc && plan.doc.yaml)
-    ? "\n\n**Approved plan document**\n\n```yaml\n" + plan.doc.yaml.trim() + "\n```"
-    : "";
-  const agendaMd = (plan.agenda && plan.agenda.length)
-    ? "## 📋 Research plan\n\n" + plan.agenda.map((s, i) => `${i + 1}. ${s}`).join("\n") + docMd
-    : null;
+  const savedPlan = (plan.agenda && plan.agenda.length) ? planSavedMessage(plan) : null;
   // An edit that is sent stays as the draft until the server answers: refused, it comes back in the
   // editor. A reply in words leaves the draft alone too — the PI may answer a question and send the
   // same plan again. Only a plan that is run or cancelled has no use for it (keepPlanDraft drops it
@@ -3839,7 +4819,7 @@ async function submitPlan(action, feedback, planYaml, c = activeChat()) {
   if (action === "edit") c.planDraftYaml = planYaml || "";
   else if (action !== "revise") dropPlanDraft(c);
   if (action === "approve") {
-    finalizePlanCard("▶ Approved — running…", agendaMd, c);
+    finalizePlanCard("▶ Approved — running…", savedPlan, c);
     // Re-anchor the live bubble below the just-approved plan so the run's activity
     // (reasoning / running code / report) streams in AFTER it, where the user is looking.
     if (chatVisible(c)) { mountStream(); repaintWorking(); }
@@ -3851,12 +4831,14 @@ async function submitPlan(action, feedback, planYaml, c = activeChat()) {
   // question, and stayed wrong on screen for the whole 10-20 min the answer took.
   else finalizePlanCard("✎ Sent to the PI — reading your reply…", null, c);
   releasePlanPrompt(c);
+  if (chatVisible(c)) renderPlanPanel();   // now without the prompt: the answered plan, read-only
   if (chatVisible(c)) $("chatInput").placeholder = DEFAULT_PLACEHOLDER;
   updateComposerButton();
   try {
     await fetch("/api/lab/plan", {
       method: "POST", headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ connection_id: state.connectionId, conversation_id: c.sid, action, feedback: feedback || "", plan_yaml: action === "edit" ? (planYaml || "") : "" }),
+      body: JSON.stringify({ connection_id: state.connectionId, conversation_id: c.sid, action, feedback: feedback || "",
+                             plan_yaml: action === "edit" || action === "revise" ? (planYaml || "") : "" }),
     });
     if (action === "approve") toast("Plan approved — running…");
     else if (action === "cancel") toast("Plan cancelled.");
@@ -3937,7 +4919,7 @@ function postJson(url, body) {
 }
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 // 20 GB reads badly as "21474.8 MB"
-const fmtUploadSize = (n) => ((n || 0) >= 1e9 ? `${((n || 0) / 1e9).toFixed(2)} GB` : `${((n || 0) / 1e6).toFixed(1)} MB`);
+const fmtUploadSize = (n) => ((n || 0) >= 1e9 ? `${(n / 1e9).toFixed(2)} GB` : (n || 0) >= 1e6 ? `${(n / 1e6).toFixed(1)} MB` : (n || 0) >= 1e3 ? `${(n / 1e3).toFixed(1)} kB` : `${n || 0} B`);
 
 // -- speed and time left ----------------------------------------------------------------------------
 // Each card measures its own bytes over the last seconds, in both halves: the browser sending to the
@@ -4072,6 +5054,31 @@ async function pickPreviousUpload(previous, storage, request = fetch) {
   }
   return alive[0].up;
 }
+// The upload of this file the server holds for the account, for a browser that has none stored: one
+// begun on another computer, in a private window, or before the site's data was cleared. The server
+// matches the path (or name), size and modification time, and offers the upload only when its first
+// chunk is this file's first chunk; no answer, or any other, starts a new upload as before. A file of
+// one chunk or less goes in one request and is never left part-way, so it is not looked for.
+// urlStorageKey null: tus-js-client stores the upload in this browser once the server says where it stands.
+async function findServerUpload(file, fields, request = fetch) {
+  if (!(file.size > UPLOAD_CHUNK) || !Number.isSafeInteger(file.lastModified) || !state.connectionId) return null;
+  try {
+    const head = new Uint8Array(await crypto.subtle.digest("SHA-256", await file.slice(0, UPLOAD_CHUNK).arrayBuffer()));
+    const r = await request("/api/tus/find", { method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ connection_id: state.connectionId, name: file.name, rel_path: fields.rel_path || "",
+        size: file.size, last_modified: file.lastModified,
+        head_sha256: Array.from(head, (b) => b.toString(16).padStart(2, "0")).join("") }) });
+    const found = r.ok ? (await r.json()).upload : null;
+    if (!found || !found.url) return null;
+    // absolute, as tus-js-client stores the uploads it creates
+    return { uploadUrl: new URL(found.url, window.location.href).href, urlStorageKey: null, size: file.size, offset: found.offset };
+  } catch { return null; }
+}
+// The upload to continue for this file: the one this browser stored, else one the server holds.
+async function previousUploadFor(upload, file, fields, request = fetch) {
+  const stored = await pickPreviousUpload(await upload.findPreviousUploads(), upload.options.urlStorage, request);
+  return stored || findServerUpload(file, fields, request);
+}
 
 // Send one file over tus; resolves with the gateway's answer for the finished upload
 // ({status: "staging", job_id, …} when a copy to HPC3 follows, {status: "complete", …} otherwise).
@@ -4094,7 +5101,9 @@ function tusUpload(file, fields, ctrl, hashPromise, onProgress, onWaitingForHash
       removeFingerprintOnSuccess: true,
       fingerprint: async (f) => `tus:${apiKeyOwner()}:${fields.rel_path || f.name}:${f.size}:${f.lastModified}`,
       headers: { "X-Connection-ID": state.connectionId },
-      metadata: { filename: file.name, connection_id: state.connectionId, ...fields },
+      // last_modified lets another browser find this upload again (findServerUpload)
+      metadata: { filename: file.name, connection_id: state.connectionId,
+        ...(Number.isSafeInteger(file.lastModified) ? { last_modified: String(file.lastModified) } : {}), ...fields },
       onShouldRetry(err) {
         const again = tusShouldRetry(err);
         if (again) {
@@ -4151,12 +5160,18 @@ function tusUpload(file, fields, ctrl, hashPromise, onProgress, onWaitingForHash
     });
     tusKicks.add(kick);
     ctrl.signal.addEventListener("abort", () => {
-      upload.abort(true).catch(() => {});
-      reject(new DOMException("cancelled", "AbortError"));
+      upload.abort(true).then(() => reject(new DOMException("cancelled", "AbortError"))).catch((error) => {
+        error.cleanupFailed = true;
+        reject(error);
+      });
     }, { once: true });
-    upload.findPreviousUploads().then((previous) => pickPreviousUpload(previous, upload.options.urlStorage)).then((previous) => {
+    previousUploadFor(upload, file, fields).then((previous) => {
       if (ctrl.signal.aborted) return;
-      if (previous) upload.resumeFromPreviousUpload(previous);
+      if (previous) { upload.resumeFromPreviousUpload(previous); dropPendingCardFor(previous.uploadUrl); }
+      // a folder's card already says how much of the folder is there
+      if (previous && previous.urlStorageKey === null && !fields.rel_path && previous.offset > 0) {
+        toast(`Continuing ${file.name} from ${Math.floor((100 * previous.offset) / file.size)}%: the server kept what was sent earlier.`);
+      }
       upload.start();
     }).catch(reject);
   });
@@ -4199,10 +5214,12 @@ async function finishStaging(d, id, name, size, signal) {
         if (job.state === "failed" || job.state === "cancelled") return { ...d, status: job.state, error: job.error };
         const status = job.state === "verifying" ? "verifying" : job.state === "unpacking" ? "unpacking" : "staging";
         // "queued" with an error is a copy waiting for its retry, or for an HPC3 session: say so
-        upsertUpload({ id, status, sent: job.sent || 0, size: job.size || size,
+        upsertUpload({ id, status, sent: job.sent || 0, size: job.size || size, dest: job.dest,
           note: job.state === "queued" && job.error ? `Waiting — ${job.error}` : "" });
-        setUploadProgress(status === "verifying" ? `Verifying ${name} on HPC3…`
-          : status === "unpacking" ? `Unpacking ${name} on HPC3…`
+        const w = stagingWords(job);
+        setUploadProgress(id, status === "verifying" ? `${w.verify} ${name}…`
+          : status === "unpacking" ? `${w.unpack}: ${name}…`
+          : job.dest === "server" ? `Checking ${name} on the server…`
           : `Copying ${name} to HPC3… ${job.size ? Math.floor((100 * (job.sent || 0)) / job.size) : 0}%${uploadPaceTextFor(id)}`);
       }
       const seen = stagingJobs.get(d.job_id);
@@ -4211,6 +5228,21 @@ async function finishStaging(d, id, name, size, signal) {
       job = now && now !== seen ? now : await stagingJob(d.job_id).catch(() => null);
     }
   } finally { if (signal) signal.removeEventListener("abort", onAbort); }
+}
+// Each file's row during the copy to HPC3 (or its check on the server): a file whose copy failed says
+// so (until a retry copies it); once the server has recorded the folder, every copied file is uploaded.
+const COPY_FAILED = new Set([stagingWords({ dest: "hpc3" }).failed, stagingWords({ dest: "server" }).failed]);
+function markFolderCopies(id, f) {
+  const card = state.uploads.find((u) => u.id === id);
+  if (!card || !card.fileProgress) return;
+  const failed = new Set(f.failed_files || []);
+  for (const row of card.fileProgress) {
+    const rel = String(row.name || "").split("/").slice(1).join("/");
+    if (failed.has(rel)) { row.status = "error"; row.error = stagingWords(f).failed; }
+    else if (row.status === "copying" || (row.status === "error" && COPY_FAILED.has(row.error))) {
+      row.status = f.recorded ? "done" : "copying"; row.error = "";
+    }
+  }
 }
 // The server records a folder once every file of it is verified on HPC3; follow that.
 async function finishFolderStaging(folder, d, id, signal) {
@@ -4226,12 +5258,15 @@ async function finishFolderStaging(folder, d, id, signal) {
       const r = await fetch(`/api/upload/staging?connection_id=${encodeURIComponent(state.connectionId)}&folder=${encodeURIComponent(folder)}`).catch(() => null);
       const f = r && r.ok ? ((await r.json().catch(() => ({}))).folder || {}) : null;
       if (f) {
-        if (f.recorded) return { ...d, status: "registered", name: folder, path: f.remote_root || d.path, size: f.size, count: f.count, kept: f.kept_count || 0 };
-        if (f.pending === 0 && f.failed > 0) throw new Error(`${f.failed} of ${f.count} files did not reach HPC3`);
+        markFolderCopies(id, f);
+        if (f.recorded) return { ...d, status: "registered", name: d.name || f.original_name || folder, path: f.remote_root || d.path, size: f.size, count: f.count, kept: f.kept_count || 0 };
+        if (f.pending === 0 && f.failed > 0) throw new Error(`${f.failed} of ${f.count} files ${stagingWords(f).missing}`);
         // what is on HPC3 before this page first looks (copied meanwhile, or there from an earlier upload) is not speed
         if (first) { uploadPaces.delete(id); first = false; }
-        upsertUpload({ id, status: "staging", filesDone: f.done || 0, filesTotal: f.count || 0, sent: f.sent || 0, size: f.size || 0 });
-        setUploadProgress(`Copying ${folder}/ to HPC3 — ${f.done || 0}/${f.count || "?"} files${uploadPaceTextFor(id)}`);
+        upsertUpload({ id, status: "staging", dest: f.dest, filesDone: f.done || 0, filesTotal: f.count || 0, filesFailed: f.failed || 0, sent: f.sent || 0, size: f.size || 0 });
+        setUploadProgress(id, f.dest === "server"
+          ? `Checking ${shownFolder(folder, f.original_name)}/ on the server — ${f.done || 0}/${f.count || "?"} files`
+          : `Copying ${shownFolder(folder, f.original_name)}/ to HPC3 — ${f.done || 0}/${f.count || "?"} files${uploadPaceTextFor(id)}`);
       }
       await nextStagingEvent(STAGING_POLL_MS);
       // every file of a big folder sends events: ask the server at most once a second
@@ -4248,7 +5283,7 @@ async function settleUpload(id, d, name, size, ctrl, attach) {
     upsertUpload({ id, jobId: d.job_id, status: "staging", sent: 0, error: "" });
     d = await finishStaging(d, id, name, size, ctrl.signal);
   }
-  if (d.status === "failed" || d.status === "cancelled") throw new Error(d.error || `copy to HPC3 ${d.status}`);
+  if (d.status === "failed" || d.status === "cancelled") throw new Error(d.error || `upload ${d.status}`);
   upsertUpload({ id, sent: size, status: "done", note: "" });
   const unpacked = d.unpacked;
   // Carry the upload-time content skim (the deterministic peek gist) onto the chip so the user sees
@@ -4264,6 +5299,11 @@ async function settleUpload(id, d, name, size, ctrl, attach) {
   setTimeout(() => removeUpload(id), 4000);                        // clear the "Done" card after a beat
 }
 function failUpload(id, err, name, ctrl) {
+  if (err.cleanupFailed) {
+    upsertUpload({ id, status: "error", error: `Cancellation cleanup failed: ${err.message}`, note: "" });
+    toast(`Cancellation cleanup failed for ${name}: ${err.message}`);
+    return;
+  }
   if ((ctrl && ctrl.signal.aborted) || err.name === "AbortError") {      // the user cancelled: not an error
     upsertUpload({ id, status: "cancelled", note: "" });
     toast(`Cancelled ${name}`);
@@ -4300,7 +5340,7 @@ async function uploadDataset(file) {
   upsertUpload({ id, kind: "file", name: file.name, size: file.size, sent: (before && before.sent) || 0, status: "queued", file,
     error: "", detail: "", lost: false, retrying: false, note: "", jobId: "", ctrl,
     chat: (before && before.chat) || state.activeId });   // the chat this upload attaches to when done
-  setUploadProgress(`Uploading ${file.name}…`);
+  setUploadProgress(id, `Uploading ${file.name}…`);
   try {
     if (!fields) {
       fields = ARCHIVE_RE.test(file.name) && window.confirm(`Unpack ${file.name} after verified transfer to HPC3?`)
@@ -4314,17 +5354,17 @@ async function uploadDataset(file) {
       const hashPromise = hashUploadFile(file, ctrl);
       hashPromise.catch(() => {}); // cancellation before the final PATCH still has a handled promise
       upsertUpload({ id, status: "uploading" });
-      d = await tusUpload(file, fields, ctrl, hashPromise, (sent, total) => {
+      d = await tusUpload(file, { ...fields, ...uploadChatField(id) }, ctrl, hashPromise, (sent, total) => {
         upsertUpload({ id, sent, size: total, status: "uploading" });
-        setUploadProgress(`Uploading ${file.name}… ${total ? Math.floor((100 * sent) / total) : 0}%${uploadPaceTextFor(id)}`);
+        setUploadProgress(id, `Uploading ${file.name}… ${total ? Math.floor((100 * sent) / total) : 0}%${uploadPaceTextFor(id)}`);
       }, (waiting) => {
         upsertUpload({ id, note: waiting ? "Finishing the checksum of the whole file…" : "" });
-        if (waiting) setUploadProgress(`Finishing the checksum of ${file.name}…`);
+        if (waiting) setUploadProgress(id, `Finishing the checksum of ${file.name}…`);
       }, (retrying) => upsertUpload({ id, retrying }));
     } finally { releaseUploadSlot(); }
     await settleUpload(id, d, file.name, file.size, ctrl, true);
   } catch (err) { failUpload(id, err, file.name, ctrl); }
-  finally { setUploadProgress(null); }
+  finally { setUploadProgress(id, null); }
 }
 
 // -- the cards ---------------------------------------------------------------------------------------
@@ -4335,7 +5375,14 @@ function upsertUpload(rec) {
   noteUploadPace(state.uploads[i >= 0 ? i : 0]);
   renderUploads();
 }
-function removeUpload(id) { state.uploads = state.uploads.filter((u) => u.id !== id); uploadPaces.delete(id); renderUploads(); }
+function removeUpload(id) { state.uploads = state.uploads.filter((u) => u.id !== id); uploadPaces.delete(id); uploadLines.delete(id); renderUploads(); }
+// An "Interrupted" card stands for one upload on the server. Once that upload continues, the card of
+// the file being sent says how it goes. Matched by upload, not by name: a card from the server's list
+// may carry the server's cleaned name ("my data.bam" is "mydata.bam" there).
+function dropPendingCardFor(url) {
+  const id = tusId(url);
+  for (const u of state.uploads.filter((x) => x.status === "pending" && x.tusUrl && tusId(x.tusUrl) === id)) removeUpload(u.id);
+}
 function resumeUpload(id) {
   const u = state.uploads.find((x) => x.id === id);
   if (u && u.kind === "folder" && u.files) uploadFolder(u.files);    // only the missing files are sent
@@ -4343,8 +5390,9 @@ function resumeUpload(id) {
 }
 // Cancel: abort whatever is in flight for this card; the code driving it finalises the card.
 function cancelUpload(id) { const u = state.uploads.find((x) => x.id === id); if (u && u.ctrl) u.ctrl.abort(); }
+// The composer's Cancel: the uploads of the chat on screen, never another chat's.
 function cancelActiveUploads() {
-  state.uploads.filter((u) => UPLOAD_ACTIVE.includes(u.status)).forEach((u) => cancelUpload(u.id));
+  chatUploads(state.activeId).forEach((u) => cancelUpload(u.id));
 }
 // The copy to HPC3 failed (the file is still on the server): run it again, without uploading again.
 async function retryUpload(id) {
@@ -4359,7 +5407,7 @@ async function retryUpload(id) {
     if (u.serverFolder) await followFolder(id, u.serverFolder, {}, ctrl, u.attach !== false);
     else await settleUpload(id, { status: "staging", job_id: u.jobId, name: u.name, size: u.size }, u.name, u.size, ctrl, u.attach !== false);
   } catch (err) { failUpload(id, err, u.name, ctrl); }
-  finally { setUploadProgress(null); }
+  finally { setUploadProgress(id, null); }
 }
 // Give a failed upload up: the server drops the job and what it had kept for a retry.
 async function dismissUpload(id) {
@@ -4375,7 +5423,9 @@ async function discardUpload(id) {
   const u = state.uploads.find((x) => x.id === id);
   if (!u) return;
   try {
-    if (u.tusUrl) await fetch(u.tusUrl, { method: "DELETE", headers: tusHeaders() }).catch(() => {});
+    for (const url of [u.tusUrl, ...(u.tusUrls || [])].filter(Boolean)) {   // tusUrls: a folder's part-way files
+      await fetch(url, { method: "DELETE", headers: tusHeaders() }).catch(() => {});
+    }
     if (u.tusKey && window.tus) await window.tus.defaultOptions.urlStorage.removeUpload(u.tusKey);
     if (u.folderKey) { localStorage.removeItem(u.folderKey); localStorage.removeItem(`${u.folderKey}:completed`); }
   } catch { /* the card goes either way */ }
@@ -4389,18 +5439,51 @@ function uploadAction(act, id) {
   else if (act === "discard") discardUpload(id);
   else if (act === "pickfile") $("datasetFile").click();
   else if (act === "pickdir") $("datasetDir").click();
+  else if (act === "openchat") openChat(uploadChat(id));
+}
+function uploadFileCounts(u) {
+  const rows = u.serverFolder ? [] : (u.fileProgress || []);
+  if (rows.length && u.status === "staging") {
+    // the copy to HPC3: the server counts which files are verified there
+    const done = u.filesDone || 0, failed = u.filesFailed || 0;
+    return { done, failed, cancelled: 0, remaining: Math.max(0, (u.filesTotal || rows.length) - done - failed) };
+  }
+  const done = rows.length ? rows.filter((f) => f.status === "done").length : (u.filesDone || 0);
+  const failed = rows.length ? rows.filter((f) => f.status === "error").length : (u.filesFailed || 0);
+  const cancelled = rows.filter((f) => f.status === "cancelled").length;
+  return { done, failed, cancelled, remaining: Math.max(0, (u.filesTotal || rows.length) - done - failed - cancelled) };
+}
+// What the background step after an upload is called: with a data root the upload is kept on the
+// server (job.dest "server") and the queue only checks it there (and unpacks an archive); otherwise
+// it is copied to HPC3. A declaration, so the code above it can use it too.
+function stagingWords(x) {
+  return x && x.dest === "server"
+    ? { copying: "Checking", verify: "Checking", unpack: "Unpacking on the server", failed: "the check on the server failed",
+        missing: "failed their check on the server" }
+    : { copying: "Copying to HPC3", verify: "Verifying on HPC3", unpack: "Unpacking on HPC3", failed: "the copy to HPC3 failed",
+        missing: "did not reach HPC3" };
+}
+function uploadFileRows(u) {
+  return (u.fileProgress || []).map((f) => {
+    const pct = f.size ? Math.min(100, Math.round(f.sent / f.size * 100)) : f.status === "done" ? 100 : 0;
+    const label = { queued: "Waiting", uploading: "Uploading", verifying: "Verifying", copying: stagingWords(u).copying, done: "Uploaded", error: "Failed", cancelled: "Cancelled" }[f.status] || f.status;
+    return `<div class="upload-file ${f.status}"><span class="upload-file-name" title="${escapeHtml(f.name)}">${escapeHtml(f.name)}</span>` +
+      `<span>${fmtUploadSize(f.sent)} / ${fmtUploadSize(f.size)} · ${pct}%</span>` +
+      `<span title="${escapeHtml(f.error || "")}">${escapeHtml(label)}${f.error ? `: ${escapeHtml(f.error)}` : ""}</span></div>`;
+  }).join("");
 }
 function uploadCardView(u) {
-  const pct = u.size ? Math.min(100, Math.round(((u.sent || 0) / u.size) * 100)) : 0;
-  const files = u.filesTotal ? `${u.filesDone || 0}/${u.filesTotal} files` : "";
+  const pct = u.size ? Math.min(100, Math.round(((u.sent || 0) / u.size) * 100)) : u.status === "done" ? 100 : 0;
+  const counts = uploadFileCounts(u);
+  const files = u.filesTotal ? `${counts.done} completed · ${counts.remaining} remaining · ${counts.failed} failed${counts.cancelled ? ` · ${counts.cancelled} cancelled` : ""}` : "";
   const pace = uploadPaceText(u);
   let stat;
   if (u.status === "done") stat = "Done";
   else if (u.status === "cancelled") stat = "Cancelled";
   else if (u.status === "queued") stat = "Waiting for an upload slot…";
-  else if (u.status === "staging") stat = u.note || `Copying to HPC3… ${files || `${pct}%`}${pace}`;
-  else if (u.status === "verifying") stat = "Verifying on HPC3…";
-  else if (u.status === "unpacking") stat = "Unpacking on HPC3…";
+  else if (u.status === "staging") stat = u.note || (u.dest === "server" ? `Checking on the server… ${files}` : `Copying to HPC3… ${files || `${pct}%`}${pace}`);
+  else if (u.status === "verifying") stat = `${stagingWords(u).verify}…`;
+  else if (u.status === "unpacking") stat = `${stagingWords(u).unpack}…`;
   else if (u.status === "error") stat = `${u.lost ? "Interrupted" : "Failed"} — ${u.error || "interrupted"}`;
   else if (u.status === "pending") stat = u.note || "Interrupted — choose it again to continue";
   else if (u.retrying) stat = `Connection lost at ${files ? files + ", " : ""}${pct}% — trying again…`;
@@ -4408,8 +5491,8 @@ function uploadCardView(u) {
   const buttons = [];
   if (UPLOAD_ACTIVE.includes(u.status)) buttons.push(["cancel", "Cancel"]);
   else if (u.status === "error") {
-    if (u.jobId || u.serverFolder) buttons.push(["retry", "Retry copy"]);
-    else if (u.kind === "folder") buttons.push(u.files ? ["resume", "Resume"] : ["pickdir", "Choose the folder again"]);
+    if (u.jobId || u.serverFolder) buttons.push(["retry", u.dest === "server" ? "Retry check" : "Retry copy"]);
+    else if (u.kind === "folder") buttons.push(u.files ? ["resume", "Retry failed files"] : ["pickdir", "Choose the folder again"]);
     else if (u.file) buttons.push(["resume", "Resume"]);
     buttons.push(["dismiss", "Dismiss"]);
   } else if (u.status === "pending") {
@@ -4420,6 +5503,8 @@ function uploadCardView(u) {
     : u.kind === "folder" ? "drive_folder_upload" : "upload_file";
   // the upload library's own wording, for whoever has to debug it
   const tip = u.status === "error" && u.detail && u.detail !== u.error ? `${stat}\n\n${u.detail}` : stat;
+  if (u.status !== "uploading") stat += ` · ${pct}% · ${fmtUploadSize(u.sent)} / ${fmtUploadSize(u.size)}`;
+  if (files && u.status !== "uploading" && u.status !== "staging") stat += ` · ${files}`;
   return { stat, pct, buttons, icon, tip };
 }
 // Cards are updated in place. Rebuilding them on every progress event replaced the buttons several
@@ -4442,23 +5527,43 @@ function renderUploads() {
       fresh.dataset.uploadId = u.id;
       fresh.dataset.shape = shape;
       fresh.innerHTML = `<div class="upload-row"><span class="material-symbols-outlined msym">${v.icon}</span>` +
-        `<span class="upload-name"></span><span class="upload-stat"></span>` +
+        `<span class="upload-name"></span><button type="button" class="upload-chat hidden" data-act="openchat"></button>` +
+        `<span class="upload-stat"></span>` +
         v.buttons.map(([act, label]) => `<button type="button" class="ghost small" data-act="${act}">${escapeHtml(label)}</button>`).join("") +
-        `</div><div class="meter"><div class="meter-fill"></div></div>`;
-      if (el) el.replaceWith(fresh);
+        `</div><div class="meter"><div class="meter-fill"></div></div>` +
+        `<details class="upload-files"><summary>File progress</summary><div class="upload-file-list"></div></details>`;
+      if (el) {
+        fresh.querySelector(".upload-files").open = !!el.querySelector(".upload-files")?.open;
+        el.replaceWith(fresh);
+      }
       el = fresh;
     }
     const nameEl = el.querySelector(".upload-name");
     nameEl.textContent = u.name; nameEl.title = u.name;
+    const from = chatLabel(u.chat);
+    const chatEl = el.querySelector(".upload-chat");
+    chatEl.classList.toggle("hidden", !from);
+    chatEl.disabled = !from || !from.open;
+    chatEl.textContent = from ? from.text : "";
+    chatEl.title = from && from.open ? "Open the chat this upload was started from" : "";
     const statEl = el.querySelector(".upload-stat");
     statEl.textContent = v.stat; statEl.title = v.tip;
     const fill = el.querySelector(".meter-fill");
     fill.style.width = `${v.pct}%`;
     fill.classList.toggle("mem", u.status === "done");
+    const details = el.querySelector(".upload-files");
+    details.hidden = !(u.fileProgress && u.fileProgress.length);
+    if (details.open) {
+      const list = details.querySelector(".upload-file-list");
+      const html = uploadFileRows(u);
+      if (list.innerHTML !== html) list.innerHTML = html;
+    }
+    details.ontoggle = () => { if (details.open) details.querySelector(".upload-file-list").innerHTML = uploadFileRows(state.uploads.find((x) => x.id === u.id) || u); };
     const at = prev ? prev.nextElementSibling : host.firstElementChild;
     if (at !== el) host.insertBefore(el, at);
     prev = el;
   }
+  renderUploadLine();
 }
 
 // -- a folder: one card ------------------------------------------------------------------------------
@@ -4486,6 +5591,12 @@ function folderDoneText(d) {
 // Upload a WHOLE folder (webkitdirectory) — every file keeps its nested relative path, so
 // a multi-level folder round-trips intact. Registered as ONE dataset entry; all uploads
 // this session stay reachable to the agent (server exposes the uploads tree to run_code).
+// The folder's name as the user knows it: the server's own name ("data_2"), unless it is a managed
+// storage id, which says nothing to the user.
+const STORAGE_ID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
+function shownFolder(serverName, userName) {
+  return serverName && !STORAGE_ID.test(serverName) ? serverName : (userName || serverName || "folder");
+}
 async function uploadFolder(fileList) {
   const files = Array.from(fileList || []).filter((f) => f && f.size >= 0)
     .sort((a, b) => {
@@ -4512,39 +5623,52 @@ async function uploadFolder(fileList) {
   const ctrl = new AbortController();
   // `files` stays on the card: while the page is open, a Resume does not need the folder chosen again
   const earlier = state.uploads.find((u) => u.id === id);
-  upsertUpload({ id, kind: "folder", name: `${folder0}/`, size: total, sent: 0, filesDone: 0, filesTotal: files.length,
+  if (earlier && earlier.fileProgress) earlier.fileProgress.forEach((f, i) => {
+    if (f.status === "done") doneBits[i >> 3] |= 1 << (i & 7);
+  });
+  const fileProgress = files.map((f, i) => ({ name: f.webkitRelativePath || f.name, size: f.size,
+    sent: isDone(i) ? f.size : 0, status: isDone(i) ? "done" : "queued", error: "" }));
+  upsertUpload({ id, kind: "folder", name: `${folder0}/`, size: total, sent: 0, filesDone: 0, filesTotal: files.length, fileProgress,
     status: "uploading", error: "", detail: "", lost: false, retrying: false, note: "", jobId: "", serverFolder: "", folderKey, files, ctrl,
     chat: (earlier && earlier.chat) || state.activeId });
-  setUploadProgress(`Preparing ${folder0}/…`);
+  setUploadProgress(id, `Preparing ${folder0}/…`);
   let folder = folder0, failedRel = "";
   try {
     // Ask the server which folder this goes to. It is told what the folder holds, so it recognises
     // one that is already uploaded, in part or whole (an upload that stopped, in this browser or
     // another, or the same folder chosen again): the answer is then that folder, and `have` lists
     // the files, by position, that are there and are not sent again. A different folder of the
-    // same name lands in "name_2/" instead of merging into / overwriting the first.
-    let savedFolder = "", kept = 0;
-    try { savedFolder = localStorage.getItem(folderKey) || ""; } catch { /* private mode */ }
-    if (!savedFolder) {
+    // same name lands in "name_2/" (or, with managed storage, gets a storage id of its own) instead of
+    // merging into / overwriting the first. A folder this browser started before is named in the
+    // request: with managed storage the server checks it again (a browser note can outlive the
+    // server's 24-hour upload expiry) and only the files it still holds are skipped; without, it is
+    // taken as it is ("resume") and the browser's own record of finished files stands.
+    let savedFolder = (earlier && earlier.reservedFolder) || "", kept = 0;
+    try { savedFolder = localStorage.getItem(folderKey) || savedFolder; } catch { /* private mode */ }
+    const rr = await postJson("/api/upload/reserve-folder", { name: folder0, folder: savedFolder, ...uploadChatField(id),
+      files: files.map((f) => [(f.webkitRelativePath || `${folder0}/${f.name}`).split("/").slice(1).join("/"), f.size]) });
+    const rd = await rr.json().catch(() => ({}));
+    if (!rr.ok || !rd.folder) throw new Error(rd.error || "folder reservation failed");
+    folder = rd.folder;
+    if (!rd.resume) {
       doneBits.fill(0);
-      const rr = await postJson("/api/upload/reserve-folder", { name: folder0,
-        files: files.map((f) => [(f.webkitRelativePath || `${folder0}/${f.name}`).split("/").slice(1).join("/"), f.size]) });
-      const rd = await rr.json().catch(() => ({}));
-      if (!rr.ok || !rd.folder) throw new Error(rd.error || "folder reservation failed");
-      folder = rd.folder;
+      fileProgress.forEach((f) => { f.sent = 0; f.status = "queued"; f.error = ""; });
       for (const i of rd.have || []) {
         if (Number.isInteger(i) && i >= 0 && i < files.length && !isDone(i)) { doneBits[i >> 3] |= 1 << (i & 7); kept++; }
       }
-      try {
-        localStorage.setItem(folderKey, folder);
-        if (kept) localStorage.setItem(bitsKey, btoa(String.fromCharCode(...doneBits)));
-      } catch { /* upload still works this session */ }
-      // (all of them there: the closing message says so, see folderDoneText)
-      if (kept && kept < files.length) toast(`${folder}/ is already uploaded in part: ${kept} of ${files.length} files are there, sending the other ${files.length - kept}`);
-    } else folder = savedFolder;
+    }
+    try {
+      localStorage.setItem(folderKey, folder);
+      localStorage.setItem(bitsKey, btoa(String.fromCharCode(...doneBits)));
+    } catch { /* upload still works this session */ }
+    // (all of them there: the closing message says so, see folderDoneText)
+    if (kept && kept < files.length) toast(`${folder0}/ is already uploaded in part: ${kept} of ${files.length} files are there, sending the other ${files.length - kept}`);
+    upsertUpload({ id, reservedFolder: folder });
+    // the server's card for this folder's part-way files (restoreServerCards): this card continues them
+    for (const u of state.uploads.filter((x) => x.status === "pending" && x.partsFolder === folder)) removeUpload(u.id);
     let done = 0, doneBytes = 0, nextFile = 0, stopped = false, firstError = null, storageWarned = false, painted = 0;
     let retryingFiles = 0;
-    files.forEach((f, i) => { if (isDone(i)) { done++; doneBytes += f.size; } });
+    files.forEach((f, i) => { if (isDone(i)) { done++; doneBytes += f.size; fileProgress[i].sent = f.size; fileProgress[i].status = "done"; } });
     uploadPaces.delete(id);             // files that are already there are not speed: measure from here
     const inFlight = new Map();         // file index -> bytes of it sent so far
     const controllers = new Set();
@@ -4554,8 +5678,8 @@ async function uploadFolder(fileList) {
       painted = Date.now();
       let sent = doneBytes;
       for (const n of inFlight.values()) sent += n;
-      upsertUpload({ id, name: `${folder}/`, sent, filesDone: done, status: "uploading" });
-      setUploadProgress(`Uploading ${folder}/ — ${done}/${files.length} files${uploadPaceTextFor(id)}`);
+      upsertUpload({ id, name: `${shownFolder(folder, folder0)}/`, sent, filesDone: done, fileProgress, status: "uploading" });
+      setUploadProgress(id, `Uploading ${shownFolder(folder, folder0)}/ — ${done}/${files.length} files${uploadPaceTextFor(id)}`);
     };
     paint(true);
     async function folderWorker() {
@@ -4573,10 +5697,11 @@ async function uploadFolder(fileList) {
           let d;
           try {
             if (stopped || fctrl.signal.aborted) throw new DOMException("cancelled", "AbortError");
+            fileProgress[index].status = "uploading";
             const hashPromise = hashUploadFile(f, fctrl);
             hashPromise.catch(() => {});
-            d = await tusUpload(f, { folder, rel_path: rel }, fctrl, hashPromise, (sent) => { inFlight.set(index, sent); paint(false); },
-              null, (retrying) => {
+            d = await tusUpload(f, { folder, rel_path: rel, ...uploadChatField(id) }, fctrl, hashPromise, (sent) => { fileProgress[index].sent = sent; inFlight.set(index, sent); paint(false); },
+              (waiting) => { fileProgress[index].status = waiting ? "verifying" : "uploading"; paint(true); }, (retrying) => {
                 retryingFiles += retrying ? 1 : -1;
                 upsertUpload({ id, retrying: retryingFiles > 0 });
               });
@@ -4587,19 +5712,22 @@ async function uploadFolder(fileList) {
           catch { storageWarned = true; }
           inFlight.delete(index);
           done++; doneBytes += f.size;
+          fileProgress[index].sent = f.size;
+          fileProgress[index].status = d.status === "staging" ? "copying" : "done";
           paint(true);
         } catch (error) {
-          inFlight.delete(index);
-          if (!firstError && !stopped) { firstError = error; failedRel = rel; }   // the error itself: it says what kind of failure
-          stopped = true;
-          for (const other of controllers) if (other !== fctrl) other.abort();
+          fileProgress[index].status = ctrl.signal.aborted ? "cancelled" : "error";
+          fileProgress[index].error = ctrl.signal.aborted ? "" : (error.message || "Upload failed");
+          if (!firstError && !stopped) { firstError = error; failedRel = rel; }
+          // A failed file keeps its resumable partial. Other files finish independently.
+          paint(true);
         } finally { controllers.delete(fctrl); }
       }
     }
     await Promise.all(Array.from({ length: Math.min(TUS_CONCURRENCY, files.length) }, () => folderWorker()));
     if (ctrl.signal.aborted) throw new DOMException("cancelled", "AbortError");
     if (firstError) throw firstError;
-    const reg = await postJson("/api/upload/register-folder", { folder, count: files.length });
+    const reg = await postJson("/api/upload/register-folder", { folder, count: files.length, ...uploadChatField(id) });
     const d = await reg.json().catch(() => ({}));
     if (!reg.ok) throw new Error(d.error || "folder registration failed");
     const forget = () => {
@@ -4621,21 +5749,32 @@ async function uploadFolder(fileList) {
   } catch (err) {
     if (ctrl.signal.aborted || err.name === "AbortError") {
       upsertUpload({ id, status: "cancelled", note: "" });
-      toast(`Cancelled ${folder}/ — choose the folder again to continue where it stopped.`);
+      fileProgress.forEach((f) => { if (f.status !== "done") f.status = "cancelled"; });
+      try {
+        const response = await postJson("/api/upload/staging/cancel", { folder, discard_upload: true });
+        if (!response.ok) throw new Error("Server could not remove temporary files");
+        localStorage.removeItem(folderKey); localStorage.removeItem(bitsKey);
+        toast(`Cancelled ${folder0}/`);
+      } catch (cleanupError) {
+        upsertUpload({ id, status: "error", error: `Cancellation cleanup failed: ${cleanupError.message}` });
+        toast(`Cancellation cleanup failed for ${folder0}/: ${cleanupError.message}`);
+        return;
+      }
       setTimeout(() => removeUpload(id), 4000);
     } else {
       const f = uploadFailure(err, "", "Resume uploads only the files that are still missing.");
       const text = failedRel && !f.lost ? `${failedRel}: ${f.text}` : f.text;   // a refusal names its file
       upsertUpload({ id, status: "error", note: "", error: text, detail: f.detail, lost: f.lost });
-      reportUploadError(id, `${folder}/`, err);
-      toast(`${folder}/: ${text}`);
+      reportUploadError(id, `${folder0}/`, err);
+      toast(`${folder0}/: ${text}`);
     }
-  } finally { setUploadProgress(null); }
+  } finally { setUploadProgress(id, null); }
 }
 
 // -- after a page reload -----------------------------------------------------------------------------
 // Copies to HPC3 run on the server whether or not a page is open; uploads the browser had not finished
-// wait in its storage. Bring both back as cards, once per connection.
+// wait in its storage, and the server lists those of any browser. Bring them back as cards, once per
+// connection.
 let uploadsRestoredFor = "";
 async function restoreUploads() {
   const cid = state.connectionId;
@@ -4651,30 +5790,35 @@ async function restoreStagingCards() {
   for (const job of d.jobs || []) {
     if (tracked.has(job.id) || job.state === "done" || job.state === "cancelled") continue;
     const id = `j${job.id}`;
-    const base = { id, kind: "file", name: job.name, size: job.size, sent: job.sent || 0, jobId: job.id, attach: false, note: "" };
-    if (job.state === "failed") { upsertUpload({ ...base, status: "error", error: job.error || "the copy to HPC3 failed" }); continue; }
+    // the chat it was started from gets its progress back, and the data once it is there
+    const chat = job.conversation_id || null;
+    const base = { id, kind: "file", name: job.name, size: job.size, sent: job.sent || 0, jobId: job.id, dest: job.dest, chat, attach: !!chat, note: "" };
+    if (job.state === "failed") { upsertUpload({ ...base, status: "error", error: job.error || stagingWords(job).failed }); continue; }
     const ctrl = new AbortController();
     upsertUpload({ ...base, status: "staging", error: "", ctrl });
-    settleUpload(id, { status: "staging", job_id: job.id, name: job.name, size: job.size }, job.name, job.size, ctrl, false)
-      .catch((err) => failUpload(id, err, job.name, ctrl)).finally(() => setUploadProgress(null));
+    settleUpload(id, { status: "staging", job_id: job.id, name: job.name, size: job.size }, job.name, job.size, ctrl, !!chat)
+      .catch((err) => failUpload(id, err, job.name, ctrl)).finally(() => setUploadProgress(id, null));
   }
   for (const f of d.folders || []) {
     // not registered = the browser had not sent every file: the "interrupted" card below covers it
     if (f.recorded || !f.registered || tracked.has(`folder:${f.name}`)) continue;
     const id = `jf${Math.abs(hashStr(f.name)).toString(36)}`;
-    const base = { id, kind: "folder", name: `${f.name}/`, size: f.size || 0, sent: f.sent || 0, filesDone: f.done || 0,
-      filesTotal: f.count || 0, serverFolder: f.name, attach: false, note: "" };
-    if (!f.pending && f.failed) { upsertUpload({ ...base, status: "error", error: `${f.failed} of ${f.count} files did not reach HPC3` }); continue; }
+    const chat = f.conversation_id || null;
+    const base = { id, kind: "folder", name: `${shownFolder(f.name, f.original_name)}/`, size: f.size || 0, sent: f.sent || 0, filesDone: f.done || 0,
+      filesTotal: f.count || 0, serverFolder: f.name, dest: f.dest, chat, attach: !!chat, note: "" };
+    if (!f.pending && f.failed) { upsertUpload({ ...base, status: "error", error: `${f.failed} of ${f.count} files ${stagingWords(f).missing}` }); continue; }
     const ctrl = new AbortController();
     upsertUpload({ ...base, status: "staging", error: "", ctrl });
-    followFolder(id, f.name, {}, ctrl, false).catch((err) => failUpload(id, err, `${f.name}/`, ctrl)).finally(() => setUploadProgress(null));
+    followFolder(id, f.name, {}, ctrl, !!chat).catch((err) => failUpload(id, err, `${f.name}/`, ctrl)).finally(() => setUploadProgress(id, null));
   }
 }
 async function restorePendingCards() {
   const owner = apiKeyOwner();
+  const stored = new Set();                            // the server's ids of every upload this browser keeps
   if (window.tus && window.tus.defaultOptions && window.tus.defaultOptions.urlStorage) {
     const storage = window.tus.defaultOptions.urlStorage;
     for (const up of await storage.findAllUploads()) {
+      if (up.uploadUrl) stored.add(tusId(up.uploadUrl));
       // key: tus::<fingerprint>::<n>, fingerprint: tus:<owner>:<name or path>:<size>:<modified>
       const fingerprint = String(up.urlStorageKey || "").split("::")[1] || "";
       const meta = up.metadata || {};
@@ -4688,7 +5832,7 @@ async function restorePendingCards() {
       if (state.uploads.some((u) => u.name === name && u.size === length && u.status !== "pending")) continue;   // already running again
       const id = `p${Math.abs(hashStr(fingerprint)).toString(36)}`;
       if (state.uploads.some((u) => u.id === id && (u.sent || 0) >= offset)) continue;   // one file stored twice: show the one further along
-      upsertUpload({ id, kind: "file", name, size: length, sent: offset,
+      upsertUpload({ id, kind: "file", name, size: length, sent: offset, chat: meta.conversation_id || null,
         status: "pending", error: "", note: `Interrupted at ${Math.floor((100 * offset) / length)}% — choose the file again to continue`,
         tusUrl: up.uploadUrl, tusKey: up.urlStorageKey });
     }
@@ -4705,6 +5849,38 @@ async function restorePendingCards() {
     upsertUpload({ id, kind: "folder", name: `${localStorage.getItem(key) || parts.slice(2, -2).join(":")}/`, size: 0, sent: 0,
       filesDone: done, filesTotal: count, status: "pending", error: "", folderKey: key,
       note: `Interrupted — ${done} of ${count} files uploaded; choose the folder again to continue` });
+  }
+  await restoreServerCards(stored);
+}
+// The account's uploads left part-way where this browser stored nothing: another computer, a private
+// window, or this browser before its site data was cleared. The server lists them (GET
+// /api/tus/unfinished); without a card nothing said they wait. Choosing the file or folder again
+// continues each one (findServerUpload) and Discard deletes it. An upload this browser stores, or one
+// a card here already stands for, is left to that card; so is a file or folder that has a card here.
+async function restoreServerCards(stored, request = fetch) {
+  let d = null;
+  try {
+    const r = await request(`/api/tus/unfinished?connection_id=${encodeURIComponent(state.connectionId)}`);
+    d = r.ok ? await r.json() : null;
+  } catch { /* no answer: the cards this browser keeps are all there is */ }
+  if (!d) return;
+  const shown = new Set(state.uploads.flatMap((u) => [u.tusUrl, ...(u.tusUrls || [])]).filter(Boolean).map(tusId));
+  const fresh = (up) => !!(up && up.url && up.size > 0) && !stored.has(tusId(up.url)) && !shown.has(tusId(up.url));
+  for (const up of (d.files || []).filter(fresh)) {
+    if (state.uploads.some((u) => u.kind === "file" && u.name === up.name && u.size === up.size)) continue;
+    upsertUpload({ id: `s${tusId(up.url)}`, kind: "file", name: up.name, size: up.size, sent: up.offset,
+      status: "pending", error: "", tusUrl: up.url, chat: up.conversation_id || null,
+      note: `Interrupted at ${Math.floor((100 * up.offset) / up.size)}% in another browser — choose the file again to continue` });
+  }
+  for (const f of d.folders || []) {
+    const parts = (f.files || []).filter(fresh);
+    if (!f.folder || !parts.length || state.uploads.some((u) => u.kind === "folder" && u.name === `${f.folder}/`)) continue;
+    const n = parts.length;
+    upsertUpload({ id: `sf${Math.abs(hashStr(f.folder)).toString(36)}`, kind: "folder", name: `${f.folder}/`,
+      size: parts.reduce((s, p) => s + p.size, 0), sent: parts.reduce((s, p) => s + p.offset, 0),
+      status: "pending", error: "", partsFolder: f.folder, tusUrls: parts.map((p) => p.url),
+      chat: (parts.find((p) => p.conversation_id) || {}).conversation_id || null,
+      note: `Interrupted in another browser — ${n} ${n === 1 ? "file" : "files"} part-way; choose the folder again to continue` });
   }
 }
 
@@ -4741,8 +5917,9 @@ function datasetIcon(kind) {
 }
 
 // ---- data already on the server, bound by path (no upload) ---------------------------------
-// The gateway allowlists folders (AISCIENTIST_SERVER_DATA_ROOTS). A path inside one can be bound from
-// the Data menu, or — when one is pasted into the chat — from the offer above the composer. Binding
+// The gateway allowlists folders (AISCIENTIST_SERVER_DATA_ROOTS). A path inside one, pasted into the
+// chat, is offered above the composer (the Data menu no longer has an item for it: users do not see
+// server paths, issue 21). Binding
 // is always the user's click: a path the model reads in a message is never bound on its own. A run
 // copies what it needs to HPC3 when it starts (only what changed since the last copy).
 const _SERVER_PATH_RE = /(?<![\w/])(\/[^\s'"`<>|;,()[\]{}]+)/g;
@@ -4752,10 +5929,6 @@ async function loadServerRoots() {
     const d = await (await fetch("/api/server-data/roots")).json();
     state.serverRoots = d.enabled ? (d.roots || []) : [];
   } catch { state.serverRoots = []; }
-  const item = $("serverDataItem");
-  if (item) item.classList.toggle("hidden", !state.serverRoots.length);
-  const inp = $("serverPathInput");
-  if (inp && state.serverRoots.length) inp.placeholder = state.serverRoots[0] + "/…";
   renderServerPathOffer();
 }
 
@@ -4794,28 +5967,29 @@ async function bindServerPath(path) {
   path = (path || "").trim();
   if (!path) return false;
   if (!state.connectionId) { toast("Connect first: binding server data needs a session."); return false; }
+  const sid = state.activeId, line = `bind:${sid}`;   // the chat it was asked in, which may be left meanwhile
   const post = async (url) => {
     const res = await fetch(url, { method: "POST", headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ connection_id: state.connectionId, path }) });
+      body: JSON.stringify({ connection_id: state.connectionId, path, conversation_id: String(sid || "") }) });
     const d = await res.json().catch(() => ({}));
     if (!res.ok) throw new Error(d.error || `HTTP ${res.status}`);
     return d;
   };
   try {
-    setUploadProgress(`Checking ${path} on the server…`);
+    setUploadProgress(line, `Checking ${path} on the server…`, sid);
     const info = await post("/api/server-data/check");
-    setUploadProgress("");
+    setUploadProgress(line, "");
     // Large copies are confirmed first: the size and what will be skipped are in the message.
     if (info.confirm && !confirm(info.message + "\n\nBind it?")) return false;
     const d = await post("/api/server-data/bind");
     state.serverBoundTyped.add(path);
     addDataset({ name: d.name + (isFolderKind(d.kind) ? "/" : ""), path: d.path, kind: d.kind,
-      gist: d.info && d.info.message });
+      gist: d.info && d.info.message }, sid);
     toast(d.info && d.info.message ? d.info.message : `Bound ${d.name}`);
     renderServerPathOffer();
     return true;
   } catch (err) {
-    setUploadProgress("");
+    setUploadProgress(line, "");
     toast("Can't bind that path: " + err.message);
     return false;
   }
@@ -4837,14 +6011,55 @@ function addDataset(d, sid) {
   const c = chatOf(sid || state.activeId);
   if (c && !c.bound.includes(d.path)) c.bound.push(d.path);
   if (!c || chatVisible(c)) syncDatasetSelection();
-  else renderDataMenuRecent();      // its chips appear when that chat is opened (showDialog)
+  else saveComposer(c);   // its chips appear when that chat is opened (showDialog)
 }
 
-// The chat an upload attaches to: the one it was started from (cards restored after a reload
-// have none, and attach nothing).
+// A deleted dataset leaves every chat it was attached to, the ones not opened since the reload too.
+function unbindEverywhere(path) {
+  state.datasets = state.datasets.filter((d) => d.path !== path);
+  for (const s of state.sessions) {
+    const c = chatOf(s.id);
+    if (!c.bound.includes(path)) continue;
+    c.bound = c.bound.filter((p) => p !== path);
+    delete c.roles[path];
+    saveComposer(c);
+  }
+  syncDatasetSelection();
+}
+
+// A dataset whose path changed (moved from HPC3 to the server) stays attached wherever it was.
+function repointEverywhere(from, to) {
+  state.datasets = state.datasets.filter((d) => d.path !== from || d.path === to);
+  for (const s of state.sessions) {
+    const c = chatOf(s.id);
+    if (!c.bound.includes(from)) continue;
+    c.bound = [...new Set(c.bound.map((p) => (p === from ? to : p)))];
+    if (from in c.roles) { c.roles[to] = c.roles[from]; delete c.roles[from]; }
+    saveComposer(c);
+  }
+}
+
+// The chat an upload attaches to: the one it was started from. The server keeps it too, so a card
+// restored after a reload knows it; one from before the server kept it has none and attaches nothing.
 function uploadChat(id) {
   const u = state.uploads.find((x) => x.id === id);
   return (u && u.chat) || null;
+}
+// What an upload request tells the server about its chat (tus metadata and the folder calls).
+function uploadChatField(id) {
+  const sid = uploadChat(id);
+  return sid ? { conversation_id: String(sid) } : {};
+}
+// "from “Retina scRNA”" for the Datasets page: { text, open } (open = the chat still exists), or null.
+function chatLabel(sid) {
+  if (!sid) return null;
+  const s = state.sessions.find((x) => String(x.id) === String(sid));
+  return s ? { text: `from “${s.title || "New chat"}”`, open: true } : { text: "from a deleted chat", open: false };
+}
+function openChat(sid) {
+  if (!sid || !state.sessions.some((s) => String(s.id) === String(sid))) return;
+  switchView("research");
+  if (String(state.activeId) !== String(sid)) selectSession(String(sid));
 }
 
 // Add/remove one path from the bind-set (a recent-list toggle or a chip ×).
@@ -4860,10 +6075,10 @@ function clearBound() { state.boundPaths = []; state.boundRoles = {}; syncDatase
 function syncDatasetSelection() {
   state.datasetPath = primaryBoundPath();
   $("datasetInput").value = state.datasetPath || "";   // legacy primary, for back-compat readers
-  // Not persisted across reloads on purpose: a new chat should start with an empty bind-set
-  // rather than silently re-attaching the last one (see loadDatasetChips).
+  // Kept per chat across a reload (saveComposer); a new chat starts with an empty bind-set rather
+  // than silently re-attaching the last one (see loadDatasetChips).
+  saveComposer(activeChat());
   renderDatasetChips();
-  renderDataMenuRecent();
 }
 // Back-compat alias: some call sites still say selectDataset(path|null) — a single-file select is just
 // "replace the set with this one" (or clear it).
@@ -4892,82 +6107,137 @@ function renderDatasetChips() {
   }).join("");
 }
 
-// ---- the case note: the SECOND attachment (clinical description → HPO) ---------------------
-// Read client-side and sent as TEXT with the run, so it never competes for the single dataset slot.
-const MAX_CASE_NOTE_CHARS = 64000;   // mirrors _MAX_CASE_NOTE_CHARS in the gateway
-
-async function attachCaseNote(file) {
-  if (!file) return;
-  try {
-    const text = (await file.text()).trim();
-    if (!text) { toast("That note is empty."); return; }
-    if (text.length > MAX_CASE_NOTE_CHARS) toast(`Note is long — only the first ${MAX_CASE_NOTE_CHARS / 1000}k characters will be used.`);
-    state.caseNote = { name: file.name, text: text.slice(0, MAX_CASE_NOTE_CHARS) };
-    renderCaseNoteChip();
-  } catch (err) {
-    toast("Couldn't read that note: " + err.message);
+// The composer's upload line belongs to the chat the upload was started from (issue 7). Each upload
+// has its own line; the composer shows only those of the chat on screen. Another chat's upload goes
+// on meanwhile, its progress is there again when that chat is opened, and the Datasets page lists
+// every upload with the chat it came from.
+const uploadLines = new Map();          // upload id (or "bind:<chat>") -> { chat, text }
+function setUploadProgress(id, text, chat) {
+  if (!text) uploadLines.delete(id);
+  else {
+    const had = uploadLines.get(id);
+    const sid = chat || uploadChat(id) || (had && had.chat) || "";
+    uploadLines.set(id, { chat: String(sid), text });
   }
+  renderUploadLine();
 }
-
-function renderCaseNoteChip() {
-  const host = $("caseNoteChips");
-  if (!host) return;
-  if (!state.caseNote) { host.innerHTML = ""; return; }   // absent by default — no empty-state noise
-  const n = state.caseNote;
-  const preview = n.text.slice(0, 160) + (n.text.length > 160 ? "…" : "");
-  host.innerHTML = `<span class="dataset-chip active" title="${escapeHtml(preview)}">` +
-    `<span class="material-symbols-outlined msym">clinical_notes</span>` +
-    `<span class="dataset-chip-name">${escapeHtml(n.name)} (${n.text.length} chars)</span>` +
-    `<button type="button" class="dataset-chip-x" data-clear-note title="Remove the case note">×</button></span>`;
+// Uploads in flight that were started from chat `sid`.
+function chatUploads(sid) {
+  return state.uploads.filter((u) => u.chat && String(u.chat) === String(sid) && UPLOAD_ACTIVE.includes(u.status));
 }
-
-// The popover's "Recent uploads" list — all known uploads (this session + server history).
-function renderDataMenuRecent() {
-  const host = $("dataMenuRecent");
-  if (!host) return;
-  if (!state.datasets.length) { host.innerHTML = '<div class="data-menu-empty">No uploads yet</div>'; return; }
-  host.innerHTML = state.datasets.map((d) => {
-    const active = state.boundPaths.includes(d.path) ? " active" : "";   // in the bind-set → checked
-    const ico = datasetIcon(d.kind);
-    return `<button type="button" class="data-menu-recent-item${active}" data-path="${escapeHtml(d.path)}" title="${escapeHtml(d.path)} (click to add/remove)">` +
-      `<span class="material-symbols-outlined msym">${ico}</span><span class="dmr-name">${escapeHtml(d.name)}</span>` +
-      (active ? `<span class="material-symbols-outlined msym dmr-check">check</span>` : "") + `</button>`;
-  }).join("");
-}
-
-function setUploadProgress(text) {
+function renderUploadLine() {
   const el = $("uploadStatus"), cb = $("uploadCancel");
   if (!el) return;
-  if (!text) { el.classList.add("hidden"); el.textContent = ""; if (cb) cb.classList.add("hidden"); return; }
-  el.classList.remove("hidden");
+  const here = String(state.activeId || "");
+  const lines = here ? [...uploadLines.values()].filter((l) => l.chat === here) : [];
+  const text = lines.length ? lines[0].text + (lines.length > 1 ? ` (+${lines.length - 1} more)` : "") : "";
+  el.classList.toggle("hidden", !text);
   el.textContent = text;
-  // Show the composer's Cancel button while any upload is actually in flight.
-  if (cb) cb.classList.toggle("hidden", !state.uploads.some((u) => UPLOAD_ACTIVE.includes(u.status)));
+  // Cancel stops this chat's uploads, so it is there only while one of them is in flight.
+  if (cb) cb.classList.toggle("hidden", !text || !chatUploads(here).length);
 }
 
+// "＋ Data" opens a two-item list, Files and Folder (issue 21): a browser's file dialog picks either
+// files or one folder, never both. Several files and folders at once are dropped onto the chat.
 function toggleDataMenu(force) {
   const m = $("dataMenu");
   if (!m) return;
   const show = force !== undefined ? force : m.classList.contains("hidden");
   m.classList.toggle("hidden", !show);
-  if (show) renderDataMenuRecent();
 }
 
-// Populate the recent list from this user's server-side dataset history so earlier uploads
-// (incl. folders from a previous visit) are selectable — not just ones uploaded this session.
+// ---- dropping files and folders onto the chat ------------------------------------------------------
+// The drop's entries are read while the event is being handled (the browser empties the DataTransfer
+// after it); the folders are then walked. A file goes up as an upload of its own, a folder as one
+// folder upload, as if chosen in the dialogs. A dropped file has no webkitRelativePath, so each file
+// of a folder gets one: its path under the dropped folder, as the folder dialog gives it.
+function dropEntries(dt) {
+  const items = [...((dt && dt.items) || [])].filter((it) => it.kind === "file");
+  const entries = items.map((it) => (typeof it.webkitGetAsEntry === "function" ? it.webkitGetAsEntry() : null));
+  if (entries.length && entries.every(Boolean)) return { entries, files: [] };
+  return { entries: [], files: [...((dt && dt.files) || [])] };   // no entry API: plain files only
+}
+function entryFile(entry) { return new Promise((res, rej) => entry.file(res, rej)); }
+async function readDirAll(dir) {
+  const reader = dir.createReader(), out = [];
+  for (;;) {      // readEntries hands the entries over in batches until it returns an empty one
+    const batch = await new Promise((res, rej) => reader.readEntries(res, rej));
+    if (!batch.length) return out;
+    out.push(...batch);
+  }
+}
+async function folderFiles(dir) {
+  const files = [], todo = [dir];
+  while (todo.length) {
+    const d = todo.shift();
+    for (const e of await readDirAll(d)) {
+      if (e.isDirectory) { todo.push(e); continue; }
+      if (!e.isFile || e.name === ".DS_Store") continue;
+      const f = await entryFile(e);
+      const rel = String(e.fullPath || `${dir.name}/${e.name}`).replace(/^\/+/, "");
+      try { Object.defineProperty(f, "webkitRelativePath", { value: rel, configurable: true }); } catch { /* read-only here */ }
+      files.push(f);
+    }
+  }
+  return files;
+}
+// What a drop holds: the loose files, and each folder's files. Reading a folder that fails is skipped
+// with a note; the rest goes up.
+async function droppedUploads(found) {
+  const files = [...found.files], folders = [];
+  for (const e of found.entries) {
+    try {
+      if (e.isDirectory) { const fl = await folderFiles(e); if (fl.length) folders.push(fl); }
+      else if (e.isFile) files.push(await entryFile(e));
+    } catch (err) { toast(`Couldn't read ${e.name}: ${err.message || err}`); }
+  }
+  return { files, folders };
+}
+async function onDataDrop(found) {
+  if (!state.connectionId) { toast("Connect to HPC3 first."); return; }
+  const { files, folders } = await droppedUploads(found);
+  if (!files.length && !folders.length) { toast("Nothing to upload in what was dropped."); return; }
+  for (const f of files) uploadDataset(f);
+  for (const fl of folders) uploadFolder(fl);
+}
+function wireDataDrop() {
+  const panel = document.querySelector(".chat-panel"), hint = $("dropHint");
+  if (!panel) return;
+  let depth = 0;
+  const carriesFiles = (e) => [...((e.dataTransfer && e.dataTransfer.types) || [])].includes("Files");
+  const show = (on) => { if (hint) hint.classList.toggle("hidden", !on); panel.classList.toggle("drop-target", on); };
+  panel.addEventListener("dragenter", (e) => { if (!carriesFiles(e)) return; e.preventDefault(); depth += 1; show(true); });
+  panel.addEventListener("dragover", (e) => { if (!carriesFiles(e)) return; e.preventDefault(); e.dataTransfer.dropEffect = "copy"; });
+  panel.addEventListener("dragleave", (e) => { if (!carriesFiles(e)) return; depth = Math.max(0, depth - 1); if (!depth) show(false); });
+  panel.addEventListener("drop", (e) => {
+    if (!carriesFiles(e)) return;
+    e.preventDefault();
+    depth = 0;
+    show(false);
+    onDataDrop(dropEntries(e.dataTransfer));
+  });
+}
+
+// Load this user's server-side dataset history so earlier uploads (incl. folders from a previous
+// visit) are known to the page: their chips, and Datasets → Use, which attaches one to the open chat.
 async function loadDatasetChips() {
   try {
     const items = (await (await fetch("/api/datasets")).json()).datasets || [];
     for (const x of items) {
       const name = isFolderKind(x.kind) ? x.name + "/" : x.name;
-      if (!state.datasets.some((d) => d.path === x.path)) state.datasets.push({ name, path: x.path, kind: x.kind });
+      // A dataset moved from HPC3 to the server keeps its id and changes its path: the chip and every
+      // chat it is attached to follow it, rather than keep sending the HPC3 original.
+      const moved = x.id != null && state.datasets.find((d) => d.id === x.id && d.path !== x.path);
+      if (moved) repointEverywhere(moved.path, x.path);
+      const known = state.datasets.find((d) => d.path === x.path);
+      if (known) { if (known.id == null) known.id = x.id; continue; }
+      state.datasets.push({ id: x.id, name, path: x.path, kind: x.kind, at: x.uploaded_at, size: x.size_bytes });
     }
   } catch { /* datasets need accounts; the list just stays empty otherwise */ }
   // Do NOT auto-select the last dataset: a fresh chat starts with an EMPTY dataset box rather than
   // silently inheriting whatever was loaded last time (that surprised users and mis-attached data to
   // a new question). Prior uploads still appear as clickable chips; the user picks one explicitly.
   renderDatasetChips();
-  renderDataMenuRecent();
 }
 
 function hashStr(s) {
@@ -5018,22 +6288,12 @@ function applyUiPrefs() {
   try { prefs = JSON.parse(localStorage.getItem(UI_KEY) || "{}"); } catch {}
   setPanel("left", prefs.left !== false);
   setPanel("right", prefs.right === true);   // downloads/log panel collapsed by default
-  // "Save results to my data" is a standing choice, not a per-run one: it stays as it was left.
-  const save = $("saveResults");
-  if (save) {
-    save.checked = prefs.saveResults === true;
-    save.addEventListener("change", () => {
-      let now = {};
-      try { now = JSON.parse(localStorage.getItem(UI_KEY) || "{}"); } catch {}
-      now.saveResults = save.checked;
-      try { localStorage.setItem(UI_KEY, JSON.stringify(now)); } catch {}
-    });
-  }
 }
 
-function setPanel(side, open) {
+function setPanel(side, open, remember = true) {
   $("layout").classList.toggle(`collapse-${side}`, !open);
   $(side === "left" ? "toggleLeft" : "toggleRight").classList.toggle("active", open);
+  if (!remember) return;
   let prefs = {};
   try { prefs = JSON.parse(localStorage.getItem(UI_KEY) || "{}"); } catch {}
   prefs[side] = open;
@@ -5150,6 +6410,7 @@ function showApp(user) {
   if (!_appInited) { init(); initShell(); _appInited = true; }
   renderAccount(user);
   switchView("research");
+  checkBudgetNotices();
 }
 
 async function doLogin(e) {
@@ -5165,16 +6426,25 @@ async function doLogin(e) {
 
 async function doLogout() {
   try { await fetch("/api/auth/logout", { method: "POST" }); } catch {}
+  try { localStorage.removeItem(COMPOSER_KEY); } catch {}   // drafts and attachments stay with the account
   location.reload();
 }
 
 function initShell() {
   document.querySelectorAll(".nav-item").forEach((b) => b.addEventListener("click", () => switchView(b.dataset.view)));
-  $("datasetsRefresh").addEventListener("click", loadDatasets);
+  $("datasetsRefresh").addEventListener("click", loadFiles);
   $("runsRefresh").addEventListener("click", loadRuns);
   $("runsList").addEventListener("click", onRunsClick);
+  $("outputsList").addEventListener("click", onOutputsClick);
+  document.querySelectorAll(".files-tab").forEach((b) => b.addEventListener("click", () => switchFilesTab(b.dataset.filesTab)));
+  wireListSearch("datasetsSearch", "datasetsList", "datasetsCount");
+  wireListSearch("outputsSearch", "outputsList", "outputsCount");
+  wireListSearch("runsSearch", "runsList", "runsCount");
   $("adminRefresh").addEventListener("click", loadAdminUsers);
   $("systemRefresh").addEventListener("click", loadSystem);
+  $("systemRuns").addEventListener("click", onSystemRunsClick);
+  wireSysCatalog();
+  document.addEventListener("visibilitychange", () => { if (!document.hidden && sysLive.timer) pollSystemLive(); });
   $("createUserForm").addEventListener("submit", createUser);
   $("changePwForm").addEventListener("submit", changePassword);
   $("logoutBtn").addEventListener("click", doLogout);
@@ -5192,6 +6462,12 @@ function initShell() {
   }));
   $("skillReviewList").addEventListener("click", onSkillReviewClick);
   $("datasetsList").addEventListener("click", onDatasetsClick);
+  $("metadataForm").addEventListener("submit", saveMetadata);
+  $("metadataForm").addEventListener("change", (e) => { if (e.target.id === "mdf_human_data") mdSyncShowIf(); });
+  $("metadataClose").addEventListener("click", () => $("metadataModal").classList.add("hidden"));
+  $("metadataModal").addEventListener("click", (e) => { if (e.target.id === "metadataModal") $("metadataModal").classList.add("hidden"); });
+  $("mcpTokenForm").addEventListener("submit", createMcpToken);
+  $("mcpTokens").addEventListener("click", onMcpTokensClick);
   $("uploadsPanel").addEventListener("click", (e) => {
     const b = e.target.closest("button[data-act]");
     const card = b && b.closest("[data-upload-id]");
@@ -5199,21 +6475,25 @@ function initShell() {
   });
   const uc = $("uploadCancel");
   if (uc) uc.addEventListener("click", cancelActiveUploads);   // composer-side Cancel
+  wireUsage();
 }
 
 function switchView(name) {
   document.querySelectorAll(".nav-item").forEach((b) => b.classList.toggle("active", b.dataset.view === name));
   document.querySelectorAll(".view").forEach((v) => v.classList.toggle("active", v.id === "view-" + name));
-  if (name === "datasets") loadDatasets();
+  if (name === "datasets") loadFiles();
   else if (name === "runs") loadRuns();
   else if (name === "admin") { loadAdminUsers(); loadSkillReviews(); }
-  else if (name === "account") renderAccount(state.user);
+  else if (name === "account") { renderAccount(state.user); loadUsage(); if (state.accountTab === "storage") loadStorageTab(); }
   else if (name === "system") loadSystem();
+  if (name !== "system") stopSystemLive();
 }
 
-// ---- System view (live agents / tools / capabilities / roadmap) ----
+// ---- System view (capabilities / agents / pipelines, tools and skills) ----
 async function loadSystem() {
-  const el = $("systemBody"); el.innerHTML = '<div class="empty-hint">Loading…</div>';
+  const el = $("systemBody");
+  const query = ($("sysSearch") || {}).value || "";       // a Refresh keeps the search
+  el.innerHTML = '<div class="empty-hint">Loading…</div>';
   try {
     const d = await (await fetch("/api/system")).json();
     const cap = (k, v) => `<span class="cap ${v ? "on" : "off"}">${v ? "✓" : "✕"} ${escapeHtml(k)}</span>`;
@@ -5222,100 +6502,565 @@ async function loadSystem() {
       `<div class="card"><div class="card-main"><strong>${escapeHtml(a.name)}</strong>` +
       `<span class="muted">${escapeHtml(a.role)} · ${escapeHtml(a.where)}</span>` +
       `<span class="sys-desc">${escapeHtml(a.description)}</span></div></div>`).join("");
-    // tools grouped by category
-    const byCat = {};
-    (d.tools || []).forEach((t) => { (byCat[t.category] = byCat[t.category] || []).push(t); });
-    const tools = Object.keys(byCat).sort().map((c) =>
-      `<div class="sys-cat"><h4>${escapeHtml(c)}</h4>` + byCat[c].map((t) =>
-        `<div class="card"><div class="card-main"><strong>${escapeHtml(t.name)}` +
-        `${t.reads_private_data ? ' <span class="tag-priv">private data</span>' : ""}</strong>` +
-        `<span class="sys-desc">${escapeHtml(t.description)}</span>` +
-        `${t.requires.length ? `<span class="muted">needs: ${t.requires.map(escapeHtml).join(", ")}</span>` : ""}</div>` +
-        `<span class="cap ${t.available ? "on" : "off"}">${t.available ? "available" : "unavailable"}</span></div>`
-      ).join("") + "</div>").join("");
-    const flows = (d.workflows || []).map((w) =>
-      `<div class="card flow"><div class="card-main"><strong>${escapeHtml(w.name)} ` +
-      `<span class="flow-kind">${escapeHtml(w.kind)}</span></strong>` +
-      `<span class="sys-desc">${escapeHtml(w.description)}</span>` +
-      `<div class="flow-stages">${(w.stages || []).map((s) =>
-        `<span class="flow-stage">${escapeHtml(s)}</span>`).join('<span class="flow-arrow">→</span>')}</div>` +
-      `</div></div>`).join("");
     const specialists = (d.specialists || []).map((s) =>
       `<div class="card"><div class="card-main"><strong>${escapeHtml(s.name)}</strong>` +
       `<span class="sys-desc">${escapeHtml(s.persona)}</span></div></div>`).join("");
     el.innerHTML =
       `<h3>Capabilities (this server)</h3><div class="cap-row">${caps}</div>` +
+      `<p class="sys-note">What the web server has itself. A tool that runs on HPC3 brings its software in ` +
+      `its job's container, so it is not checked here: each tool below says where it runs.</p>` +
       `<h3>Agents</h3><div class="card-list">${agents}</div>` +
       (specialists ? `<h3>Scientist specialists</h3><div class="card-list">${specialists}</div>` : "") +
-      `<h3>Workflow presets</h3><div class="card-list">${flows}</div>` +
-      `<h3>Tools / skills</h3>${tools}`;
+      sysCatalogHtml(d);
+    if (query) { $("sysSearch").value = query; sysCatalogFilter(query); }
     renderWorkflowGraph(d.graph);
+    startSystemLive();
   } catch { el.innerHTML = '<div class="empty-hint">Failed to load system overview.</div>'; }
 }
 
-// ---- Live workflow graph (read-only; reflects the current code) ----
-let _cy = null;
-const _GRAPH_FILL = { agent: "#DCCCFF", output: "#C6FAF6", preset: "#FFE0C2", persona: "#FFECBD", tool: "#CDF4D3" };
-const _GRAPH_STROKE = { agent: "#874FFF", output: "#5AD8CC", preset: "#FF9E42", persona: "#FFC943", tool: "#66D575" };
+// Pipelines, tools and skills: one line each (name, summary, where it runs), the whole text when a
+// row is opened, and one search over all three. A row's data-q holds everything the search reads.
+function sysSearchText(parts) {
+  const raw = parts.filter((p) => p !== undefined && p !== null && p !== "").join(" \n ").toLowerCase();
+  return raw + " \n " + raw.replace(/[_\-·]+/g, " ");      // "cell type" finds cell-type and cell_type
+}
+
+function sysMatch(query, text) {
+  const terms = String(query || "").toLowerCase().split(/\s+/).filter(Boolean);
+  return terms.every((t) => text.includes(t));
+}
+
+function sysKv(rows) {
+  const html = rows.filter(([, v]) => v).map(([k, v]) => `<dt>${escapeHtml(k)}</dt><dd>${v}</dd>`).join("");
+  return html ? `<dl class="sys-kv">${html}</dl>` : "";
+}
+
+const sysCode = (s) => `<code>${escapeHtml(s)}</code>`;
+
+// Whether an opened row's full text starts with its summary line, which then need not show twice.
+function sysRepeats(summary, full) {
+  const head = String(summary || "").replace(/…$/, "").replace(/[*`]/g, "").trim();
+  return !!head && String(full || "").replace(/[*`]/g, "").replace(/\s+/g, " ").startsWith(head);
+}
+
+function sysPipelineItem(p) {
+  const type = METHOD_DATA_TYPES[p.data_type] || p.data_type || "";
+  const tools = (p.tools || []).map((t) =>
+    `<button type="button" class="sys-q" data-sys-tool="${escapeHtml(t)}" title="Show ${escapeHtml(t)} in Tools">${escapeHtml(t)}</button>`).join("");
+  const long = p.description && p.description !== p.summary ? `<div class="sys-md">${renderMarkdown(p.description)}</div>` : "";
+  return {
+    id: `pipeline:${p.key}`, name: p.title || p.key, summary: p.summary, repeats: !!long && sysRepeats(p.summary, p.description),
+    tags: type ? [{ text: type }] : [],
+    body: long + sysKv([["Tools", tools && `<div class="sys-qs">${tools}</div>`], ["Key", sysCode(p.key)],
+                        ["Protocol", sysCode(`preset_pipelines/${p.key}/`)]]),
+    text: sysSearchText([p.title, p.key, p.summary, p.description, type, ...(p.tools || [])]),
+  };
+}
+
+function sysToolItem(t) {
+  const tags = [{ text: t.where || t.runs_on || "", title: "Where it runs" }];
+  if (t.available === false) tags.push({ text: "unavailable here", cls: "off" });
+  if (t.reads_private_data) tags.push({ text: "private data", cls: "priv", title: "Reads the user's data" });
+  return {
+    id: `tool:${t.name}`, name: t.name, mono: true, summary: t.summary || t.description, tags,
+    body: `<div class="sys-k">What the model is told</div><div class="sys-md">${renderMarkdown(t.description)}</div>` +
+      sysKv([["Runs on", escapeHtml(t.where || t.runs_on || "")], ["Category", escapeHtml(t.category || "")],
+             ["Needs", (t.requires || []).map(escapeHtml).join(", ")],
+             ["Here", typeof t.available === "boolean" ? (t.available ? "available on this server" : "not installed on this server") : ""],
+             ["Code", t.code ? sysCode(t.code) : ""]]),
+    text: sysSearchText([t.name, t.summary, t.description, t.category, t.where, t.runs_on, ...(t.requires || []),
+                         t.reads_private_data ? "private data" : ""]),
+  };
+}
+
+function sysSkillItem(s) {
+  const tags = [];
+  if (s.category) tags.push({ text: s.category });
+  if (s.image) tags.push({ text: "own environment", title: s.image });
+  if (s.induced) tags.push({ text: "induced", title: "Written by the system from a past run, approved by an admin" });
+  const long = s.description && s.description !== s.summary ? `<div class="sys-md">${renderMarkdown(s.description)}</div>` : "";
+  const use = s.use ? `<div class="sys-k">When to use</div><div class="sys-md">${renderMarkdown(methodUnwrap(s.use))}</div>` : "";
+  return {
+    id: `skill:${s.name}`, name: s.name, mono: true, summary: s.summary, tags, repeats: !!long && sysRepeats(s.summary, s.description),
+    body: long + use + sysKv([["Files", (s.files || []).map(sysCode).join(" ")], ["Runs in", s.image ? sysCode(s.image) : ""],
+                              ["Replaces", s.supersedes ? sysCode(s.supersedes) : ""]]),
+    text: sysSearchText([s.name, s.summary, s.description, s.use, s.category, ...(s.files || [])]),
+  };
+}
+
+function sysItemHtml(it) {
+  const tags = (it.tags || []).filter((g) => g.text).map((g) =>
+    `<span class="sys-tag${g.cls ? " " + g.cls : ""}"${g.title ? ` title="${escapeHtml(g.title)}"` : ""}>${escapeHtml(g.text)}</span>`).join("");
+  return `<details class="sys-item${it.repeats ? " repeats" : ""}" data-id="${escapeHtml(it.id)}" data-q="${escapeHtml(it.text)}">` +
+    `<summary><span class="sys-item-name${it.mono ? " mono" : ""}">${escapeHtml(it.name)}</span>` +
+    `<span class="sys-item-sum">${escapeHtml(it.summary || "")}</span>` +
+    (tags ? `<span class="sys-item-tags">${tags}</span>` : "") + `</summary>` +
+    `<div class="sys-item-body">${it.body}</div></details>`;
+}
+
+function sysCatalogHtml(d) {
+  const lists = [
+    ["pipelines", "Pipelines", "The protocols the PI picks from for a request", (d.pipelines || []).map(sysPipelineItem)],
+    ["tools", "Tools", "What the Scientist can call, and where each one runs", (d.tools || []).map(sysToolItem)],
+    ["skills", "Skills", "Templates the Scientist fetches when a step needs one", (d.skills || []).map(sysSkillItem)],
+  ];
+  return `<div class="sys-catalog-head"><h3>Pipelines, tools and skills</h3>` +
+    `<input id="sysSearch" type="search" class="preset-search sys-search" autocomplete="off" ` +
+    `placeholder="Search names, descriptions, where it runs…" aria-label="Search pipelines, tools and skills" /></div>` +
+    lists.map(([key, title, hint, items]) =>
+      `<section class="sys-list" data-list="${key}"><h4>${title} <span class="sys-n" data-total="${items.length}">${items.length}</span>` +
+      `<span class="sys-hint">${escapeHtml(hint)}</span></h4>` +
+      `<div class="sys-items">${items.map(sysItemHtml).join("")}</div>` +
+      `<div class="sys-none hidden">Nothing here matches.</div></section>`).join("");
+}
+
+function sysCatalogFilter(query) {
+  for (const list of document.querySelectorAll("#systemBody .sys-list")) {
+    let shown = 0;
+    for (const row of list.querySelectorAll(".sys-item")) {
+      const hit = sysMatch(query, row.dataset.q || "");
+      row.classList.toggle("hidden", !hit);
+      shown += hit;
+    }
+    const n = list.querySelector(".sys-n");
+    n.textContent = query.trim() ? `${shown} of ${n.dataset.total}` : n.dataset.total;
+    list.querySelector(".sys-items").classList.toggle("hidden", !shown);
+    list.querySelector(".sys-none").classList.toggle("hidden", !!shown);
+  }
+}
+
+// A pipeline's tool opens that tool in the Tools list.
+function sysShowTool(name) {
+  const box = $("sysSearch");
+  box.value = name;
+  sysCatalogFilter(name);
+  const row = document.querySelector(`#systemBody .sys-item[data-id="tool:${CSS.escape(name)}"]`);
+  if (row) { row.open = true; row.scrollIntoView({ behavior: "smooth", block: "center" }); }
+}
+
+function wireSysCatalog() {
+  const body = $("systemBody");
+  body.addEventListener("input", (e) => { if (e.target.id === "sysSearch") sysCatalogFilter(e.target.value); });
+  body.addEventListener("keydown", (e) => {
+    if (e.target.id === "sysSearch" && e.key === "Escape" && e.target.value) { e.target.value = ""; sysCatalogFilter(""); }
+  });
+  body.addEventListener("click", (e) => {
+    const b = e.target.closest("[data-sys-tool]");
+    if (b) sysShowTool(b.dataset.sysTool);
+  });
+}
+
+// ---- Live workflow graph: the pipeline from /api/system, the running tasks from /api/system/live ----
+// The graph is drawn once per /api/system load; the tasks move over it. Its stage nodes are the
+// stages the server moves runs through (gateway/run_monitor.py STAGES), its tool nodes the live
+// catalog grouped by where each tool runs, so the picture is the code's, not a drawing of it.
+const SG = { W: 1040, M: 12, NW: 104, NH: 46, LANE_Y: 74, SIDE_Y0: 140, SIDE_DY: 38, SW: 120, SH: 34,
+  AGENT_Y: 268, AW: 116, AH: 36, PLACE_Y: 330, COLW: 128, ROW_H: 22, HEAD: 30, PAD: 8, GAP: 10, BOTTOM: 14 };
+const SG_COLORS = ["#ad5a2b", "#1f7a8c", "#6b4fbb", "#2f8a4a", "#c0446b", "#b07d12"];
+const SG_ROLE = { plan: "PI", critic: "Critic", scientist: "Scientist", audit: "Claim auditor",
+  writer: "Writer", classify: "Router", literature: "Literature", chat: "Chat", reason: "Model" };
+
+// Positions for every node and a path for every edge. Pure: the same graph always lays out the same.
+function sysGraphLayout(graph) {
+  const nodes = (graph && graph.nodes) || [];
+  const byType = (t) => nodes.filter((n) => n.type === t);
+  const stages = byType("stage").slice().sort((a, b) => ((a.meta || {}).order || 0) - ((b.meta || {}).order || 0));
+  const isMain = (n) => ((n.meta || {}).kinds || []).includes("research");
+  const main = stages.filter(isMain), side = stages.filter((n) => !isMain(n));
+  const pos = {};
+  const step = main.length > 1 ? (SG.W - 2 * SG.M - SG.NW) / (main.length - 1) : 0;
+  main.forEach((n, i) => { pos[n.id] = { x: SG.M + SG.NW / 2 + i * step, y: SG.LANE_Y, w: SG.NW, h: SG.NH, kind: "stage" }; });
+  const first = main[0] ? pos[main[0].id] : { x: SG.M + SG.NW / 2, y: SG.LANE_Y };
+  const last = main.length ? pos[main[main.length - 1].id] : first;
+  const sideX = main.length > 3 ? (pos[main[2].id].x + pos[main[3].id].x) / 2 : SG.W / 2;
+  side.forEach((n, i) => { pos[n.id] = { x: sideX, y: SG.SIDE_Y0 + i * SG.SIDE_DY, w: SG.SW, h: SG.SH, kind: "side" }; });
+
+  const exec = pos.execute || { x: SG.W / 2 };
+  const agentX = { scientist: exec.x, critic: exec.x + 168, model: exec.x - 190 };
+  byType("agent").forEach((n, i) => {
+    pos[n.id] = { x: agentX[n.id] != null ? agentX[n.id] : SG.M + SG.AW / 2 + i * (SG.AW + 20), y: SG.AGENT_Y, w: SG.AW, h: SG.AH, kind: "agent" };
+  });
+
+  // Places as boxes of tool chips, packed into rows and centred; a big box gets more columns.
+  const tools = byType("tool");
+  const boxes = byType("place").map((p) => {
+    const chips = tools.filter((t) => (t.meta || {}).place === p.id);
+    const cols = chips.length > 8 ? 3 : chips.length > 4 ? 2 : 1;
+    const rows = Math.max(1, Math.ceil(chips.length / cols));
+    const inner = cols * SG.COLW + SG.PAD * 2 - 8;
+    // Wide enough for its title too (10.5px bold ≈ 6.4px a character), chips centred under it.
+    const w = Math.max(inner, Math.ceil(String(p.label || "").length * 6.4 + 22));
+    return { p, chips, cols, w, inset: (w - inner) / 2, h: SG.HEAD + rows * SG.ROW_H + SG.PAD };
+  });
+  const rowsOfBoxes = [];
+  let cur = [], width = 0;
+  boxes.forEach((b) => {
+    const need = (cur.length ? SG.GAP : 0) + b.w;
+    if (cur.length && width + need > SG.W - 2 * SG.M) { rowsOfBoxes.push(cur); cur = []; width = 0; }
+    width += (cur.length ? SG.GAP : 0) + b.w;
+    cur.push(b);
+  });
+  if (cur.length) rowsOfBoxes.push(cur);
+  let y = SG.PLACE_Y;
+  rowsOfBoxes.forEach((row) => {
+    const total = row.reduce((s, b) => s + b.w, 0) + SG.GAP * (row.length - 1);
+    let x = (SG.W - total) / 2;
+    const rowH = Math.max(...row.map((b) => b.h));
+    row.forEach((b) => {
+      pos[b.p.id] = { x: x + b.w / 2, y: y + b.h / 2, w: b.w, h: b.h, kind: "place" };
+      b.chips.forEach((t, i) => {
+        const c = i % b.cols, r = Math.floor(i / b.cols);
+        pos[t.id] = { x: x + b.inset + SG.PAD + c * SG.COLW + (SG.COLW - 8) / 2, y: y + SG.HEAD + r * SG.ROW_H + 9,
+          w: SG.COLW - 8, h: 18, kind: "tool" };
+      });
+      x += b.w + SG.GAP;
+    });
+    y += rowH + SG.GAP;
+  });
+  const height = Math.ceil(y - SG.GAP + SG.BOTTOM);
+
+  const edges = [];
+  ((graph && graph.edges) || []).forEach((e, i) => {
+    const a = pos[e.source], b = pos[e.target];
+    if (!a || !b || e.type === "pipeline") return;   // the scRNA order is the chips' own order
+    let d = "", lx = (a.x + b.x) / 2, ly = (a.y + b.y) / 2;
+    if (e.type === "skip") {
+      const top = SG.LANE_Y - SG.NH / 2, x1 = a.x + 14, x2 = b.x - 14, peak = top - 30;
+      d = `M${x1},${top} C${x1},${peak} ${x2},${peak} ${x2},${top}`;
+      lx = (x1 + x2) / 2; ly = peak + 6;
+    } else if (a.kind === "stage" && b.kind === "stage") {
+      d = `M${a.x + a.w / 2},${a.y} L${b.x - b.w / 2},${b.y}`;
+    } else if (b.kind === "side") {          // request -> a side lane: down, then right
+      const r = 10, x0 = a.x, y1 = b.y;
+      d = `M${x0},${a.y + a.h / 2} L${x0},${y1 - r} Q${x0},${y1} ${x0 + r},${y1} L${b.x - b.w / 2},${y1}`;
+    } else if (a.kind === "side") {          // a side lane -> done: right, then up
+      const r = 10, x1 = b.x, y0 = a.y;
+      d = `M${a.x + a.w / 2},${y0} L${x1 - r},${y0} Q${x1},${y0} ${x1},${y0 - r} L${x1},${b.y + b.h / 2}`;
+    } else if (e.source === "scientist" && e.target === "critic") {
+      d = `M${a.x + a.w / 2},${a.y - 6} C${a.x + a.w / 2 + 26},${a.y - 22} ${b.x - b.w / 2 - 26},${b.y - 22} ${b.x - b.w / 2},${b.y - 6}`;
+      ly = a.y - 22;
+    } else if (e.source === "critic" && e.target === "scientist") {
+      d = `M${a.x - a.w / 2},${a.y + 6} C${a.x - a.w / 2 - 26},${a.y + 22} ${b.x + b.w / 2 + 26},${b.y + 22} ${b.x + b.w / 2},${b.y + 6}`;
+      ly = a.y + 24;
+    } else if (b.kind === "place") {
+      const y0 = a.y + a.h / 2, y1 = b.y - b.h / 2;
+      d = `M${a.x},${y0} C${a.x},${(y0 + y1) / 2} ${b.x},${(y0 + y1) / 2} ${b.x},${y1}`;
+      lx = null;
+    } else {
+      d = `M${a.x},${a.y + a.h / 2} L${b.x},${b.y - b.h / 2}`;
+    }
+    edges.push({ id: "e" + i, source: e.source, target: e.target, type: e.type, label: e.label || "", d, lx, ly });
+  });
+  return { width: SG.W, height, pos, edges, first, last };
+}
+
+function _sgAvail(n) { return (n.meta || {}).available === false; }
+
+// The static picture: lanes, agents, places with their tools. Tasks go in the #sgTasks layer.
+function sysGraphSvg(graph, layout) {
+  const L = layout, P = L.pos, out = [];
+  out.push(`<svg class="sg" viewBox="0 0 ${L.width} ${L.height}" role="img" aria-label="Workflow graph with the running tasks">`);
+  out.push('<defs><marker id="sgArrow" viewBox="0 0 8 8" refX="7" refY="4" markerWidth="7" markerHeight="7" orient="auto-start-reverse">' +
+    '<path d="M0,0 L8,4 L0,8 z" class="sg-arrowhead"/></marker></defs>');
+  out.push('<g class="sg-edges">');
+  // The side lanes cross the Run steps → Scientist line: drawn last, over a halo, they read as a bridge.
+  const isSide = (e) => (P[e.source] || {}).kind === "side" || (P[e.target] || {}).kind === "side";
+  [...L.edges.filter((e) => !isSide(e)), ...L.edges.filter(isSide)].forEach((e) => {
+    const arrow = e.type === "tool" ? "" : ' marker-end="url(#sgArrow)"';
+    if (isSide(e)) out.push(`<path class="sg-edge-halo" d="${e.d}"/>`);
+    out.push(`<path class="sg-edge sg-e-${escapeHtml(e.type)}" data-edge="${escapeHtml(e.source)}>${escapeHtml(e.target)}" d="${e.d}"${arrow}/>`);
+    if (e.label && e.lx != null) out.push(`<text class="sg-elabel" x="${e.lx}" y="${e.ly}">${escapeHtml(e.label)}</text>`);
+  });
+  out.push('</g><g class="sg-links" id="sgLinks"></g><g class="sg-nodes">');
+  (graph.nodes || []).forEach((n) => {
+    const p = P[n.id];
+    if (!p) return;
+    const m = n.meta || {}, x = p.x - p.w / 2, y = p.y - p.h / 2;
+    const attrs = `data-node="${escapeHtml(n.id)}" tabindex="0" role="button" aria-label="${escapeHtml(n.label)}"`;
+    if (p.kind === "place") {
+      out.push(`<g class="sg-node sg-place" ${attrs}><rect x="${x}" y="${y}" width="${p.w}" height="${p.h}" rx="12"/>` +
+        `<text class="sg-place-label" x="${x + 10}" y="${y + 19}">${escapeHtml(n.label)}</text></g>`);
+    } else if (p.kind === "tool") {
+      out.push(`<g class="sg-node sg-tool${_sgAvail(n) ? " sg-off" : ""}" ${attrs}><rect x="${x}" y="${y}" width="${p.w}" height="${p.h}" rx="6"/>` +
+        `<text x="${p.x}" y="${p.y + 3.5}">${escapeHtml(n.label)}</text></g>`);
+    } else {
+      const sub = p.kind === "agent"
+        ? (n.id === "model" ? "every role" : n.id === "scientist" ? `${(m.specialists || []).length} specialists` : "judges each step")
+        : (m.roles || []).map((r) => SG_ROLE[r] || r).join(" · ");
+      const rx = p.kind === "agent" ? p.h / 2 : 12;
+      out.push(`<g class="sg-node sg-${p.kind}" ${attrs}><rect x="${x}" y="${y}" width="${p.w}" height="${p.h}" rx="${rx}"/>` +
+        `<text class="sg-label" x="${p.x}" y="${p.y + (sub ? -2 : 4)}">${escapeHtml(n.label)}</text>` +
+        (sub ? `<text class="sg-sub" x="${p.x}" y="${p.y + 12}">${escapeHtml(sub)}</text>` : "") + "</g>");
+    }
+  });
+  out.push('</g><g class="sg-tasks" id="sgTasks"></g></svg>');
+  return out.join("");
+}
+
+const SG_PER_NODE = 4;          // dots drawn on one node; the rest are a "+n"
+const SG_DONE_LINGER = 90;      // seconds a finished run's dot stays on Done (its card stays 10 minutes)
+
+// Where each run's markers go, and what lights up. Pure (no DOM), so it is tested under node.
+// ``now`` is the server's clock in seconds. Returns { tokens: [{key, run, node, x, y, color, cls, title}],
+// more: [{node, count, x, y}], hot: {node: "hot"|"waiting"}, links: [...], flows: [...] }.
+function sysTaskTargets(graph, layout, runs, now) {
+  const P = layout.pos, has = (id) => !!P[id];
+  const tokens = [], hot = {}, links = [], flows = [], more = {};
+  const atNode = {};
+  const place = (key, run, nodeId, cls, title) => {
+    const p = P[nodeId];
+    if (!p) return;
+    if (!run.ended) hot[nodeId] = hot[nodeId] === "waiting" || cls.includes("waiting") ? "waiting" : "hot";
+    const k = atNode[nodeId] = (atNode[nodeId] || 0) + 1;
+    if (k > SG_PER_NODE) { more[nodeId] = (more[nodeId] || 0) + 1; return; }
+    const small = p.kind === "tool";
+    const x = p.x + p.w / 2 - (small ? 9 : 12) - (k - 1) * (small ? 15 : 19);
+    const y = p.y - p.h / 2 + (small ? 1 : 0);
+    tokens.push({ key, run: run.ordinal, node: nodeId, x, y, color: run.color, cls, title, small });
+  };
+  (runs || []).forEach((r) => {
+    const label = r.mine ? (r.question || "Your run") : (r.owner ? `${r.owner}'s run` : "Another account's run");
+    if (r.ended) {
+      // A finished run arrives at Done and leaves it after a while, without lighting it.
+      if (now == null || now - r.ended <= SG_DONE_LINGER)
+        place(r.key, r, has("done") ? "done" : r.stage, `sg-tok-ended sg-out-${r.outcome || "ended"}`,
+          `${label} — ${r.outcome || "ended"}`);
+      return;
+    }
+    const lane = r.kind === "research" ? null : r.kind;           // literature / chat / corpus
+    // A literature run waits for its plan's review on the main line first; its lane once approved.
+    const home = lane && has(lane) && (lane !== "literature" || r.stage === "literature") ? lane : null;
+    const active = r.active || [];
+    if (active.length && ["execute", "literature", "chat", "corpus"].includes(r.stage)) {
+      active.forEach((a, i) => {
+        const key = i === 0 ? r.key : `${r.key}:${a.n || i}`;
+        const stepTxt = a.step ? `Step ${a.n ? a.n + ": " : ""}${a.step}` : "";
+        let nodeId = home || "scientist";
+        if (a.phase === "tool" && has("tool:" + a.tool)) nodeId = "tool:" + a.tool;
+        else if (a.phase === "critic" && has("critic")) nodeId = "critic";
+        const what = a.phase === "tool" ? `running ${a.tool}` : a.phase === "critic" ? "the Critic is judging it" : "the model is choosing the next action";
+        place(key, r, nodeId, `sg-tok-${a.phase}`, [label, stepTxt, what].filter(Boolean).join(" — "));
+        if (a.phase === "tool" && nodeId.startsWith("tool:")) links.push({ from: home || "scientist", to: nodeId, color: r.color, cls: "sg-link-tool" });
+        if (a.phase === "model" && has("model")) links.push({ from: "model", to: nodeId, color: r.color, cls: "sg-link-model" });
+      });
+    } else {
+      const nodeId = home || (has(r.stage) ? r.stage : "request");
+      place(r.key, r, nodeId, r.waiting ? "sg-tok-waiting" : "sg-tok-stage",
+        `${label} — ${r.stage_label || r.stage}${r.waiting ? " (waiting for you)" : ""}`);
+      if ((r.llm && (r.llm.thinking || []).length) && has("model")) links.push({ from: "model", to: nodeId, color: r.color, cls: "sg-link-model" });
+    }
+    // The lane edge the run came in on keeps flowing while it is in that stage.
+    const into = (layout.edges || []).find((e) => e.target === (home || r.stage) && e.type === "flow");
+    if (into) flows.push(`${into.source}>${into.target}`);
+  });
+  const extra = Object.entries(more).map(([node, count]) => {
+    const p = P[node], small = p.kind === "tool";
+    return { node, count, x: p.x + p.w / 2 - (small ? 9 : 12) - SG_PER_NODE * (small ? 15 : 19), y: p.y - p.h / 2 };
+  });
+  return { tokens, more: extra, hot, links, flows };
+}
+
+function _sgLinkPath(P, from, to) {
+  const a = P[from], b = P[to];
+  if (!a || !b) return "";
+  const y0 = a.y + (b.y > a.y ? a.h / 2 : -a.h / 2), y1 = b.y + (b.y > a.y ? -b.h / 2 : b.h / 2);
+  const x0 = a.x + (b.x - a.x) * 0.15, x1 = b.x;
+  return `M${x0},${y0} C${x0},${(y0 + y1) / 2} ${x1},${(y0 + y1) / 2} ${x1},${y1}`;
+}
+
+const sysLive = { timer: null, graph: null, layout: null, runs: [], now: null, selected: null, failed: 0, node: null };
 
 function renderWorkflowGraph(graph) {
   const host = $("systemGraph");
   if (!host) return;
-  if (typeof cytoscape === "undefined") { host.innerHTML = '<div class="empty-hint">Graph library not loaded.</div>'; return; }
   if (!graph || !(graph.nodes || []).length) { host.innerHTML = '<div class="empty-hint">No workflow graph.</div>'; return; }
-  if (_cy) { try { _cy.destroy(); } catch {} _cy = null; }
-  host.innerHTML = "";
-  const elements = [];
-  graph.nodes.forEach((n) => elements.push({ data: {
-    id: n.id, label: n.label, ntype: n.type, meta: n.meta || {},
-    dim: n.type === "tool" && n.meta && n.meta.available === false,
-  } }));
-  graph.edges.forEach((e, i) => elements.push({ data: {
-    id: "e" + i, source: e.source, target: e.target, label: e.label || "", etype: e.type || "flow",
-  } }));
-  const roots = graph.nodes.filter((n) => n.type === "preset").map((n) => n.id);
-  _cy = cytoscape({
-    container: host,
-    elements,
-    wheelSensitivity: 0.2,
-    style: [
-      { selector: "node", style: {
-        label: "data(label)", "font-size": "10px", "text-wrap": "wrap", "text-max-width": "120px",
-        "text-valign": "center", "text-halign": "center", shape: "round-rectangle",
-        width: "label", height: "label", padding: "9px", color: "#1E1E1E",
-        "background-color": (n) => _GRAPH_FILL[n.data("ntype")] || "#C2E5FF",
-        "border-color": (n) => _GRAPH_STROKE[n.data("ntype")] || "#3DADFF", "border-width": 1.4,
-      } },
-      { selector: "node[?dim]", style: { opacity: 0.45, "border-style": "dashed" } },
-      { selector: "node:selected", style: { "border-width": 3, "border-color": "#1E1E1E" } },
-      { selector: "edge", style: {
-        label: "data(label)", "font-size": "8px", color: "#8a929c", "curve-style": "bezier",
-        "target-arrow-shape": "triangle", width: 1.2, "line-color": "#b8bfc8", "target-arrow-color": "#b8bfc8",
-        "text-background-color": "#ffffff", "text-background-opacity": 1, "text-background-padding": "1px",
-      } },
-      { selector: 'edge[etype="steer"]', style: { "line-style": "dashed", "line-color": "#FF9E42", "target-arrow-color": "#FF9E42" } },
-      { selector: 'edge[etype="persona"]', style: { "line-style": "dashed", "line-color": "#FFC943", "target-arrow-color": "#FFC943" } },
-      { selector: 'edge[etype="tool"]', style: { "line-style": "dashed", "line-color": "#66D575", "target-arrow-color": "#66D575" } },
-      { selector: 'edge[etype="pipeline"]', style: { "line-color": "#3DADFF", "target-arrow-color": "#3DADFF", width: 2 } },
-    ],
-    layout: { name: "breadthfirst", directed: true, roots: roots.length ? roots : undefined, spacingFactor: 1.15, padding: 14 },
-  });
-  _cy.on("tap", "node", (ev) => showGraphNodeInfo(ev.target.data()));
-  _cy.fit(undefined, 24);
+  sysLive.graph = graph;
+  sysLive.layout = sysGraphLayout(graph);
+  host.innerHTML = sysGraphSvg(graph, sysLive.layout);
+  host.onclick = (ev) => {
+    const g = ev.target.closest("[data-node]");
+    if (g) { sysLive.node = g.dataset.node; showGraphNodeInfo(g.dataset.node); }
+  };
+  host.onkeydown = (ev) => {
+    const g = ev.target.closest && ev.target.closest("[data-node]");
+    if (g && (ev.key === "Enter" || ev.key === " ")) { ev.preventDefault(); sysLive.node = g.dataset.node; showGraphNodeInfo(g.dataset.node); }
+  };
+  paintSystemTasks();
 }
 
-function showGraphNodeInfo(d) {
+// Colour and number each run once, so a run keeps its marker while others come and go.
+const _sgOrdinals = {};
+let _sgNextOrdinal = 1;
+function _sgDecorate(runs) {
+  return (runs || []).map((r) => {
+    if (!_sgOrdinals[r.key]) _sgOrdinals[r.key] = _sgNextOrdinal++;
+    const ordinal = _sgOrdinals[r.key];
+    return { ...r, ordinal, color: SG_COLORS[(ordinal - 1) % SG_COLORS.length] };
+  });
+}
+
+function paintSystemTasks() {
+  const L = sysLive.layout, svg = document.querySelector("#systemGraph svg.sg");
+  if (!L || !svg) return;
+  const t = sysTaskTargets(sysLive.graph, L, sysLive.runs, sysLive.now);
+  svg.querySelectorAll(".sg-node").forEach((g) => {
+    const h = t.hot[g.dataset.node];
+    g.classList.toggle("is-hot", h === "hot");
+    g.classList.toggle("is-waiting", h === "waiting");
+  });
+  const flowing = new Set(t.flows);
+  svg.querySelectorAll(".sg-edge").forEach((p) => p.classList.toggle("is-flowing", flowing.has(p.dataset.edge)));
+  $("sgLinks").innerHTML = t.links.map((l) =>
+    `<path class="sg-link ${l.cls}" d="${_sgLinkPath(L.pos, l.from, l.to)}" style="stroke:${l.color}"/>`).join("");
+  // Markers are kept by key and moved, so a step travelling from the Scientist to a tool to the
+  // Critic glides there instead of blinking.
+  const layer = $("sgTasks"), seen = new Set();
+  t.tokens.forEach((k) => {
+    seen.add(k.key);
+    let g = layer.querySelector(`[data-key="${CSS.escape(k.key)}"]`);
+    if (!g) {
+      g = document.createElementNS("http://www.w3.org/2000/svg", "g");
+      g.setAttribute("data-key", k.key);
+      g.innerHTML = '<circle class="sg-tok-halo" r="13"/><circle class="sg-tok-dot" r="9"/><text class="sg-tok-num" y="3.5"></text><title></title>';
+      const start = L.pos.request || L.first;
+      g.style.transform = `translate(${start.x}px, ${start.y - SG.NH / 2}px)`;
+      layer.appendChild(g);
+      g.getBoundingClientRect();     // commit the start position so the move below animates
+    }
+    g.setAttribute("class", `sg-token ${k.cls}${k.small ? " sg-tok-small" : ""}${sysLive.selected === k.key.split(":")[0] ? " is-selected" : ""}`);
+    g.style.transform = `translate(${k.x}px, ${k.y}px)`;
+    g.style.setProperty("--tok", k.color);
+    g.querySelector(".sg-tok-dot").setAttribute("r", k.small ? "7.5" : "9");
+    g.querySelector(".sg-tok-num").textContent = String(k.run);
+    g.querySelector("title").textContent = k.title;
+  });
+  layer.querySelectorAll(".sg-token").forEach((g) => { if (!seen.has(g.dataset.key)) g.remove(); });
+  layer.querySelectorAll(".sg-more").forEach((g) => g.remove());
+  t.more.forEach((m) => layer.insertAdjacentHTML("beforeend",
+    `<text class="sg-more" x="${m.x}" y="${m.y + 4}">+${m.count}</text>`));
+}
+
+function _sgAgo(sec) {
+  if (sec < 60) return `${Math.max(0, Math.round(sec))}s`;
+  if (sec < 3600) return `${Math.floor(sec / 60)}m ${String(Math.floor(sec % 60)).padStart(2, "0")}s`;
+  return `${Math.floor(sec / 3600)}h ${String(Math.floor((sec % 3600) / 60)).padStart(2, "0")}m`;
+}
+
+const SG_KIND = { research: "Research", literature: "Literature", chat: "Chat", corpus: "Corpus scan" };
+const SG_OUTCOME = { finished: "Finished", stopped: "Stopped", cancelled: "Cancelled", failed: "Failed", ended: "Ended" };
+
+// One card in "Running now". ``now`` is the server's clock (seconds), so elapsed times are the
+// server's, whatever the viewer's clock says.
+function sysRunCardHtml(r, now) {
+  const who = r.mine ? "" : `<span class="sr-who">${escapeHtml(r.owner ? r.owner : "another account")}</span>`;
+  const head = `<span class="sr-dot" style="background:${r.color}">${r.ordinal}</span>` +
+    `<span class="sr-kind">${escapeHtml(SG_KIND[r.kind] || r.kind)}</span>${who}` +
+    `<span class="sr-stage${r.waiting ? " waiting" : ""}">${escapeHtml(r.ended ? (SG_OUTCOME[r.outcome] || "Ended") : r.stage_label || r.stage)}</span>` +
+    `<span class="sr-time">${r.ended ? _sgAgo(now - r.ended) + " ago" : _sgAgo(now - r.started)}</span>`;
+  const q = r.question ? `<div class="sr-q" title="${escapeHtml(r.question)}">${escapeHtml(r.question)}</div>` : "";
+  const lines = [];
+  if (!r.ended) {
+    const whom = r.mine ? "you" : "its owner";
+    if (r.waiting === "plan") lines.push(`Waiting for ${whom} to review the plan.`);
+    else if (r.waiting === "confirm") lines.push(`Waiting for ${whom} to confirm an action.`);
+    (r.active || []).forEach((a) => {
+      const what = a.phase === "tool" ? `<code>${escapeHtml(a.tool)}</code>` : a.phase === "critic" ? "Critic judging" : "model thinking";
+      const step = a.n ? `Step ${a.n}` : a.step ? "Step" : "";
+      const spec = a.specialist && a.specialist !== "Scientist" ? ` · ${escapeHtml(a.specialist)}` : "";
+      lines.push(`${step ? `<b>${step}</b>${spec} · ` : ""}${what} <span class="muted">${_sgAgo(now - a.since)}</span>` +
+        (a.step ? `<div class="sr-step" title="${escapeHtml(a.step)}">${escapeHtml(a.step)}</div>` : ""));
+    });
+    if (!(r.active || []).length && r.llm && (r.llm.thinking || []).length)
+      lines.push(`${escapeHtml(r.llm.thinking.map((x) => SG_ROLE[x] || x).join(", "))} thinking <span class="muted">${_sgAgo(now - r.stage_since)}</span>`);
+  }
+  const s = r.steps || {};
+  const bar = s.total ? `<div class="sr-bar" title="${s.accepted} of ${s.total} steps accepted"><span style="width:${Math.min(100, Math.round(100 * s.accepted / s.total))}%;background:${r.color}"></span></div>` +
+    `<div class="sr-meta">${s.accepted}/${s.total} steps accepted · ${r.tools_called || 0} tool call${r.tools_called === 1 ? "" : "s"}${r.tool_errors ? ` · ${r.tool_errors} failed` : ""}</div>` : "";
+  const last = (r.recent || []).slice(-1)[0];
+  const note = last && !r.ended ? `<div class="sr-note">${escapeHtml(last.text)}</div>` : "";
+  return `<div class="sr-card${r.ended ? " ended" : ""}${sysLive.selected === r.key ? " selected" : ""}" data-run="${escapeHtml(r.key)}" tabindex="0">` +
+    `<div class="sr-head">${head}</div>${q}${lines.map((l) => `<div class="sr-line">${l}</div>`).join("")}${bar}${note}</div>`;
+}
+
+function paintSystemRuns(data) {
+  const el = $("systemRuns");
+  if (!el) return;
+  const now = (data && data.now) || Date.now() / 1000;
+  const runs = sysLive.runs;
+  const live = runs.filter((r) => !r.ended), ended = runs.filter((r) => r.ended).slice(0, 6);
+  const head = `<div class="sr-title">Running now <span class="muted">${live.length ? live.length : "nothing"}` +
+    `${data && data.sessions != null ? ` · ${data.sessions} session${data.sessions === 1 ? "" : "s"} open` : ""}</span></div>`;
+  el.innerHTML = head + (live.length ? live.map((r) => sysRunCardHtml(r, now)).join("")
+    : '<div class="empty-hint sr-empty">No task is running. Start one in Research and watch it move through the graph.</div>') +
+    (ended.length ? `<div class="sr-sub">Finished in the last 10 minutes</div>${ended.map((r) => sysRunCardHtml(r, now)).join("")}` : "");
+}
+
+async function pollSystemLive() {
+  if (document.hidden || !$("view-system").classList.contains("active")) return;
+  try {
+    const res = await fetch("/api/system/live", { cache: "no-store" });
+    if (res.status === 401) { $("systemRuns").innerHTML = '<div class="empty-hint">Sign in to see the running tasks.</div>'; return; }
+    const data = await res.json();
+    sysLive.failed = 0;
+    sysLive.runs = _sgDecorate(data.runs || []);
+    sysLive.now = data.now;
+    paintSystemTasks();
+    paintSystemRuns(data);
+    if (sysLive.node) showGraphNodeInfo(sysLive.node);
+  } catch {
+    if (++sysLive.failed === 3) $("systemRuns").innerHTML = '<div class="empty-hint">Lost contact with the server — retrying.</div>';
+  }
+}
+
+function startSystemLive() {
+  stopSystemLive();
+  pollSystemLive();
+  sysLive.timer = setInterval(pollSystemLive, 1500);
+}
+function stopSystemLive() {
+  if (sysLive.timer) { clearInterval(sysLive.timer); sysLive.timer = null; }
+}
+
+function showGraphNodeInfo(id) {
   const box = $("systemGraphInfo");
-  if (!box) return;
-  const m = d.meta || {};
-  const rows = [`<div class="gi-title">${escapeHtml(d.label)} <span class="gi-type">${escapeHtml(d.ntype)}</span></div>`];
+  const n = sysLive.graph && (sysLive.graph.nodes || []).find((x) => x.id === id);
+  if (!box || !n) return;
+  const m = n.meta || {};
+  const type = { stage: "stage", agent: "agent", place: "where tools run", tool: "tool" }[n.type] || n.type;
+  const rows = [`<div class="gi-title">${escapeHtml(n.label)} <span class="gi-type">${escapeHtml(type)}</span></div>`];
+  if (m.kinds) rows.push(`<div><span class="gi-k">runs</span> ${m.kinds.map((k) => escapeHtml(SG_KIND[k] || k)).join(", ")}</div>`);
   if (m.category) rows.push(`<div><span class="gi-k">category</span> ${escapeHtml(m.category)}</div>`);
-  if (m.where) rows.push(`<div><span class="gi-k">where</span> <code>${escapeHtml(m.where)}</code></div>`);
-  if (typeof m.available === "boolean") rows.push(`<div><span class="gi-k">status</span> <span class="cap ${m.available ? "on" : "off"}">${m.available ? "available" : "unavailable"}</span></div>`);
+  if (m.place) {
+    const pl = (sysLive.graph.nodes || []).find((x) => x.id === m.place);
+    rows.push(`<div><span class="gi-k">runs on</span> ${escapeHtml(pl ? pl.label : m.runs_on)}</div>`);
+  }
+  if (m.where) rows.push(`<div><span class="gi-k">code</span> <code>${escapeHtml(m.where)}</code></div>`);
+  if (typeof m.available === "boolean") rows.push(`<div><span class="gi-k">here</span> <span class="cap ${m.available ? "on" : "off"}">${m.available ? "available" : "unavailable"}</span></div>`);
   if (m.reads_private_data) rows.push('<div><span class="tag-priv">reads private data</span></div>');
   if (m.requires && m.requires.length) rows.push(`<div><span class="gi-k">needs</span> ${m.requires.map(escapeHtml).join(", ")}</div>`);
   if (m.description) rows.push(`<div class="gi-desc">${escapeHtml(m.description)}</div>`);
+  if (m.roles && m.roles.length && typeof m.roles[0] === "object")
+    rows.push(`<div class="gi-list">${m.roles.map((r) => `<div><b>${escapeHtml(SG_ROLE[r.role] || r.role)}</b> — ${escapeHtml(r.does)}</div>`).join("")}</div>`);
+  if (m.specialists && m.specialists.length)
+    rows.push(`<div class="gi-list">${m.specialists.map((s) => `<div><b>${escapeHtml(s.name)}</b></div>`).join("")}</div>`);
+  if (m.pipelines && m.pipelines.length)
+    rows.push(`<div class="gi-list"><div class="gi-k">pipelines it can follow</div>${m.pipelines.map((p) => `<div>${escapeHtml(p.label)}</div>`).join("")}</div>`);
+  if (n.type === "place") {
+    const tools = (sysLive.graph.nodes || []).filter((x) => x.type === "tool" && (x.meta || {}).place === n.id);
+    rows.push(`<div class="gi-list">${tools.map((t) => `<div><code>${escapeHtml(t.label)}</code></div>`).join("")}</div>`);
+  }
+  const here = sysTaskTargets(sysLive.graph, sysLive.layout, sysLive.runs, sysLive.now).tokens.filter((k) => k.node === id);
+  if (here.length) rows.push(`<div class="gi-here"><div class="gi-k">here now</div>${here.map((k) =>
+    `<div><span class="sr-dot small" style="background:${k.color}">${k.run}</span> ${escapeHtml(k.title)}</div>`).join("")}</div>`);
   box.innerHTML = rows.join("");
+}
+
+function onSystemRunsClick(e) {
+  const card = e.target.closest("[data-run]");
+  if (!card) return;
+  sysLive.selected = sysLive.selected === card.dataset.run ? null : card.dataset.run;
+  paintSystemTasks();
+  document.querySelectorAll("#systemRuns .sr-card").forEach((c) => c.classList.toggle("selected", c.dataset.run === sysLive.selected));
 }
 
 // ---- Datasets view ----
@@ -5324,15 +7069,83 @@ async function loadDatasets() {
   const el = $("datasetsList"); el.innerHTML = '<div class="empty-hint">Loading…</div>';
   try {
     const items = (await (await fetch("/api/datasets")).json()).datasets || [];
-    el.innerHTML = items.length ? items.map((x) =>
-      `<div class="card"><div class="card-main"><strong>${icon(datasetIcon(x.kind))} ${escapeHtml(x.name)}${isFolderKind(x.kind) ? "/" : ""}</strong>` +
-      `<span class="muted">${escapeHtml(x.kind)} · ${(x.size_bytes / 1e6).toFixed(1)} MB · ${fmtDate(x.uploaded_at)}</span></div>` +
+    el.innerHTML = items.length ? items.map((x) => {
+      const from = chatLabel(x.conversation_id);
+      const fromHtml = !from ? ""
+        : from.open ? ` · <button type="button" class="upload-chat" data-open-chat="${escapeHtml(String(x.conversation_id))}" title="Open the chat this upload was started from">${escapeHtml(from.text)}</button>`
+        : ` · ${escapeHtml(from.text)}`;
+      const q = sysSearchText([x.name, x.kind, x.location === "hpc3" ? "on hpc3" : "on the server", from && from.text,
+                               fmtDate(x.uploaded_at), (x.uploaded_at || "").slice(0, 10)]);
+      return `<div class="card" data-q="${escapeHtml(q)}"><div class="card-main"><strong>${icon(datasetIcon(x.kind))} ${escapeHtml(x.name)}${isFolderKind(x.kind) ? "/" : ""}</strong>` +
+      `<span class="muted">${escapeHtml(x.kind)} · ${fmtSize(x.size_bytes)} · ${fmtDate(x.uploaded_at)}${fromHtml}${x.location === "hpc3" ? ` · <span title="Kept only on HPC3 so far: it is moved to the server when you connect">on HPC3</span>` : ""}${metadataBadge(x.metadata)}</span></div>` +
+      `<button class="ghost small" data-preview="${x.id}" data-name="${escapeHtml(x.name)}" title="See what this dataset holds">Preview</button>` +
+      `<button class="ghost small" data-meta="${x.id}" title="Review how this dataset is described (Croissant metadata)">Metadata</button>` +
+      `<a class="ghost small" href="/api/datasets/${x.id}/download" download data-dl-size="${Number(x.size_bytes) || 0}" data-name="${escapeHtml(x.name)}" title="${isFolderKind(x.kind) ? "Download the folder as one .zip" : "Download the file"}">Download</a>` +
       `<button class="ghost small" data-use="${escapeHtml(x.path)}" data-name="${escapeHtml(x.name)}" data-kind="${escapeHtml(x.kind)}">Use</button>` +
-      `<button class="ghost small danger" data-del="${x.id}" data-name="${escapeHtml(x.name)}" data-kind="${escapeHtml(x.kind)}">${x.kind.startsWith("server-") ? "Remove" : "Delete"}</button></div>`).join("")
+      `<button class="ghost small danger" data-del="${x.id}" data-path="${escapeHtml(x.path)}" data-name="${escapeHtml(x.name)}" data-kind="${escapeHtml(x.kind)}" data-location="${escapeHtml(x.location || "server")}">${x.kind.startsWith("server-") ? "Remove" : "Delete"}</button></div>`;
+    }).join("")
       : '<div class="empty-hint">No datasets yet — upload one in Research.</div>';
   } catch { el.innerHTML = '<div class="empty-hint">Failed to load.</div>'; }
+  filterCards("datasetsList", "datasetsCount", $("datasetsSearch").value);   // a reload keeps the search
+  loadMcpTokens();
+}
+
+// ---- Files view: two tabs, Datasets (above) and Outputs (what the runs wrote, below) ----
+let filesTab = "datasets";
+function switchFilesTab(tab) {
+  filesTab = tab === "outputs" ? "outputs" : "datasets";
+  document.querySelectorAll(".files-tab").forEach((b) => {
+    const on = b.dataset.filesTab === filesTab;
+    b.classList.toggle("active", on);
+    b.setAttribute("aria-selected", on ? "true" : "false");
+  });
+  document.querySelectorAll(".files-pane").forEach((p) => p.classList.toggle("hidden", p.id !== "filesPane-" + filesTab));
+  if (filesTab === "outputs") loadOutputs();
+}
+function loadFiles() {
+  loadDatasets();
+  if (filesTab === "outputs") loadOutputs();
+}
+
+// The search over a page's list: each card's data-q holds what it is found by (see sysSearchText), and
+// every term must match. Beside the box, "n of N" while a search is on.
+function filterCards(listId, countId, query) {
+  const list = $(listId);
+  if (!list) return;
+  const cards = [...list.children].filter((c) => c.dataset && c.dataset.q !== undefined);
+  let shown = 0;
+  for (const c of cards) {
+    const hit = sysMatch(query, c.dataset.q || "");
+    c.classList.toggle("hidden", !hit);
+    shown += hit;
+  }
+  const searching = !!String(query || "").trim() && cards.length > 0;
+  $(countId).textContent = searching ? `${shown} of ${cards.length}` : "";
+  let none = list.querySelector(":scope > .list-none");
+  if (!none) {
+    none = document.createElement("div");
+    none.className = "empty-hint list-none hidden";
+    none.textContent = "Nothing here matches.";
+    list.appendChild(none);
+  }
+  none.classList.toggle("hidden", !(searching && !shown));
+}
+function wireListSearch(boxId, listId, countId) {
+  const box = $(boxId);
+  box.addEventListener("input", () => filterCards(listId, countId, box.value));
+  box.addEventListener("keydown", (e) => {
+    if (e.key === "Escape" && box.value) { box.value = ""; filterCards(listId, countId, ""); }
+  });
 }
 async function onDatasetsClick(e) {
+  const open = e.target.closest("[data-open-chat]");
+  if (open) { openChat(open.dataset.openChat); return; }
+  const pv = e.target.closest("[data-preview]");
+  if (pv) { openDatasetPreview(`/api/datasets/${Number(pv.dataset.preview)}`, pv.dataset.name || ""); return; }
+  const dl = e.target.closest("[data-dl-size]");
+  if (dl) { if (!confirmLargeDownload(Number(dl.dataset.dlSize), dl.dataset.name)) e.preventDefault(); return; }
+  const meta = e.target.closest("[data-meta]");
+  if (meta) { openMetadata(meta.dataset.meta); return; }
   const b = e.target.closest("[data-use]");
   if (b) {
     addDataset({ name: b.dataset.name || b.dataset.use.split("/").pop(), path: b.dataset.use, kind: b.dataset.kind || "file" });
@@ -5341,20 +7154,380 @@ async function onDatasetsClick(e) {
     return;
   }
   const d = e.target.closest("[data-del]");
-  if (d) {
-    const fromServer = (d.dataset.kind || "").startsWith("server-");
-    const ask = fromServer
-      ? `Remove "${d.dataset.name}" from your datasets?\n\nThe data on the server is not touched. Your HPC3 copy of it is deleted (a later run copies it again).`
-      : `Delete dataset "${d.dataset.name}" from the server?\n\nThis removes the uploaded file and its history. This cannot be undone.`;
-    if (!confirm(ask)) return;
-    try {
-      const res = await fetch("/api/datasets/delete", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ id: Number(d.dataset.del) }) });
-      const j = await res.json();
-      if (!res.ok) { toast(j.error || "Delete failed"); return; }
-      toast("Dataset deleted.");
-      loadDatasets();
-    } catch (err) { toast(isUnreachable(err) ? "Can't reach the local server." : "Delete failed: " + err.message); }
+  if (d && await deleteDatasetRow(d)) loadDatasets();
+}
+
+// Delete the dataset a button names (data-del, -name, -kind, -location, -path), after asking; true
+// when it is gone. Files → Datasets and My account → Storage both use it.
+async function deleteDatasetRow(d) {
+  const fromServer = (d.dataset.kind || "").startsWith("server-");
+  const ask = fromServer
+    ? `Remove "${d.dataset.name}" from your datasets?\n\nThe data on the server is not touched. Your HPC3 copy of it is deleted (a later run copies it again).`
+    : d.dataset.location === "hpc3"
+    ? `Delete dataset "${d.dataset.name}" from your HPC3 storage?\n\nThis removes its files there and its history. This cannot be undone.`
+    : `Delete dataset "${d.dataset.name}" from the server?\n\nThis removes its files on the server (and this session's HPC3 copy) and its history. This cannot be undone.`;
+  if (!confirm(ask)) return false;
+  try {
+    const res = await fetch("/api/datasets/delete", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ id: Number(d.dataset.del) }) });
+    const j = await res.json();
+    if (!res.ok) { toast(j.error || "Delete failed"); return false; }
+    if (d.dataset.path) unbindEverywhere(d.dataset.path);
+    toast("Dataset deleted.");
+    return true;
+  } catch (err) { toast(isUnreachable(err) ? "Can't reach the local server." : "Delete failed: " + err.message); }
+  return false;
+}
+
+// ---- Dataset metadata (Croissant; RCHENLAB/AiScientist issue 9) ----
+// The review form edits only what cannot be measured. Each value the owner has not set says where
+// it came from and how sure the drafting was; the ones to check first are marked.
+const MD_SOURCE_LABEL = {
+  "owner": "yours", "upload-check": "measured at upload", "computed": "measured", "run-record": "from the run",
+  "account": "from your account", "registry": "from the registry", "file-content": "drafted from the file's content",
+  "file-name": "drafted from the file name", "default": "placeholder",
+};
+let mdVocab = null;            // a promise of /api/metadata/vocabulary
+let mdCurrent = null;          // { ref, view } of the open dialog
+
+function metadataBadge(m) {
+  if (!m) return "";
+  if (m.valid === false) return ' · <span class="md-badge md-bad" title="Its croissant.json did not validate">metadata invalid</span>';
+  return m.status === "reviewed"
+    ? ' · <span class="md-badge md-ok">metadata reviewed</span>'
+    : ' · <span class="md-badge md-draft" title="Drafted automatically — review it">metadata draft</span>';
+}
+
+function mdSourceHtml(src) {
+  if (!src || !src.source) return "";
+  const label = MD_SOURCE_LABEL[src.source] || src.source;
+  if (src.reviewed) return `<span class="md-src md-src-owner">${escapeHtml(label)}</span>`;
+  const conf = typeof src.confidence === "number" ? ` · ${Math.round(src.confidence * 100)}% sure` : "";
+  const low = typeof src.confidence === "number" && src.confidence < 0.7;
+  return `<span class="md-src ${low ? "md-src-low" : ""}" title="${escapeHtml(src.detail || "")}">${escapeHtml(label + conf)}${low ? " — check" : ""}</span>`;
+}
+
+function mdFieldHtml(f, value, src, vocab) {
+  const id = `mdf_${f.key}`;
+  const head = `<span class="md-field-head">${escapeHtml(f.label)} ${mdSourceHtml(src)}</span>`;
+  const hint = f.hint ? `<span class="hint-inline md-hint-line">${escapeHtml(f.hint)}</span>` : "";
+  const show = f.show_if ? ` data-show-if="${escapeHtml(f.show_if)}"` : "";
+  if (f.type === "bool") {
+    return `<label class="check"${show}><input id="${id}" name="${f.key}" type="checkbox" ${value ? "checked" : ""}/> ${escapeHtml(f.label)}</label>`;
   }
+  if (f.type === "textarea") {
+    return `<label${show}>${head}<textarea id="${id}" name="${f.key}" rows="3">${escapeHtml(value || "")}</textarea>${hint}</label>`;
+  }
+  if (f.type === "select") {
+    const opts = (vocab.license || []).map((o) =>
+      `<option value="${escapeHtml(o.id)}" ${o.id === value ? "selected" : ""}>${escapeHtml(o.label)}</option>`).join("");
+    return `<label${show}>${head}<select id="${id}" name="${f.key}"><option value="" ${value ? "" : "selected"}>— not chosen (private) —</option>${opts}</select>${hint}</label>`;
+  }
+  const text = Array.isArray(value) ? value.join(", ") : (value || "");
+  const list = f.type === "terms" ? ` list="${id}_list"` : "";
+  const datalist = f.type === "terms"
+    ? `<datalist id="${id}_list">${(vocab[f.vocab] || []).map((t) => `<option value="${escapeHtml(t.label)}">${escapeHtml(t.id)}</option>`).join("")}</datalist>` : "";
+  return `<label${show}>${head}<input id="${id}" name="${f.key}" type="text" value="${escapeHtml(text)}"${list} autocomplete="off" />${datalist}${hint}</label>`;
+}
+
+function mdSyncShowIf() {
+  const human = $("mdf_human_data");
+  document.querySelectorAll("#metadataForm [data-show-if]").forEach((el) => {
+    el.classList.toggle("hidden", !(human && human.checked));
+  });
+}
+
+function renderMetadata(view, vocab) {
+  const form = view.form || { fields: [], values: {}, sources: {}, measured: {}, needs_review: [] };
+  const m = form.measured || {};
+  const files = m.file_count != null ? `${m.file_count} file${m.file_count === 1 ? "" : "s"}` : "files not listed";
+  const sums = m.files_listed ? ` · ${m.files_with_sha256} of ${m.files_listed} with a SHA-256 checksum` : "";
+  const tables = (m.record_sets || []).length
+    ? ` · tables: ${(m.record_sets || []).map((r) => `${escapeHtml(r.name)} (${r.fields} columns)`).join(", ")}` : "";
+  $("metadataTitle").textContent = view.name || "Dataset metadata";
+  $("metadataMeasured").innerHTML = `Measured: ${files} · ${fmtSize(m.size_bytes)}${sums}${tables}. ` +
+    `ID <code>${escapeHtml(view.uuid)}</code>`;
+  const todo = form.needs_review || [];
+  $("metadataHint").innerHTML = view.status === "reviewed" && !todo.length
+    ? "You have reviewed this description."
+    : `Drafted automatically. ${todo.length ? `Check first: <strong>${todo.map((k) => escapeHtml(((form.fields || []).find((f) => f.key === k) || {}).label || k)).join(", ")}</strong>. ` : ""}` +
+      "Never enter a patient's name or identifier, or a path on the server.";
+  $("metadataForm").innerHTML = (form.fields || []).map((f) => mdFieldHtml(f, form.values[f.key], form.sources[f.key], vocab)).join("");
+  mdSyncShowIf();
+  const v = view.validation || {};
+  $("metadataValidation").innerHTML = v.ok
+    ? `${icon("verified")} Valid Croissant 1.1 (checked by ${escapeHtml(v.validator || "")}${(v.warnings || []).length ? `; ${v.warnings.length} warning(s): ${escapeHtml(v.warnings.join("; "))}` : ""}).`
+    : `<span class="md-badge md-bad">Not valid</span> ${escapeHtml((v.errors || []).join("; "))}`;
+  $("metadataDownload").href = `/api/datasets/${encodeURIComponent(view.uuid)}/croissant.json`;
+}
+
+async function openMetadata(ref) {
+  $("metadataError").classList.add("hidden");
+  $("metadataForm").innerHTML = '<div class="storage-loading">Loading…</div>';
+  $("metadataMeasured").textContent = ""; $("metadataHint").textContent = ""; $("metadataValidation").textContent = "";
+  $("metadataModal").classList.remove("hidden");
+  try {
+    if (!mdVocab) mdVocab = fetch("/api/metadata/vocabulary").then((r) => r.json()).catch(() => { mdVocab = null; return {}; });
+    const res = await fetch(`/api/datasets/${encodeURIComponent(ref)}/metadata`);
+    const view = await res.json();
+    if (!res.ok) throw new Error(view.detail || "not found");
+    mdCurrent = { ref, view };
+    renderMetadata(view, await mdVocab);
+  } catch (err) {
+    $("metadataForm").innerHTML = "";
+    $("metadataError").textContent = isUnreachable(err) ? "Can't reach the server." : "Could not load the metadata: " + err.message;
+    $("metadataError").classList.remove("hidden");
+  }
+}
+
+async function saveMetadata(e) {
+  e.preventDefault();
+  if (!mdCurrent) return;
+  const out = {};
+  for (const f of (mdCurrent.view.form || {}).fields || []) {
+    const el = $(`mdf_${f.key}`);
+    if (!el) continue;
+    out[f.key] = f.type === "bool" ? el.checked : el.value;
+  }
+  $("metadataSave").disabled = true;
+  $("metadataError").classList.add("hidden");
+  try {
+    const res = await fetch(`/api/datasets/${encodeURIComponent(mdCurrent.ref)}/metadata`, {
+      method: "PUT", headers: { "Content-Type": "application/json" }, body: JSON.stringify(out) });
+    const view = await res.json();
+    if (!res.ok) throw new Error(view.detail || "save failed");
+    mdCurrent.view = view;
+    renderMetadata(view, await (mdVocab || {}));
+    toast("Metadata saved.");
+    loadDatasets();
+  } catch (err) {
+    $("metadataError").textContent = isUnreachable(err) ? "Can't reach the server." : err.message;
+    $("metadataError").classList.remove("hidden");
+  } finally { $("metadataSave").disabled = false; }
+}
+
+// Personal access tokens for MCP clients.
+async function loadMcpTokens() {
+  const box = $("mcpSection");
+  if (!box) return;
+  try {
+    const res = await fetch("/api/account/tokens");
+    if (!res.ok) { box.classList.add("hidden"); return; }
+    const tokens = (await res.json()).tokens || [];
+    box.classList.remove("hidden");
+    $("mcpTokens").innerHTML = tokens.length ? tokens.map((t) =>
+      `<div class="storage-item"><span class="si-name">${icon("key")} ${escapeHtml(t.name)} <code>${escapeHtml(t.prefix)}…</code></span>` +
+      `<span class="si-size">${t.last_used_at ? "used " + fmtDate(t.last_used_at) : "never used"}</span>` +
+      `<button type="button" class="si-del" data-revoke-token="${t.id}">Revoke</button></div>`).join("")
+      : '<div class="storage-note">No tokens yet.</div>';
+  } catch { box.classList.add("hidden"); }
+}
+
+async function createMcpToken(e) {
+  e.preventDefault();
+  try {
+    const res = await fetch("/api/account/tokens", { method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ name: $("mcpTokenName").value.trim() || "MCP client" }) });
+    const j = await res.json();
+    if (!res.ok) { toast(j.detail || "Could not create a token."); return; }
+    $("mcpTokenName").value = "";
+    const url = `${location.origin}/mcp`;
+    const shown = $("mcpTokenShown");
+    shown.innerHTML = `<p><strong>Copy this token now:</strong> it is shown only once.</p>` +
+      `<pre class="md-code">${escapeHtml(j.token)}</pre>` +
+      `<p class="storage-note">Claude Code:</p><pre class="md-code">claude mcp add --transport http aiscientist ${escapeHtml(url)} --header "Authorization: Bearer ${escapeHtml(j.token)}"</pre>` +
+      `<p class="storage-note">Any MCP client (Streamable HTTP): URL <code>${escapeHtml(url)}</code>, header <code>Authorization: Bearer &lt;token&gt;</code>.</p>`;
+    shown.classList.remove("hidden");
+    loadMcpTokens();
+  } catch (err) { toast(isUnreachable(err) ? "Can't reach the server." : "Could not create a token."); }
+}
+
+async function onMcpTokensClick(e) {
+  const b = e.target.closest("[data-revoke-token]");
+  if (!b || !confirm("Revoke this token? A client using it stops working at once.")) return;
+  const res = await fetch(`/api/account/tokens/${encodeURIComponent(b.dataset.revokeToken)}`, { method: "DELETE" });
+  toast(res.ok ? "Token revoked." : "Could not revoke it.");
+  $("mcpTokenShown").classList.add("hidden");
+  loadMcpTokens();
+}
+
+// ---- Dataset preview (RCHENLAB/AiScientist issue 10) ----
+// What a dataset holds, read on the server where it is kept: an .h5ad's cells, genes, metadata
+// columns and first rows; a table's first rows; a VCF's header and first records; a folder's files.
+// The server reads only a bounded part, so a 15 GB matrix opens as fast as a small one. The same viewer
+// opens a run's outputs (Files → Outputs): ``base`` is the API path of what is shown, /api/datasets/<id>
+// or /api/runs/<run id>, each answering /preview and /download.
+
+const LARGE_DOWNLOAD = 2 * 1024 ** 3;
+const dsPreview = { base: null, name: "", folder: null };
+
+function confirmLargeDownload(size, name) {
+  if (!size || size < LARGE_DOWNLOAD) return true;
+  return confirm(`"${name}" is ${fmtSize(size)}. Download it anyway?\n\nLarge downloads take a while; keep this tab open until it finishes.`);
+}
+
+function dsDownloadUrl(base, file, inline) {
+  const q = new URLSearchParams();
+  if (file) q.set("file", file);
+  if (inline) q.set("inline", "1");
+  const qs = q.toString();
+  return `${base}/download${qs ? "?" + qs : ""}`;
+}
+
+async function openDatasetPreview(base, name, file) {
+  const modal = $("datasetPreviewModal"), body = $("dsPreviewBody");
+  if (dsPreview.base !== base) dsPreview.folder = null;
+  Object.assign(dsPreview, { base, name });
+  $("dsPreviewTitle").textContent = file ? file.split("/").pop() : name;
+  $("dsPreviewMeta").textContent = "";
+  const dl = $("dsPreviewDownload");
+  dl.href = dsDownloadUrl(base, file);
+  dl.onclick = null;
+  body.innerHTML = `<div class="ds-loading">${icon("hourglass_top")} Reading ${escapeHtml(file || name)}…</div>`;
+  modal.classList.remove("hidden");
+  let data;
+  try {
+    const q = file ? `?file=${encodeURIComponent(file)}` : "";
+    const res = await fetch(`${base}/preview${q}`);
+    data = await res.json();
+    if (!res.ok) throw new Error(data.error || `HTTP ${res.status}`);
+  } catch (err) {
+    body.innerHTML = `<div class="ds-error">${icon("error")} ${escapeHtml(isUnreachable(err) ? "Can't reach the server." : err.message)}</div>`;
+    return;
+  }
+  if (dsPreview.base !== base) return;                // another preview was opened meanwhile
+  const ds = data.dataset || {};
+  const where = ds.location === "hpc3" ? "kept on HPC3" : "kept on the server";
+  if (data.folder) {
+    dsPreview.folder = data.folder;
+    $("dsPreviewMeta").textContent = `Folder · ${data.folder.total_files} files · ${fmtSize(data.folder.total_bytes)} · ${where}`;
+    dl.onclick = (e) => { if (!confirmLargeDownload(data.folder.total_bytes, name)) e.preventDefault(); };
+    dl.textContent = "Download (.zip)";
+    body.innerHTML = dsFolderHtml(base, data.folder);
+    return;
+  }
+  const f = data.file || {};
+  dl.textContent = "Download";
+  dl.onclick = (e) => { if (!confirmLargeDownload(f.size_bytes, f.name)) e.preventDefault(); };
+  $("dsPreviewMeta").textContent = [dsKindLabel(f.kind, data.preview), fmtSize(f.size_bytes), where].filter(Boolean).join(" · ");
+  const back = file && ds.is_folder
+    ? `<button type="button" class="ds-back ghost small" data-ds-back="1">${icon("arrow_back")} ${escapeHtml(name)}/</button>` : "";
+  body.innerHTML = back + dsPreviewHtml(base, file, data.preview || {});
+}
+
+function dsKindLabel(kind, p) {
+  if (p && p.compressed && p.type !== "binary") return ({ table: "Table", vcf: "VCF", text: "Text" }[p.type] || "File") + " (gzip)";
+  return { h5ad: "AnnData (.h5ad)", hdf5: "HDF5", vcf: "VCF", table: "Table", json: "JSON",
+           image: "Image", pdf: "PDF", text: "Text", binary: "Binary file" }[kind] || "File";
+}
+
+function dsTable(columns, rows, opts = {}) {
+  if (!columns || !columns.length) return "";
+  const head = "<tr>" + (opts.index ? `<th class="ds-idx"></th>` : "") +
+    columns.map((c, k) => `<th>${escapeHtml(c)}${opts.types && opts.types[k] ? `<span class="ds-type">${escapeHtml(opts.types[k])}</span>` : ""}</th>`).join("") + "</tr>";
+  const body = (rows || []).map((r, i) => "<tr>" + (opts.index ? `<th class="ds-idx">${escapeHtml(opts.index[i] ?? "")}</th>` : "") +
+    columns.map((_c, k) => `<td>${escapeHtml(r[k] ?? "")}</td>`).join("") + "</tr>").join("");
+  return `<div class="ds-table-wrap"><table class="ds-table"><thead>${head}</thead><tbody>${body}</tbody></table></div>`;
+}
+
+function dsSection(title, inner, note) {
+  if (!inner) return "";
+  return `<section class="ds-section"><h3>${escapeHtml(title)}</h3>${inner}${note ? `<p class="ds-note">${escapeHtml(note)}</p>` : ""}</section>`;
+}
+
+function dsFacts(items) {
+  const xs = items.filter((x) => x && x[1] !== undefined && x[1] !== null && x[1] !== "");
+  return xs.length ? `<dl class="ds-facts">${xs.map(([k, v]) => `<div><dt>${escapeHtml(k)}</dt><dd>${escapeHtml(String(v))}</dd></div>`).join("")}</dl>` : "";
+}
+
+function dsNames(list) {
+  return (list || []).length
+    ? `<ul class="ds-names">${list.map((x) => `<li><code>${escapeHtml(x.name ?? x)}</code>${x.shape ? ` <span class="ds-dim">${escapeHtml(x.shape.join(" × "))}</span>` : ""}</li>`).join("")}</ul>` : "";
+}
+
+function dsFolderHtml(base, folder) {
+  const rows = (folder.entries || []).map((e) => {
+    const p = escapeHtml(e.path);
+    return `<tr><td class="ds-path"><button type="button" class="linklike" data-ds-file="${p}">${p}</button></td>` +
+      `<td class="ds-size">${fmtSize(e.size)}</td>` +
+      `<td class="ds-act"><a class="ghost small" href="${dsDownloadUrl(base, e.path)}" download>Download</a></td></tr>`;
+  }).join("");
+  const more = folder.truncated ? `<p class="ds-note">Showing the first ${folder.entries.length} of ${folder.total_files} files. The .zip has all of them.</p>` : "";
+  return rows
+    ? `<div class="ds-table-wrap"><table class="ds-table ds-files"><thead><tr><th>File</th><th>Size</th><th></th></tr></thead><tbody>${rows}</tbody></table></div>${more}`
+    : `<div class="ds-note">This folder has no files.</div>`;
+}
+
+function dsXValues(x) {
+  const s = x && x.sample;
+  if (!s) return "";
+  const range = `${+s.min.toPrecision(4)} to ${+s.max.toPrecision(4)}`;
+  if (s.all_integer && !s.any_negative) return `whole numbers, ${range}, in the first ${s.n} stored values: looks like raw counts`;
+  return `${range} in the first ${s.n} stored values, not all whole numbers: already normalized or transformed`;
+}
+
+function dsPreviewHtml(base, file, p) {
+  switch (p.type) {
+    case "h5ad": {
+      if (p.note && !p.obs) return `<div class="ds-note">${escapeHtml(p.note)}</div>`;
+      const x = p.X || {};
+      const facts = dsFacts([
+        ["Cells (obs)", (p.n_obs ?? "").toLocaleString()], ["Genes (var)", (p.n_vars ?? "").toLocaleString()],
+        ["Matrix X", x.present ? [x.encoding, x.dtype].filter(Boolean).join(", ") : "none"],
+        ["Values in X", dsXValues(x)],
+        [".raw", p.raw && p.raw.present ? `yes${p.raw.n_vars ? `, ${p.raw.n_vars.toLocaleString()} genes` : ""}` : "no"],
+      ]);
+      const cols = (frame) => frame && frame.columns && frame.columns.length ? dsTable(["Column", "Type", "Values"],
+        frame.columns.map((c) => [c.name, c.dtype || "", c.categories ? `${c.n_categories} ${c.n_categories === 1 ? "category" : "categories"}: ${c.categories.join(", ")}${c.n_categories > c.categories.length ? ", …" : ""}` : (c.note || "")])) : "";
+      const head = (frame) => frame && frame.head && frame.head.columns.length ? dsTable(frame.head.columns, frame.head.rows, { index: frame.head.index }) : "";
+      return facts +
+        dsSection("Cell metadata (obs)", cols(p.obs), p.obs && p.obs.n_columns > (p.obs.columns || []).length ? `${p.obs.n_columns} columns; the first ${p.obs.columns.length} are listed.` : "") +
+        dsSection("First cells", head(p.obs)) +
+        dsSection("Gene metadata (var)", cols(p.var)) +
+        dsSection("First genes", head(p.var)) +
+        dsSection("Layers", dsNames(p.layers)) +
+        dsSection("Embeddings (obsm)", dsNames(p.obsm)) +
+        dsSection("Graphs (obsp)", dsNames(p.obsp)) +
+        dsSection("Unstructured (uns)", dsNames(p.uns)) +
+        (p.note ? `<p class="ds-note">${escapeHtml(p.note)}</p>` : "");
+    }
+    case "hdf5": {
+      const cr = p.cellranger;
+      const facts = cr ? dsFacts([["Features", cr.features.toLocaleString()], ["Barcodes", cr.barcodes.toLocaleString()],
+        ["Feature types", Object.entries(cr.feature_types || {}).map(([k, v]) => `${k} (${v.toLocaleString()})`).join(", ")]]) : "";
+      const nodes = (p.nodes || []).map((n) => [n.path, n.kind, n.shape ? n.shape.join(" × ") : "", n.dtype || ""]);
+      return facts + dsSection("Structure", dsTable(["Path", "Kind", "Shape", "Type"], nodes), p.more_nodes ? "The first nodes are listed." : "") +
+        (p.note ? `<p class="ds-note">${escapeHtml(p.note)}</p>` : "");
+    }
+    case "table":
+      return dsTable(p.columns, p.rows, { types: p.column_types }) +
+        `<p class="ds-note">${escapeHtml(p.note || "")} ${p.more_rows ? `Showing the first ${p.rows_shown} rows.` : `${p.rows_shown} ${p.rows_shown === 1 ? "row" : "rows"}.`}</p>`;
+    case "vcf":
+      return dsFacts([["Format", p.fileformat], ["Reference", p.reference], ["Contigs", p.n_contigs],
+                      ["Samples", p.n_samples ? `${p.n_samples}: ${p.samples.slice(0, 12).join(", ")}${p.n_samples > 12 ? ", …" : ""}` : "none (sites only)"],
+                      ["INFO fields", (p.info_fields || []).join(", ")], ["FORMAT fields", (p.format_fields || []).join(", ")]]) +
+        dsSection("First records", dsTable(p.columns, p.rows), p.more_rows ? `Showing the first ${p.rows.length} records.` : "") +
+        (p.header_complete ? "" : `<p class="ds-note">The header is longer than the part read for the preview.</p>`);
+    case "image":
+      return `<div class="ds-media"><img src="${dsDownloadUrl(base, file, true)}" alt="${escapeHtml(file || dsPreview.name)}" /></div>`;
+    case "pdf":
+      return `<iframe class="ds-pdf" src="${dsDownloadUrl(base, file, true)}" title="${escapeHtml(file || dsPreview.name)}"></iframe>`;
+    case "text":
+      return `<pre class="ds-text">${escapeHtml(p.text || "")}</pre>` + (p.more_rows ? `<p class="ds-note">Showing the beginning of the file.</p>` : "");
+    default:
+      return `<div class="ds-note">${escapeHtml(p.note || "This file has no preview. Download it to open it.")}</div>`;
+  }
+}
+
+function onDatasetPreviewClick(e) {
+  const f = e.target.closest("[data-ds-file]");
+  if (f) { openDatasetPreview(dsPreview.base, dsPreview.name, f.dataset.dsFile); return; }
+  if (e.target.closest("[data-ds-back]")) openDatasetPreview(dsPreview.base, dsPreview.name);
+}
+
+function closeDatasetPreview() {
+  $("datasetPreviewModal").classList.add("hidden");
+  $("dsPreviewBody").innerHTML = "";                   // stop a PDF or image that is still loading
+  dsPreview.base = null;
 }
 
 // ---- Runs view ----
@@ -5367,14 +7540,77 @@ async function loadRuns() {
     const items = (await (await fetch("/api/runs")).json()).runs || [];
     const results = await loadResultHandoffs(true);
     el.innerHTML = items.length ? items.map((x) => {
-      const done = x.status === "done" || x.status === "incomplete";
+      const done = runHasOutputs(x);
       const zip = done
-        ? `<a class="ghost small" href="/api/bundle/${encodeURIComponent(owner)}/${encodeURIComponent(x.run_id)}" download>${icon("download")} Results (.zip)</a>`
+        ? `<button type="button" class="ghost small" data-run-files="${escapeHtml(x.run_id)}" data-name="${escapeHtml(runTitle(x))}" title="Preview the report, figures and tables this run wrote">Files</button>` +
+          `<a class="ghost small" href="/api/results/${encodeURIComponent(x.run_id)}/croissant.json" target="_blank" rel="noopener" title="The result's Croissant metadata: its files, inputs and provenance">croissant.json</a>` +
+          `<a class="ghost small" href="/api/bundle/${encodeURIComponent(owner)}/${encodeURIComponent(x.run_id)}" download>${icon("download")} Results (.zip)</a>`
         : `<span class="muted small">${escapeHtml(x.status)}</span>`;
-      return `<div class="card run-card"><div class="card-main"><strong>${escapeHtml((x.question || "").slice(0, 90))}</strong>` +
-        `<span class="muted">${escapeHtml(x.status)}${x.plan_mode ? " · planned" : ""} · ${fmtDate(x.created_at)}</span>${resultHandoffHtml(x.run_id, results[x.run_id])}</div>${zip}</div>`;
+      return `<div class="card run-card" data-q="${escapeHtml(runSearchText(x))}"><div class="card-main"><strong>${escapeHtml(runTitle(x))}</strong>` +
+        `<span class="muted">${escapeHtml(x.status)}${x.plan_mode ? " · planned" : ""} · ${fmtDate(x.created_at)}</span>${resultHandoffHtml(x.run_id, results[x.run_id])}</div>` +
+        `<div class="run-card-actions"><button type="button" class="ghost small" data-run-usage="${escapeHtml(x.run_id)}" title="Tokens and estimated cost of this run, by pipeline step and model">Usage</button>${zip}` +
+        `<button type="button" class="ghost small danger" data-run-del="${escapeHtml(x.run_id)}" data-name="${escapeHtml(runTitle(x))}" data-kept="${keptBesideRun(results[x.run_id]) ? "1" : ""}" title="Delete this run and its files from the server">Delete</button></div></div>`;
     }).join("") : '<div class="empty-hint">No runs yet.</div>';
   } catch { el.innerHTML = '<div class="empty-hint">Failed to load.</div>'; }
+  filterCards("runsList", "runsCount", $("runsSearch").value);
+}
+
+// What a run handed on that is still kept beside it on this host (not saved to the user's data, not on
+// HPC3): deleting the run deletes it too.
+function keptBesideRun(r) {
+  const here = (x) => x && x.name && !x.saved_to && !x.saving && x.location !== "hpc3";
+  return !!r && (here(r) || here(r.cellqc));
+}
+function runHasOutputs(x) { return x.status === "done" || x.status === "incomplete"; }
+function runTitle(x) { return (x.question || "").slice(0, 90) || `Run ${x.run_id}`; }
+function runSearchText(x) {
+  const from = chatLabel(x.conversation_id);
+  return sysSearchText([x.question, x.status, x.plan_mode ? "planned" : "", x.run_id, from && from.text,
+                        fmtDate(x.created_at), (x.created_at || "").slice(0, 10)]);
+}
+
+// Files → Outputs: the runs that wrote something, each opening its artifacts in the dataset viewer.
+async function loadOutputs() {
+  const el = $("outputsList"); el.innerHTML = '<div class="empty-hint">Loading…</div>';
+  const owner = state.user ? state.user.username : "";
+  try {
+    const items = ((await (await fetch("/api/runs")).json()).runs || []).filter(runHasOutputs);
+    const results = await loadResultHandoffs(true);
+    el.innerHTML = items.length ? items.map((x) =>
+      `<div class="card run-card" data-q="${escapeHtml(runSearchText(x))}"><div class="card-main"><strong>${icon("description")} ${escapeHtml(runTitle(x))}</strong>` +
+      `<span class="muted">${escapeHtml(x.status)} · ${fmtDate(x.created_at)} · run ${escapeHtml(x.run_id)}</span>${resultHandoffHtml(x.run_id, results[x.run_id])}</div>` +
+      `<div class="run-card-actions"><button type="button" class="ghost small" data-run-files="${escapeHtml(x.run_id)}" data-name="${escapeHtml(runTitle(x))}" title="Preview the report, figures and tables this run wrote">Preview</button>` +
+      `<a class="ghost small" href="/api/results/${encodeURIComponent(x.run_id)}/croissant.json" target="_blank" rel="noopener" title="The result's Croissant metadata: its files, inputs and provenance">croissant.json</a>` +
+      `<a class="ghost small" href="/api/bundle/${encodeURIComponent(owner)}/${encodeURIComponent(x.run_id)}" download>${icon("download")} Results (.zip)</a></div></div>`).join("")
+      : '<div class="empty-hint">No outputs yet: a finished run\'s report, figures and tables appear here.</div>';
+  } catch { el.innerHTML = '<div class="empty-hint">Failed to load.</div>'; }
+  filterCards("outputsList", "outputsCount", $("outputsSearch").value);
+}
+function onOutputsClick(e) {
+  const f = e.target.closest("[data-run-files]");
+  if (f) { openDatasetPreview(`/api/runs/${encodeURIComponent(f.dataset.runFiles)}`, f.dataset.name || ""); return; }
+  onSaveResultClick(e);
+}
+
+async function deleteRun(b) {
+  const what = b.dataset.kept ? ", and the processed data kept beside it (not saved to your data)" : "";
+  if (!confirm(`Delete the run "${b.dataset.name}"?\n\nThis removes from the server its report, figures, tables and run record${what}. ` +
+               `Datasets you saved from it stay in Files → Datasets, and what it cost stays in your usage. ` +
+               `Its working files on HPC3 go when your session ends. This cannot be undone.`)) return;
+  b.disabled = true;
+  try {
+    const res = await fetch("/api/runs/delete", { method: "POST", headers: { "Content-Type": "application/json" },
+                                                  body: JSON.stringify({ run_id: b.dataset.runDel }) });
+    const j = await res.json();
+    if (!res.ok) { toast(j.error || "Delete failed"); b.disabled = false; return; }
+    toast("Run deleted.");
+    resultHandoffs = null;
+    return true;
+  } catch (err) {
+    toast(isUnreachable(err) ? "Can't reach the server." : "Delete failed: " + err.message);
+    b.disabled = false;
+  }
+  return false;
 }
 
 // What a run hands on besides its bundle, neither of them in the zip: the processed dataset (an
@@ -5394,7 +7630,9 @@ function resultHandoffHtml(runId, r) {
   const mb = (n) => `${(Number(n || 0) / 1e6).toFixed(0)} MB`;
   const kept = (x, label, what) => (x.saved_to
     ? `<span class="ok small" title="${escapeHtml(x.saved_to)}">Saved to my data</span>`
+    : x.saving ? `<span class="muted small">Copying from HPC3 to your data on the server…</span>`
     : `<span class="muted small">kept ${x.location === "hpc3" ? "on HPC3" : "on the server"} ${x.until_disconnect ? `until you disconnect (at most ${escapeHtml(String(x.kept_days ?? ""))} days)` : `for ${escapeHtml(String(x.kept_days ?? ""))} days`}</span>` +
+      (x.save_error ? `<span class="bad small" title="${escapeHtml(x.save_error)}">The last save failed</span>` : "") +
       `<button class="ghost small" data-save-result="${escapeHtml(runId)}" data-what="${what}" data-label="${escapeHtml(label)}">${escapeHtml(label)}</button>`);
   let html = "";
   if (r.name) {
@@ -5412,8 +7650,26 @@ function resultHandoffHtml(runId, r) {
 }
 async function showResultHandoff(host, runId) {
   if (!host) return;
+  host.dataset.run = runId;
   const r = (await loadResultHandoffs())[runId];
   host.innerHTML = resultHandoffHtml(runId, r);
+}
+// A result kept on HPC3 is copied back to the server in the background; the server says when it is here.
+async function onResultSaved(msg) {
+  await loadResultHandoffs(true);
+  document.querySelectorAll(".result-handoff").forEach((host) => {
+    if (host.dataset.run === String(msg.run_id)) showResultHandoff(host, host.dataset.run);
+  });
+  if ($("view-runs") && $("view-runs").classList.contains("active")) loadRuns();
+  if (outputsShown()) loadOutputs();
+  onDatasetsChanged();
+}
+function outputsShown() {
+  return filesTab === "outputs" && $("view-datasets") && $("view-datasets").classList.contains("active");
+}
+function onDatasetsChanged() {
+  if ($("view-datasets") && $("view-datasets").classList.contains("active")) loadDatasets();
+  loadDatasetChips();   // a moved dataset's chips, and the chats it is attached to, take its new path
 }
 
 async function onSaveResultClick(e) {
@@ -5425,14 +7681,26 @@ async function onSaveResultClick(e) {
     const r = await fetch(`/api/result-datasets/${encodeURIComponent(runId)}/save?what=${encodeURIComponent(b.dataset.what || "dataset")}`, { method: "POST" });
     const j = await r.json();
     if (!r.ok) { toast(j.error || "Could not save it."); b.disabled = false; b.textContent = label; return; }
-    toast(`Saved to ${j.path} — it is in your Datasets now.`);
+    if (j.saving) {
+      b.textContent = "Copying to the server…";
+      toast("Copying it from HPC3 to your data on the server. It appears in Files → Datasets when it is there.");
+      await loadResultHandoffs(true);
+      return;
+    }
+    toast(`Saved to ${j.path} — it is in Files → Datasets now.`);
     await loadResultHandoffs(true);
     const inChat = b.closest(".result-handoff");
-    if (inChat) showResultHandoff(inChat, runId); else loadRuns();
+    if (inChat) showResultHandoff(inChat, runId); else if (outputsShown()) loadOutputs(); else loadRuns();
     loadDatasets();
   } catch (err) { toast("Could not save it: " + err.message); b.disabled = false; b.textContent = label; }
 }
-const onRunsClick = onSaveResultClick;
+function onRunsClick(e) {
+  const u = e.target.closest("[data-run-usage]");
+  if (u) { toggleRunUsage(u); return; }
+  const d = e.target.closest("[data-run-del]");
+  if (d) { deleteRun(d).then((gone) => { if (gone) loadRuns(); }); return; }
+  onOutputsClick(e);
+}
 
 // ---- Admin view ----
 async function loadAdminUsers() {
@@ -5469,6 +7737,7 @@ function switchAdminTab(tab) {
   document.querySelectorAll(".admin-tab").forEach((b) => b.classList.toggle("active", b.dataset.adminTab === tab));
   document.querySelectorAll(".admin-pane").forEach((p) => p.classList.toggle("hidden", p.id !== "adminPane-" + tab));
   if (tab === "skills") loadSkillReviews();
+  else if (tab === "usage") loadAdminUsage();
 }
 
 async function loadSkillReviews() {
@@ -5599,21 +7868,597 @@ async function onUserTableClick(e) {
   }
 }
 
-// ---- Account view ----
+// ---- Account view: two tabs, API usage (the key, its usage, the budget) and Password ----
 function renderAccount(user) {
   const el = $("accountInfo");
-  if (!user) { el.innerHTML = '<p class="muted">Accounts are disabled on this server.</p>'; $("changePwForm").classList.add("hidden"); $("logoutBtn").classList.add("hidden"); return; }
-  $("changePwForm").classList.remove("hidden"); $("logoutBtn").classList.remove("hidden");
-  el.innerHTML = `<p><strong>${escapeHtml(user.username)}</strong> · role: ${escapeHtml(user.role)}</p>` +
-    `<p class="muted">Member since ${fmtDate(user.created_at)}</p>`;
+  const pwTab = $("accountTab-password");
+  if (!user) {
+    el.innerHTML = '<p class="muted">Accounts are disabled on this server.</p>';
+    $("logoutBtn").classList.add("hidden"); pwTab.classList.add("hidden"); switchAccountTab("usage");
+    return;
+  }
+  $("logoutBtn").classList.remove("hidden"); pwTab.classList.remove("hidden");
+  el.innerHTML = accountInfoHtml(user);
 }
+
+function accountInfoHtml(user) {
+  const since = user.created_at ? fmtDay(String(user.created_at).slice(0, 10), { year: true }) : "";
+  const bits = [user.email ? escapeHtml(user.email) : "", since ? `Member since ${escapeHtml(since)}` : ""].filter(Boolean);
+  return `<span class="account-avatar" aria-hidden="true">${escapeHtml((user.username || "?").slice(0, 1).toUpperCase())}</span>` +
+    `<div class="account-id"><div><strong>${escapeHtml(user.username)}</strong> <span class="role-chip">${escapeHtml(user.role)}</span></div>` +
+    (bits.length ? `<div class="muted">${bits.join(" · ")}</div>` : "") + `</div>`;
+}
+
+function switchAccountTab(tab, { load = true } = {}) {
+  state.accountTab = tab;
+  document.querySelectorAll(".account-tab").forEach((b) => {
+    const on = b.dataset.accountTab === tab;
+    b.classList.toggle("active", on);
+    b.setAttribute("aria-selected", on ? "true" : "false");
+    b.tabIndex = on ? 0 : -1;
+  });
+  document.querySelectorAll(".account-pane").forEach((p) => p.classList.toggle("hidden", p.id !== "accountPane-" + tab));
+  if (load && tab === "storage" && storageShown()) loadStorageTab();
+}
+
+// The chat counter, the budget notice and the key dialog lead here, to the usage tab; the session
+// chip, to the storage tab. switchView reads the tab that is open.
+function openAccount(tab = "usage") {
+  switchAccountTab(tab, { load: false });
+  switchView("account");
+}
+
+// The new password is typed twice: a typo here would lock the account until an admin resets it.
+function passwordProblem(oldPw, newPw, again) {
+  if (!oldPw) return "Enter your current password.";
+  if (newPw.length < 6) return "The new password needs at least 6 characters.";
+  if (newPw !== again) return "The two new passwords are not the same.";
+  return "";
+}
+
 async function changePassword(e) {
   e.preventDefault();
+  const problem = passwordProblem($("cpOld").value, $("cpNew").value, $("cpNew2").value);
+  const box = $("cpProblem");
+  box.textContent = problem; box.classList.toggle("hidden", !problem);
+  if (problem) return;
   const payload = { old_password: $("cpOld").value, new_password: $("cpNew").value };
   const r = await fetch("/api/account/password", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(payload) });
   const d = await r.json().catch(() => ({}));
-  if (!r.ok) { toast(d.detail || "Change failed"); return; }
+  if (!r.ok) {
+    const why = typeof d.detail === "string" && d.detail ? d.detail[0].toUpperCase() + d.detail.slice(1) : "Change failed";
+    box.textContent = why; box.classList.remove("hidden"); toast(why); return;
+  }
   toast("Password updated"); $("changePwForm").reset();
+}
+
+// ---- LLM usage and estimated cost (Account › API usage, the chat counter, run details, budgets) ----
+// Every model call is recorded server-side with its token counts; the dollars are ESTIMATES from a
+// configurable price table (or the provider's own figure when it reports one). The Claude Console
+// stays the authoritative bill, and every view here says so.
+const GUIDE_URL = "https://github.com/RCHENLAB/AiScientist/blob/main/docs/claude_api_guide.md";
+
+function userTz() { try { return Intl.DateTimeFormat().resolvedOptions().timeZone || ""; } catch { return ""; } }
+
+function fmtUsd(x, { approx = true } = {}) {
+  const v = Number(x || 0);
+  const s = v === 0 ? "$0" : v < 0.01 ? "<$0.01" : v < 100 ? `$${v.toFixed(2)}` : `$${Math.round(v).toLocaleString()}`;
+  return (approx && v >= 0.01 ? "~" : "") + s;
+}
+
+// The chat counter's tooltip: what an API key paid for, then the lab GPUs' calls apart and free.
+function usageTitle(t) {
+  if (!t) return "";
+  const api = apiPart(t);
+  const free = freeParts(t).map((f) => `${f.name}: ${plural(f.calls, "call")} · ${f.total_tokens.toLocaleString()} tokens · free.`);
+  const cluster = free.length ? `${free.join("\n")} ${freeNote(t)}` : "";
+  if (!api.calls) return `${cluster}\nClick for Account › API usage.`;
+  const unpriced = t.unpriced_calls ? `\n${t.unpriced_calls} call(s) on a model the price table does not list are not in the dollar figure.` : "";
+  return `${plural(api.calls, "API call")} · ${api.total_tokens.toLocaleString()} API tokens · ${fmtUsd(t.spend_usd)} estimated.` +
+    unpriced + (cluster ? `\n${cluster}` : "") +
+    "\nAn estimate from AiScientist's own record; the Claude Console is the authoritative bill. Click for Account › API usage.";
+}
+
+// "2026-10-18" -> "Oct 18" (or "Oct 18, 2026"). A calendar day, so it is read and written in UTC.
+function fmtDay(iso, { year = false } = {}) {
+  if (!iso) return "";
+  const d = new Date(String(iso).slice(0, 10) + "T00:00:00Z");
+  if (isNaN(d)) return String(iso);
+  return d.toLocaleDateString(undefined, { month: "short", day: "numeric", timeZone: "UTC", ...(year ? { year: "numeric" } : {}) });
+}
+
+// The chat header counter: the API tokens and estimated cost of this chat, plus the running cost of
+// its run while one is going. Calls on the lab's GPUs (the shared model, a session's own cluster GPU)
+// are in no dollar figure: they read "shared model free" beside an API figure, or carry the counter
+// alone when the chat had no API call.
+//   "12K API tokens · ~$0.18"   "12K API tokens · ~$0.18 · cluster GPU free"   "9.9K tokens · free on the shared model"
+function chatUsageText(u, running = false) {
+  if (!u || !u.chat || !u.chat.calls) return "";
+  const api = apiPart(u.chat), onCluster = (u.chat.cluster && u.chat.cluster.calls) || 0;
+  if (!api.calls) return `${fmtTokens((u.chat.cluster && u.chat.cluster.total_tokens) || 0)} tokens · free on the ${freeWhere(u.chat)}`;
+  let text = `${fmtTokens(api.total_tokens)} API tokens · ${fmtUsd(u.chat.spend_usd)}`;
+  if (onCluster) text += ` · ${freeWhere(u.chat)} free`;
+  if (running && u.run && apiPart(u.run).calls) text += ` · this run ${fmtUsd(u.run.spend_usd)}`;
+  return text;
+}
+
+function renderChatUsage() {
+  const el = $("chatUsage");
+  if (!el) return;
+  const c = activeChat();
+  const text = authed() && c ? chatUsageText(c.usage, c.running) : "";
+  if (!text) { el.classList.add("hidden"); return; }
+  el.textContent = text;
+  el.title = usageTitle(c.usage.chat);
+  el.classList.remove("hidden");
+}
+
+async function refreshChatUsage(c = activeChat()) {
+  if (!authed() || !c || !c.sid) return;
+  try {
+    const r = await fetch(`/api/usage/chat/${encodeURIComponent(c.sid)}`);
+    if (!r.ok) return;
+    const t = await r.json();
+    c.usage = { ...(c.usage || {}), chat: t };
+    if (chatVisible(c)) renderChatUsage();
+  } catch { /* the counter is best-effort */ }
+}
+
+function onUsageUpdate(msg) {
+  const c = msg.conversation_id && chats.get(String(msg.conversation_id));
+  if (!c) return;
+  c.usage = { ...(c.usage || {}), ...(msg.chat ? { chat: msg.chat } : {}), ...(msg.run ? { run: msg.run } : {}) };
+  if (chatVisible(c)) renderChatUsage();
+}
+
+// A budget threshold reached: a notice above the chat, once per threshold and billing cycle.
+async function checkBudgetNotices() {
+  if (!authed()) return;
+  try {
+    const r = await fetch(`/api/usage/summary?tz=${encodeURIComponent(userTz())}`);
+    if (!r.ok) return;
+    const s = await r.json();
+    const fresh = s.new_notices || [];
+    if (!fresh.length) return;
+    const top = Math.max(...fresh);
+    const b = s.budget || {};
+    const el = $("budgetNotice");
+    const over = s.remaining_usd != null && s.remaining_usd <= 0;
+    const left = s.remaining_usd != null && s.remaining_usd > 0 ? ` (${fmtUsd(s.remaining_usd)} left)` : "";
+    const when = over ? " The estimate is past the credit: once the Console shows it used up, Claude API requests stop until the cycle resets."
+      : s.projected_exhaustion ? ` At the current rate it runs out around ${escapeHtml(s.projected_exhaustion)}.` : "";
+    el.innerHTML = `<span class="material-symbols-outlined msym">savings</span>` +
+      `<span><strong>${top}% of your monthly API credit used</strong> — an estimated ${fmtUsd(s.spent_usd)} of ` +
+      `${fmtUsd(b.monthly_credit_usd, { approx: false })} this cycle${left}.${when} ` +
+      `<a href="#" data-usage-open>See usage</a> · <a href="${escapeHtml(s.console_url || "")}" target="_blank" rel="noopener">Claude Console</a></span>` +
+      `<button type="button" class="icon-btn" data-dismiss aria-label="Dismiss">✕</button>`;
+    el.classList.remove("hidden");
+    toast(`${top}% of your monthly API credit used (estimate).`);
+    fetch("/api/usage/notices/ack", { method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ thresholds: fresh, tz: userTz() }) }).catch(() => {});
+  } catch { /* best-effort */ }
+}
+
+function plural(n, word) { const v = n || 0; return `${v.toLocaleString()} ${word}${v === 1 ? "" : "s"}`; }
+
+// Today as the browser's own calendar day, "2026-10-18" (the server is told the same time zone).
+function localIsoDay(d = new Date()) {
+  const p = (n) => String(n).padStart(2, "0");
+  return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())}`;
+}
+
+function nextDay(iso) {
+  if (!iso) return "";
+  const d = new Date(iso + "T00:00:00Z"); d.setUTCDate(d.getUTCDate() + 1);
+  return d.toISOString().slice(0, 10);
+}
+
+// "Oct 1 – Oct 31, 2026 · day 18 of 31 · resets Nov 1"
+function usageCycleText(cyc, today = localIsoDay()) {
+  if (!cyc || !cyc.start) return "";
+  const day = Math.round((Date.parse(today + "T00:00:00Z") - Date.parse(cyc.start + "T00:00:00Z")) / 86400000) + 1;
+  const of = cyc.days_total ? ` · day ${Math.min(Math.max(day, 1), cyc.days_total)} of ${cyc.days_total}` : "";
+  return `${fmtDay(cyc.start)} – ${fmtDay(cyc.end, { year: true })}${of} · resets ${fmtDay(nextDay(cyc.end))}`;
+}
+
+function usageTile(label, value, sub, cls = "") {
+  return `<div class="usage-tile${cls ? " " + cls : ""}"><div class="usage-tile-label">${label}</div>` +
+    `<div class="usage-tile-value">${value}</div><div class="usage-tile-sub">${sub}</div></div>`;
+}
+
+// The summary row: what this billing cycle has cost so far, in dollars and tokens, and where that
+// stands against the budget. The cycle does not follow the breakdown's period picker.
+function usageSummaryHtml(d) {
+  const t = d.totals || {};
+  const cyc = t.cycle || {}, today = t.today || {}, week = t.last_7_days || {};
+  const span = (d.budget && d.budget.cycle) || {};
+  // The cycle's spend at the rate so far, as the budget's projection reckons it.
+  const pace = cyc.spend_usd > 0 && span.days_elapsed >= 1 && span.days_total
+    ? `<div class="usage-tile-note">On pace for ${fmtUsd((cyc.spend_usd / span.days_elapsed) * span.days_total)} by ${escapeHtml(fmtDay(span.end))}</div>` : "";
+  const unpriced = cyc.unpriced_calls
+    ? `<div class="usage-tile-note" title="Calls on a model the price table does not list are not in the dollar figure.">+ ${plural(cyc.unpriced_calls, "call")} on an unpriced model</div>` : "";
+  const spend = usageTile("Estimated API spend", fmtUsd(cyc.spend_usd),
+    `Today ${fmtUsd(today.spend_usd)} · last 7 days ${fmtUsd(week.spend_usd)}${pace}${unpriced}`);
+  const shared = sharedTokensTile(t, d.shared_model);
+  return `<div class="usage-tiles">${spend}${apiTokensTile(cyc, { sharedApart: !!shared })}${shared}${budgetTileHtml(d.budget || {})}</div>`;
+}
+
+// The lab's shared model, beside the API figures: its tokens this cycle, today and in the last 7
+// days. It is free (HPC3 charges the lab's GPUs by time), so it has tokens and no dollars. Shown once
+// the account has used it, or wherever the server keeps one (``kept``).
+function sharedTokensTile(t, kept = false) {
+  const sh = (x) => (x && x.shared) || {};
+  const cyc = sh(t.cycle);
+  if (!cyc.calls && !kept) return "";
+  const split = tokenSplit(cyc);
+  return usageTile("Shared model tokens", fmtTokens(cyc.total_tokens || 0),
+    `${plural(cyc.calls || 0, "call")} · today ${fmtTokens(sh(t.today).total_tokens || 0)} · last 7 days ${fmtTokens(sh(t.last_7_days).total_tokens || 0)}` +
+    (split ? `<div class="usage-tile-note">${split}</div>` : "") +
+    `<div class="usage-tile-note" title="${SHARED_FREE}">Free: the lab's GPUs on HPC3</div>`, "usage-tile-shared");
+}
+
+// What an API key paid for: the whole minus ``cluster``, the calls on the cluster GPU, which HPC3
+// charges by GPU time and not by token, so they cost nothing here and count against no budget.
+function apiPart(x) {
+  const c = (x && x.cluster) || {};
+  const out = { calls: Math.max(0, (x.calls || 0) - (c.calls || 0)) };
+  ["input_tokens", "cache_write_tokens", "cache_read_tokens", "output_tokens", "total_tokens"]
+    .forEach((k) => { out[k] = Math.max(0, (x[k] || 0) - (c[k] || 0)); });
+  return out;
+}
+
+const CLUSTER_FREE = "HPC3 charges the cluster GPU by the time it runs, not by token: these calls are in no dollar figure or budget.";
+const SHARED_FREE = "HPC3 charges the lab's GPUs by the time they run, not by token: calls on the shared model and on a session's own GPU are in no dollar figure or budget.";
+
+// The tooltip of a free figure: the cluster GPU's wording, or the lab GPUs' once the shared model is in it.
+function freeNote(x) { return x && x.shared && x.shared.calls ? SHARED_FREE : CLUSTER_FREE; }
+
+// The calls no API key paid for, by where they ran: the lab's shared model (``shared``, a part of
+// ``cluster``) and the rest of ``cluster``, a session's own GPU. Only the parts with calls.
+function freeParts(x) {
+  const c = (x && x.cluster) || {}, sh = (x && x.shared) || {};
+  const parts = [];
+  if (sh.calls) parts.push({ name: "Shared model", calls: sh.calls, total_tokens: sh.total_tokens || 0 });
+  const own = (c.calls || 0) - (sh.calls || 0);
+  if (own > 0) parts.push({ name: "Cluster GPU", calls: own, total_tokens: Math.max(0, (c.total_tokens || 0) - (sh.total_tokens || 0)) });
+  return parts;
+}
+
+function lowerFirst(name) { return name.charAt(0).toLowerCase() + name.slice(1); }
+
+// "shared model", "cluster GPU", or "lab GPUs" when a figure holds calls on both.
+function freeWhere(x) {
+  const parts = freeParts(x);
+  return parts.length > 1 ? "lab GPUs" : parts.length ? lowerFirst(parts[0].name) : "cluster GPU";
+}
+
+// ``sharedApart``: the shared model has a tile of its own beside this one, so only a session GPU's part.
+function clusterNote(x, sharedApart = false) {
+  return freeParts(x).filter((f) => !sharedApart || f.name !== "Shared model").map((f) => `<div class="usage-tile-note" title="${freeNote(x)}">${f.name}: ${plural(f.calls, "call")} · ${fmtTokens(f.total_tokens)} tokens · free</div>`).join("");
+}
+
+function apiTokensTile(t, { sharedApart = false } = {}) {
+  const api = apiPart(t);
+  const split = tokenSplit(api);
+  return usageTile("API tokens", fmtTokens(api.total_tokens),
+    plural(api.calls, "API call") + (t.errors ? ` · <span class="bad">${t.errors} failed</span>` : "") +
+    (split ? `<div class="usage-tile-note">${split}</div>` : "") + clusterNote(t, sharedApart));
+}
+
+// Where the cycle's estimated spend stands against the monthly credit: left / over, a bar with the
+// warning thresholds on it, the projection, and the hard limit.
+function budgetTileHtml(b) {
+  const bud = b.budget;
+  const resets = fmtDay(nextDay((b.cycle || {}).end));
+  if (!bud || !bud.monthly_credit_usd) {
+    return usageTile("Budget", "Not set",
+      `<a href="#budgetSection" data-budget-edit>Set your monthly credit</a> to see the spend against it.`, "usage-tile-budget unset");
+  }
+  const pct = b.percent || 0;
+  const over = b.remaining_usd != null && b.remaining_usd <= 0;
+  const early = b.lasts_cycle === false;
+  const tone = over ? "over" : pct >= 80 || early ? "warn" : "ok";
+  const chip = over ? "Credit used up" : early ? "Runs out early" : pct >= 80 ? `${pct.toFixed(0)}% used` : "On track";
+  const value = over ? `Over by ${fmtUsd(-b.remaining_usd)}` : `${fmtUsd(b.remaining_usd)} left`;
+  const marks = (bud.thresholds || []).filter((x) => x < 100).map((x) => `<i class="usage-mark" style="left:${x}%" title="Warns at ${x}%"></i>`).join("");
+  const bar = `<div class="usage-bar tone-${tone}" role="img" aria-label="${pct.toFixed(0)}% of the credit used"><i style="width:${Math.min(100, pct)}%"></i>${marks}</div>` +
+    `<div class="usage-bar-legend"><span>${fmtUsd(b.spent_usd)} of ${fmtUsd(bud.monthly_credit_usd, { approx: false })}</span><span>${pct.toFixed(0)}%</span></div>`;
+  const proj = over ? "Check the Claude Console for what is actually left."
+    : early && b.projected_exhaustion ? `At this rate it runs out around <strong>${escapeHtml(fmtDay(b.projected_exhaustion))}</strong>, before the reset on ${escapeHtml(resets)}.`
+      : b.lasts_cycle ? `At this rate it lasts until the reset on ${escapeHtml(resets)}.` : `Resets on ${escapeHtml(resets)}.`;
+  const hard = bud.hard_limit_usd != null
+    ? `<div class="usage-tile-note">Hard limit ${fmtUsd(bud.hard_limit_usd, { approx: false })} · ${bud.hard_limit_mode === "block" ? "then new runs on your key are blocked" : "then each new run asks first"}${b.hard_limit_reached ? ' · <span class="bad">reached</span>' : ""}</div>` : "";
+  const label = `Budget <span class="usage-chip tone-${tone}">${chip}</span><a href="#budgetSection" class="usage-tile-link" data-budget-edit>Edit</a>`;
+  return usageTile(label, value, bar + `<div>${proj}</div>` + hard, `usage-tile-budget tone-${tone}`);
+}
+
+// Daily bars. Dollars when anything was priced, otherwise tokens (only the cluster GPU was used).
+function usageChart(daily, { title = `Last ${(daily || []).length} days` } = {}) {
+  if (!daily || !daily.length) return "";
+  const spendMax = Math.max(...daily.map((d) => d.spend_usd || 0), 0);
+  const tokMax = Math.max(...daily.map((d) => d.total_tokens || 0), 0);
+  const useTokens = spendMax === 0 && tokMax > 0;
+  const top = useTokens ? tokMax : spendMax;
+  const what = useTokens ? "tokens" : "estimated spend";
+  const peak = useTokens ? `${fmtTokens(tokMax)} tokens` : fmtUsd(spendMax);
+  const head = `<div class="usage-chart-head"><span><strong>${escapeHtml(title)}</strong> <span class="muted">· daily ${what}</span></span>` +
+    (top > 0 ? `<span class="muted">peak ${peak}</span>` : "") + "</div>";
+  if (top === 0) return `<div class="usage-card-box usage-chart-wrap">${head}<p class="usage-empty">No model calls in these ${daily.length} days.</p></div>`;
+  const last = daily.length - 1, today = localIsoDay();
+  const bars = daily.map((d) => {
+    const v = useTokens ? d.total_tokens || 0 : d.spend_usd || 0;
+    const h = v > 0 ? Math.max(3, Math.round((v / top) * 100)) : 0;
+    const tip = `${fmtDay(d.date)}: ${fmtUsd(d.spend_usd)} · ${(d.total_tokens || 0).toLocaleString()} tokens · ${plural(d.calls, "call")}`;
+    return `<div class="usage-day${d.date === today ? " today" : ""}${v ? "" : " zero"}" title="${escapeHtml(tip)}"><i style="height:${h}%"></i></div>`;
+  }).join("");
+  const mid = Math.floor(last / 2);
+  const end = daily[last].date === today ? "Today" : fmtDay(daily[last].date);
+  return `<div class="usage-card-box usage-chart-wrap">${head}` +
+    `<div class="usage-chart" role="img" aria-label="Daily ${what} from ${escapeHtml(fmtDay(daily[0].date))} to ${escapeHtml(fmtDay(daily[last].date))}, peak ${peak}">${bars}</div>` +
+    `<div class="usage-axis"><span>${escapeHtml(fmtDay(daily[0].date))}</span><span>${escapeHtml(fmtDay(daily[mid].date))}</span><span>${escapeHtml(end)}</span></div></div>`;
+}
+
+// "40K input · 30K cache write · 1.1M cache read · 52K output", leaving out the classes at zero.
+function tokenSplit(x) {
+  return [["input_tokens", "input"], ["cache_write_tokens", "cache write"], ["cache_read_tokens", "cache read"], ["output_tokens", "output"]]
+    .filter(([k]) => (x[k] || 0) > 0).map(([k, label]) => `${fmtTokens(x[k])} ${label}`).join(" · ");
+}
+
+function sharePct(part) {
+  const p = part * 100;
+  return p > 0 && p < 1 ? "<1%" : `${Math.round(p)}%`;
+}
+
+// One breakdown (by model, run, chat, step, account or day). Each row: its name, its calls and
+// tokens by class underneath, its estimated cost and share of the whole on the right, and a thin
+// bar for that share. Two columns, so it reads the same on a phone as on a laptop.
+function usageList(rows, nameCol, nameOf, { empty = "Nothing in this period.", capped = 0 } = {}) {
+  if (!rows || !rows.length) return `<p class="usage-empty">${empty}</p>`;
+  const spendSum = rows.reduce((a, x) => a + (x.spend_usd || 0), 0);
+  const tokSum = rows.reduce((a, x) => a + (x.total_tokens || 0), 0);
+  const byTokens = spendSum === 0;
+  const items = rows.map((x) => {
+    const part = byTokens ? (tokSum ? (x.total_tokens || 0) / tokSum : 0) : (x.spend_usd || 0) / spendSum;
+    const onCluster = (x.cluster && x.cluster.calls) || 0;
+    const free = onCluster > 0 && onCluster === x.calls;
+    const meta = [plural(x.calls, "call"), `${fmtTokens(x.total_tokens || 0)} tokens`];
+    if (onCluster && !free) meta.push(`<span title="${freeNote(x)}">${onCluster} on the ${freeWhere(x)}, free</span>`);
+    if (x.errors) meta.push(`<span class="bad">${x.errors} failed</span>`);
+    const split = tokenSplit(x);
+    const unpriced = x.unpriced_calls ? `<span class="usage-unpriced" title="${plural(x.unpriced_calls, "call")} on a model the price table does not list">+?</span>` : "";
+    const cost = free ? `<strong class="usage-free" title="${freeNote(x)}">Free</strong><span>${freeWhere(x)}</span>`
+      : `<strong>${fmtUsd(x.spend_usd)}${unpriced}</strong><span>${sharePct(part)}</span>`;
+    return `<li class="usage-row${free ? " is-free" : ""}"><div class="usage-row-main"><div class="usage-row-name">${nameOf(x)}</div>` +
+      `<div class="usage-row-meta">${meta.join(" · ")}${split ? `<span class="usage-row-split">${split}</span>` : ""}</div></div>` +
+      `<div class="usage-row-cost">${cost}</div>` +
+      `<div class="usage-row-share" aria-hidden="true"><i style="width:${Math.min(100, part * 100).toFixed(1)}%"></i></div></li>`;
+  }).join("");
+  const more = capped && rows.length >= capped ? `<p class="usage-foot">The ${capped} largest are shown; Export CSV has every call.</p>` : "";
+  return `<div class="usage-list"><div class="usage-list-head"><span>${nameCol}</span><span>Est. cost · share${byTokens ? " of tokens" : ""}</span></div>` +
+    `<ul>${items}</ul></div>${more}`;
+}
+
+const ERROR_TEXT = {
+  credit: "Out of credit — the key's balance is used up for this cycle",
+  rate: "Rate-limited — too many requests or tokens per minute for the key's tier",
+  auth: "Authentication failed — the key was revoked or mistyped",
+  model: "Model not available to this key",
+  context: "Prompt longer than the model's context window",
+  network: "Could not reach the provider",
+  endpoint: "The provider returned an error",
+  refusal: "The model declined the request",
+  unavailable: "The shared model was not answering (its GPU job was being renewed)",
+  busy: "The shared model was busy: the request waited too long in its queue",
+  stopped: "Stopped while waiting for the shared model",
+};
+
+const PERIOD_LABEL = { today: "Today", "7d": "Last 7 days", cycle: "This billing cycle", "30d": "Last 30 days", all: "All time" };
+const PERIOD_IN = { today: "today", "7d": "in the last 7 days", cycle: "in this billing cycle", "30d": "in the last 30 days", all: "yet" };
+
+function usageErrorsHtml(errors) {
+  if (!errors || !errors.length) return "";
+  const n = errors.reduce((a, e) => a + (e.calls || 0), 0);
+  return `<div class="usage-errors" role="note"><span class="material-symbols-outlined msym" aria-hidden="true">error</span>` +
+    `<div><strong>${plural(n, "failed request")}</strong><ul>` +
+    errors.map((e) => `<li>${e.calls}× ${escapeHtml(ERROR_TEXT[e.error_type] || e.error_type)} <span class="muted">· last ${escapeHtml(fmtDate(e.last_at))}</span></li>`).join("") +
+    "</ul></div></div>";
+}
+
+// The breakdown of the picked period: failed requests first, then one list at a time, by model,
+// run or chat. A run and a chat open their conversation.
+const usageView = { by: "model", data: null };
+
+function usageBreakdownHtml(d, by = "model") {
+  const p = (d.totals && d.totals.period) || {};
+  if (!p.calls) {
+    const when = PERIOD_IN[d.period] || "in this period";
+    return `<p class="usage-empty"><strong>No model calls ${when}.</strong> ` +
+      "Every chat reply and run step that calls a model is listed here, with its tokens and estimated cost." +
+      (d.period !== "all" ? " Pick a longer period to see earlier ones." : "") + "</p>";
+  }
+  const views = [
+    ["model", "Models", d.by_model, "Model", (x) => `<code>${escapeHtml(x.model)}</code>`, ""],
+    ["run", "Runs", d.by_run, "Run", (x) => {
+      const q = escapeHtml(x.question || x.run_id);
+      const name = x.conversation_id ? `<a href="#" data-open-chat="${escapeHtml(String(x.conversation_id))}" title="Run ${escapeHtml(x.run_id)}: open its chat">${q}</a>` : `<span title="Run ${escapeHtml(x.run_id)}">${q}</span>`;
+      return name + (x.status ? ` <span class="usage-status ${escapeHtml(x.status)}">${escapeHtml(x.status)}</span>` : "");
+    }, "None of the calls in this period belonged to a run: they were chat replies."],
+    ["chat", "Chats", d.by_chat, "Chat", (x) => {
+      const t = x.title || chatTitle(x.conversation_id) || `chat ${x.conversation_id}`;
+      return `<a href="#" data-open-chat="${escapeHtml(String(x.conversation_id))}">${escapeHtml(t)}</a>`;
+    }, "None of the calls in this period belonged to a chat."],
+  ];
+  const cur = views.find((v) => v[0] === by) || views[0];
+  const seg = `<div class="usage-seg" role="group" aria-label="Break down by">` + views.map(([k, label, rows]) =>
+    `<button type="button" class="usage-seg-btn${k === cur[0] ? " active" : ""}" aria-pressed="${k === cur[0]}" data-usage-by="${k}">${label} <span class="usage-seg-n">${(rows || []).length}</span></button>`).join("") + "</div>";
+  return usageErrorsHtml(d.errors) + seg + usageList(cur[2], cur[3], cur[4], { empty: cur[5], capped: 50 });
+}
+
+function usagePeriodTotalHtml(d) {
+  const p = (d.totals && d.totals.period) || {};
+  return `${escapeHtml(PERIOD_LABEL[d.period] || "")}: ${usageTotalText(p)}`;
+}
+
+// "~$2.47 · 2.4M API tokens · 86 API calls · 1 call on the cluster GPU (free)"
+function usageTotalText(t) {
+  const api = apiPart(t);
+  const free = freeParts(t).map((f) => ` · ${plural(f.calls, "call")} on the ${lowerFirst(f.name)} (free)`);
+  return `${fmtUsd(t.spend_usd)} · ${fmtTokens(api.total_tokens)} API tokens · ${plural(api.calls, "API call")}` + free.join("");
+}
+
+function usageNoteHtml(d) {
+  return `<span class="material-symbols-outlined msym" aria-hidden="true">info</span><span>${escapeHtml(d.note || "")} ` +
+    `<a href="${escapeHtml(d.console_url || "")}" target="_blank" rel="noopener">Open the Claude Console usage page</a>.` +
+    (d.pricing && d.pricing.as_of ? ` Prices as of ${escapeHtml(fmtDay(d.pricing.as_of, { year: true }))}.` : "") + "</span>";
+}
+
+function renderUsage(d) {
+  $("usageCycle").textContent = usageCycleText(d.budget && d.budget.cycle);
+  $("usageBody").innerHTML = usageSummaryHtml(d) + usageChart(d.daily);
+  $("usagePeriodTotal").innerHTML = usagePeriodTotalHtml(d);
+  $("usageBreakdown").innerHTML = usageBreakdownHtml(d, usageView.by);
+  $("usageNote").innerHTML = usageNoteHtml(d);
+}
+
+function usageFailedHtml(why) {
+  return `<div class="usage-empty">Could not load your usage (${escapeHtml(why)}). ` +
+    `<button type="button" class="secondary small" data-usage-retry>Try again</button></div>`;
+}
+
+async function loadUsage() {
+  const body = $("usageBody");
+  if (!body) return;
+  const clear = () => { ["usageCycle", "usagePeriodTotal", "usageBreakdown", "usageNote"].forEach((id) => { $(id).innerHTML = ""; }); };
+  if (!authed()) { clear(); body.innerHTML = '<p class="usage-empty">Usage tracking needs an account.</p>'; return; }
+  const period = ($("usagePeriod") && $("usagePeriod").value) || "cycle";
+  $("usageExport").href = `/api/usage/export.csv?period=${encodeURIComponent(period)}&tz=${encodeURIComponent(userTz())}`;
+  try {
+    const r = await fetch(`/api/usage?period=${encodeURIComponent(period)}&tz=${encodeURIComponent(userTz())}`);
+    if (!r.ok) { clear(); body.innerHTML = usageFailedHtml(`HTTP ${r.status}`); return; }
+    const d = await r.json();
+    usageView.data = d;
+    renderUsage(d);
+    fillBudgetForm(d.budget && d.budget.budget);
+  } catch (err) { clear(); body.innerHTML = usageFailedHtml(err.message); }
+}
+
+function fillBudgetForm(b) {
+  if (!$("budgetForm") || $("budgetForm").dataset.dirty) return;
+  $("budgetCredit").value = b && b.monthly_credit_usd != null ? b.monthly_credit_usd : "";
+  $("budgetResetDay").value = (b && b.reset_day) || 1;
+  $("budgetThresholds").value = ((b && b.thresholds) || [50, 80, 100]).join(", ");
+  $("budgetHardLimit").value = b && b.hard_limit_usd != null ? b.hard_limit_usd : "";
+  $("budgetHardMode").value = (b && b.hard_limit_mode) || "confirm";
+}
+
+async function saveBudget(e) {
+  e.preventDefault();
+  const num = (id) => { const v = $(id).value.trim(); return v === "" ? null : Number(v); };
+  const thresholds = $("budgetThresholds").value.split(/[,\s]+/).map((x) => parseInt(x, 10)).filter((x) => x > 0);
+  const payload = { monthly_credit_usd: num("budgetCredit"), reset_day: parseInt($("budgetResetDay").value, 10) || 1,
+    thresholds, hard_limit_usd: num("budgetHardLimit"), hard_limit_mode: $("budgetHardMode").value };
+  const r = await fetch("/api/usage/budget", { method: "PUT", headers: { "Content-Type": "application/json" }, body: JSON.stringify(payload) });
+  const d = await r.json().catch(() => ({}));
+  if (!r.ok) { toast(d.detail || "Could not save the budget."); return; }
+  delete $("budgetForm").dataset.dirty;
+  toast("Budget saved.");
+  loadUsage();
+  checkBudgetNotices();
+}
+
+// A run's breakdown by pipeline step and model, under its card in Runs.
+async function toggleRunUsage(btn) {
+  const card = btn.closest(".run-card");
+  let box = card && card.querySelector(".run-usage");
+  if (box) { box.remove(); btn.textContent = "Usage"; return; }
+  box = document.createElement("div");
+  box.className = "run-usage";
+  box.innerHTML = '<span class="muted small">Loading…</span>';
+  card.appendChild(box);
+  btn.textContent = "Hide usage";
+  try {
+    const d = await (await fetch(`/api/usage/run/${encodeURIComponent(btn.dataset.runUsage)}`)).json();
+    box.innerHTML = runUsageHtml(d);
+  } catch (err) { box.innerHTML = `<span class="bad small">Could not load: ${escapeHtml(err.message)}</span>`; }
+}
+
+function runUsageHtml(d) {
+  if (!d.calls) return '<span class="muted small">No model calls were recorded for this run (runs before usage tracking have none).</span>';
+  return `<p class="run-usage-total"><strong>Estimated</strong> ${usageTotalText(d)}</p>` +
+    usageErrorsHtml(d.errors) +
+    `<h4>By step</h4>${usageList(d.by_step, "Step", (x) => escapeHtml(x.step))}` +
+    `<h4>By model</h4>${usageList(d.by_model, "Model", (x) => `<code>${escapeHtml(x.model)}</code>`)}`;
+}
+
+function adminUsageHtml(d) {
+  const t = d.totals || {};
+  const since = fmtDay(String(d.since || "").slice(0, 10), { year: true });
+  const tiles = `<div class="usage-tiles">` +
+    usageTile("Estimated API spend", fmtUsd(t.spend_usd), `Since ${escapeHtml(since)}`) + apiTokensTile(t) +
+    usageTile("Accounts", String((d.by_user || []).length), "with at least one model call") + "</div>";
+  const daily = (d.by_day || []).map((x) => ({ date: x.date, spend_usd: x.spend_usd, total_tokens: x.total_tokens, calls: x.calls }));
+  return tiles + usageChart(daily) +
+    `<h4>By account</h4>${usageList(d.by_user, "Account", (x) => escapeHtml(x.username))}` +
+    `<h4>By model</h4>${usageList(d.by_model, "Model", (x) => `<code>${escapeHtml(x.model)}</code>`)}` +
+    `<h4>By day</h4>${usageList([...(d.by_day || [])].filter((x) => x.calls).reverse(), "Day", (x) => escapeHtml(fmtDay(x.date, { year: true })))}`;
+}
+
+async function loadAdminUsage() {
+  const el = $("adminUsageBody");
+  if (!el) return;
+  el.innerHTML = '<div class="empty-hint">Loading…</div>';
+  try {
+    const days = ($("adminUsageDays") && $("adminUsageDays").value) || 30;
+    const r = await fetch(`/api/admin/usage?days=${encodeURIComponent(days)}&tz=${encodeURIComponent(userTz())}`);
+    if (!r.ok) { el.innerHTML = '<div class="empty-hint">Admin only.</div>'; return; }
+    el.innerHTML = adminUsageHtml(await r.json());
+  } catch (err) { el.innerHTML = `<div class="empty-hint">Failed to load: ${escapeHtml(err.message)}</div>`; }
+}
+
+// Scroll to the budget form and put the cursor in its first field.
+function editBudget() {
+  const sec = $("budgetSection");
+  sec.scrollIntoView({ behavior: "smooth", block: "start" });
+  setTimeout(() => $("budgetCredit").focus({ preventScroll: true }), 300);
+}
+
+function wireUsage() {
+  document.querySelectorAll("[data-guide]").forEach((a) => { a.href = GUIDE_URL; });
+  $("accountKeysBtn").addEventListener("click", () => openApiKeys());
+  $("usageRefresh").addEventListener("click", loadUsage);
+  $("usagePeriod").addEventListener("change", loadUsage);
+  $("budgetForm").addEventListener("submit", saveBudget);
+  $("budgetForm").addEventListener("input", () => { $("budgetForm").dataset.dirty = "1"; });
+  $("changePwForm").addEventListener("input", () => $("cpProblem").classList.add("hidden"));
+  const tabs = [...document.querySelectorAll(".account-tab")];
+  tabs.forEach((b) => {
+    b.addEventListener("click", () => switchAccountTab(b.dataset.accountTab));
+    // Arrow keys move between the tabs, as in any tab list.
+    b.addEventListener("keydown", (e) => {
+      if (e.key !== "ArrowRight" && e.key !== "ArrowLeft") return;
+      const shown = tabs.filter((t) => !t.classList.contains("hidden"));
+      const next = shown[(shown.indexOf(b) + (e.key === "ArrowRight" ? 1 : shown.length - 1)) % shown.length];
+      switchAccountTab(next.dataset.accountTab); next.focus(); e.preventDefault();
+    });
+  });
+  const onUsageClick = (e) => {
+    const a = e.target.closest("[data-open-chat]");
+    if (a) { e.preventDefault(); openChat(a.dataset.openChat); return; }
+    if (e.target.closest("[data-budget-edit]")) { e.preventDefault(); editBudget(); return; }
+    if (e.target.closest("[data-usage-retry]")) { loadUsage(); return; }
+    const by = e.target.closest("[data-usage-by]");
+    if (by && usageView.data) { usageView.by = by.dataset.usageBy; $("usageBreakdown").innerHTML = usageBreakdownHtml(usageView.data, usageView.by); }
+  };
+  $("usageBody").addEventListener("click", onUsageClick);
+  $("usageBreakdown").addEventListener("click", onUsageClick);
+  $("adminUsageRefresh").addEventListener("click", loadAdminUsage);
+  $("adminUsageDays").addEventListener("change", loadAdminUsage);
+  $("chatUsage").addEventListener("click", () => openAccount("usage"));
+  $("apiKeysUsageLink").addEventListener("click", (e) => { e.preventDefault(); $("apiKeysModal").classList.add("hidden"); openAccount("usage"); });
+  $("budgetNotice").addEventListener("click", (e) => {
+    if (e.target.closest("[data-dismiss]")) { $("budgetNotice").classList.add("hidden"); return; }
+    if (e.target.closest("[data-usage-open]")) { e.preventDefault(); openAccount("usage"); }
+  });
 }
 
 // ---- init -----------------------------------------------------------------
@@ -5623,11 +8468,14 @@ function init() {
   $("reattachDismiss").addEventListener("click", () => $("reattachHint").classList.add("hidden"));
   $("disconnectBtn").addEventListener("click", disconnect);
   $("stopGpuBtn").addEventListener("click", stopGpu);
-  $("storageBtn").addEventListener("click", openStorage);
-  $("storageClose").addEventListener("click", () => $("storageModal").classList.add("hidden"));
-  $("storageModal").addEventListener("click", (e) => { if (e.target.id === "storageModal") $("storageModal").classList.add("hidden"); });
-  $("storageItems").addEventListener("click", (e) => { const b = e.target.closest("[data-path]"); if (b) deleteStorageItem(b.dataset.path); });
-  $("modelSelect").addEventListener("change", (e) => selectModel(e.target.value));
+  $("sessChip").addEventListener("click", openStorageSessions);
+  $("storageRefresh").addEventListener("click", loadStorageTab);
+  $("storeServerBody").addEventListener("click", onServerStorageClick);
+  $("originalsBox").addEventListener("click", (e) => {
+    const b = e.target.closest("button[data-orig]");
+    if (b) originalsAction(b.dataset.orig, b.dataset.plan);
+  });
+  $("storeHpcBody").addEventListener("click", (e) => { const b = e.target.closest("button[data-path]"); if (b) deleteStorageItem(b.dataset.path); });
 
   // --- LLM endpoint + API-key manager ---
   // "＋ Add your own API key…" is a menu ITEM, not an endpoint: it opens the manager and snaps the
@@ -5685,10 +8533,6 @@ function init() {
   $("egressCancel").addEventListener("click", () => closeEgressDialog(false));
   $("egressClose").addEventListener("click", () => closeEgressDialog(false));
   $("egressModal").addEventListener("click", (e) => { if (e.target.id === "egressModal") closeEgressDialog(false); });
-  $("pullModelBtn").addEventListener("click", () => {
-    const tag = prompt("Pull a model tag from Ollama (e.g. qwen3:32b, llama3.1:8b):");
-    if (tag && tag.trim()) selectModel(tag.trim());
-  });
   $("duoPushBtn").addEventListener("click", () => submitDuo("1"));
   $("duoSubmitBtn").addEventListener("click", () => submitDuo($("duoInput").value.trim() || "1"));
   $("duoInput").addEventListener("keydown", (e) => { if (e.key === "Enter") { e.preventDefault(); submitDuo($("duoInput").value.trim() || "1"); } });
@@ -5711,28 +8555,18 @@ function init() {
     const x = e.target.closest("[data-clear-path]");
     if (x) toggleBound(x.dataset.clearPath);
   });
-  $("caseNoteChips").addEventListener("click", (e) => { if (e.target.closest("[data-clear-note]")) { state.caseNote = null; renderCaseNoteChip(); } });   // this chat's note only
-  $("caseNoteFile").addEventListener("change", (e) => { const f = e.target.files[0]; if (f) attachCaseNote(f); e.target.value = ""; });
-  // "＋ Data" popover: upload a file/folder, or pick a recent upload.
+  // "＋ Data": Files or Folder, each straight to its dialog; or drop files and folders onto the chat.
   $("dataMenuBtn").addEventListener("click", (e) => { e.stopPropagation(); toggleDataMenu(); });
   $("dataMenu").addEventListener("click", (e) => {
     const act = e.target.closest("[data-act]");
-    if (act && act.dataset.act === "server") {
-      $("serverPathRow").classList.remove("hidden");
-      $("serverPathInput").focus();
-      return;
-    }
-    if (act) {
-      const target = { file: "datasetFile", folder: "datasetDir", note: "caseNoteFile" }[act.dataset.act];
-      if (target) $(target).click();
-      toggleDataMenu(false);
-      return;
-    }
-    const rec = e.target.closest("[data-path]");
-    // Toggle the file in/out of the bind-set; keep the popover OPEN so several can be picked at once.
-    if (rec) { toggleBound(rec.dataset.path); }
+    const target = act && { file: "datasetFile", folder: "datasetDir" }[act.dataset.act];
+    if (target) $(target).click();
+    if (act) toggleDataMenu(false);
   });
-  document.addEventListener("click", (e) => { if (!e.target.closest(".data-menu-wrap")) toggleDataMenu(false); });
+  wireDataDrop();
+  document.addEventListener("click", (e) => {
+    if (!e.composedPath().some((n) => n.classList && n.classList.contains("data-menu-wrap"))) toggleDataMenu(false);
+  });
   $("downloads").addEventListener("click", (e) => {
     if (e.target.closest("[data-rerun]")) { primeComposer("rerun"); return; }
     const tab = e.target.closest("[data-rtab]");
@@ -5741,25 +8575,26 @@ function init() {
     if (cell) { e.preventDefault(); openResultFile(cell.dataset.url, cell.dataset.kind, cell.dataset.name); }
   });
   $("filePreviewClose").addEventListener("click", () => $("filePreviewModal").classList.add("hidden"));
+  $("dsPreviewClose").addEventListener("click", closeDatasetPreview);
+  $("dsPreviewBody").addEventListener("click", onDatasetPreviewClick);
+  $("datasetPreviewModal").addEventListener("click", (e) => { if (e.target.id === "datasetPreviewModal") closeDatasetPreview(); });
+  document.addEventListener("keydown", (e) => {
+    if (e.key === "Escape" && !$("datasetPreviewModal").classList.contains("hidden")) closeDatasetPreview();
+  });
   $("filePreviewModal").addEventListener("click", (e) => { if (e.target.id === "filePreviewModal") $("filePreviewModal").classList.add("hidden"); });
   $("chatInput").addEventListener("keydown", (e) => { if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); $("chatForm").requestSubmit(); } });
-  // Live-swap Send⇄Stop as the user types during a run / plan review.
-  $("chatInput").addEventListener("input", updateComposerButton);
+  // Live-swap Send⇄Stop as the user types during a run / plan review; the text is this chat's draft.
+  $("chatInput").addEventListener("input", () => {
+    const c = activeChat();
+    if (c) { c.draft = $("chatInput").value; saveComposer(c); }
+    updateComposerButton();
+  });
   $("serverPathOffer").addEventListener("click", (e) => {
     const b = e.target.closest("[data-spo-bind]");
     if (b) { bindServerPath(b.dataset.spoBind); return; }
     const x = e.target.closest("[data-spo-dismiss]");
     if (x) { state.serverOfferDismissed.add(x.dataset.spoDismiss); renderServerPathOffer(); }
   });
-  const bindTyped = async () => {
-    const inp = $("serverPathInput");
-    if (await bindServerPath(inp.value)) { inp.value = ""; $("serverPathRow").classList.add("hidden"); toggleDataMenu(false); }
-  };
-  $("serverPathBind").addEventListener("click", bindTyped);
-  $("serverPathInput").addEventListener("keydown", (e) => { if (e.key === "Enter") { e.preventDefault(); bindTyped(); } });
-  wireMethods();
-  $("modeSelect").addEventListener("change", onModeChange);
-  { const rs = $("routeSelect"); if (rs) rs.addEventListener("change", onRouteChange); }
   $("newSessionBtn").addEventListener("click", newSession);
   $("sessionList").addEventListener("click", (e) => {
     const del = e.target.closest("[data-del]");
@@ -5769,12 +8604,12 @@ function init() {
   });
   $("toggleLeft").addEventListener("click", () => togglePanel("left"));
   $("toggleRight").addEventListener("click", () => togglePanel("right"));
+  $("sideTabPlan").addEventListener("click", () => { state.planView = null; selectSideTab("plan"); renderPlanPanel(); });
+  $("sideTabResults").addEventListener("click", () => selectSideTab("results"));
   $("leftLogoutBtn").addEventListener("click", doLogout);
 
   syncAuthMethod();
   applyUiPrefs();
-  loadPresets();
-  loadSkills();
   loadSessions();
   renderSessionList();
   renderChat();

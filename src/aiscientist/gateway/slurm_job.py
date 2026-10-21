@@ -70,6 +70,18 @@ class SlurmJobError(RuntimeError):
         self.detail = detail
 
 
+class SlurmQueueTimeout(SlurmJobError):
+    """The job waited out every window in the queue and never started: the cluster queue was too
+    long, not a fault in the job. ``reason`` is Slurm's last pending reason (``Priority``,
+    ``Resources``, ...). A caller can submit the same job again later; nothing ran."""
+
+    def __init__(self, message: str, *, job_id: str | None = None, reason: str = "",
+                 waited_s: float = 0.0) -> None:
+        super().__init__(message, job_id=job_id)
+        self.reason = reason
+        self.waited_s = waited_s
+
+
 class JobCancelled(SlurmJobError):
     """The user asked to Stop mid-run, so the in-flight job was ``scancel``-led. Distinct from a
     real failure so callers can end the run cleanly instead of falling back to a LOCAL re-run
@@ -198,6 +210,7 @@ def build_analysis_script(
     container_module: str = "",
     log_dir: str = ".",
     exclude: str = "",
+    constraint: str = "",
 ) -> str:
     """A batch sbatch script that runs one contained analysis command and exits.
 
@@ -212,6 +225,9 @@ def build_analysis_script(
     # hpc3-gpu-n54-01, whose GPU1 is dead but which Slurm keeps offering. A GPU job placed there
     # fails for a reason that has nothing to do with the model, and reads like a model problem.
     exclude_line = f"#SBATCH --exclude={exclude}\n" if exclude else ""
+    # Node features the job needs (``--constraint``), e.g. ``nvme`` with ``gpu:1`` for an A30 or an
+    # A100 and never a V100 (AISCIENTIST_CORPUS_SCAN_CONSTRAINT).
+    constraint_line = f"#SBATCH --constraint={constraint}\n" if constraint else ""
     module_line = f"module load {container_module} 2>/dev/null || true\n" if container_module else ""
     return (
         "#!/bin/bash\n"
@@ -220,6 +236,7 @@ def build_analysis_script(
         f"{account_line}"
         f"{gres_line}"
         f"{exclude_line}"
+        f"{constraint_line}"
         f"#SBATCH --cpus-per-task={cpus}\n"
         f"#SBATCH --mem={mem_gb}G\n"
         f"#SBATCH --time={time_limit}\n"
@@ -363,6 +380,7 @@ def acquire_allocation(
         windows_left -= 1
         deadline = time.monotonic() + config.startup_timeout_s
         died = False
+        announced = False               # one "pending" line per window, not one per poll
         while time.monotonic() < deadline:
             _check_cancel(executor, job_id, should_cancel, emit)   # Stop honoured while queued
             state, node = _queue_state(executor, job_id)
@@ -378,7 +396,8 @@ def acquire_allocation(
                 emit("warning", "slurm", f"Job {job_id} died on startup (state {state}); re-requesting ...")
                 died = True
                 break
-            if state == _PENDING:
+            if state == _PENDING and not announced:
+                announced = True
                 emit("info", "slurm", f"Job {job_id} pending in the queue ...")
             time.sleep(config.poll_interval_s)
         if died:
@@ -409,13 +428,67 @@ def acquire_allocation(
         executor.exec(f"scancel {job_id}")
     total_s = config.startup_timeout_s * (config.max_attempts + (1 if extended else 0))
     why = f"; Slurm's reason: {reason}" if reason else ""
-    raise SlurmJobError(
+    raise SlurmQueueTimeout(
         f"{spec.job_name} did not get a node within {total_s:.0f}s over {submissions} submission(s) "
         f"(the cluster queue is too long right now, not a fault in the job{why}).",
+        job_id=job_id or None, reason=reason, waited_s=float(total_s),
     )
 
 
-def supervise_job(
+def parse_accounting(text: str, job_id: str) -> dict | None:
+    """Read only the terminal parent allocation; .batch/.extern would double-count hours."""
+    import math
+    import re
+
+    for line in text.splitlines():
+        fields = line.strip().split("|")
+        if len(fields) < 5 or fields[0] != job_id or not _is_terminal_sacct(fields[4]):
+            continue
+        try:
+            seconds, cpus = float(fields[1]), int(fields[2])
+            if not math.isfinite(seconds) or seconds < 0 or cpus < 0:
+                continue
+            # AllocTRES can include both gres/gpu and typed GPU counts. Use the aggregate.
+            tres = dict(part.split("=", 1) for part in fields[3].split(",") if "=" in part)
+            gpus = int(tres.get("gres/gpu", 0))
+            if "gres/gpu" not in tres:
+                gpus = sum(int(v) for k, v in tres.items() if re.match(r"gres/gpu:", k))
+            return {"seconds": seconds, "cpu_hours": seconds * cpus / 3600,
+                    "gpu_hours": seconds * gpus / 3600}
+        except (ValueError, TypeError):
+            continue
+    return None
+
+
+def collect_accounting(executor: RemoteExecutor, job_id: str, elapsed: float | None = None) -> None:
+    from .estimates import job_usage
+
+    collector = job_usage.get()
+    if collector is None:
+        return
+    try:
+        result = _query(executor, f"sacct -j {job_id} --noheader --parsable2 "
+                        "--format=JobIDRaw,ElapsedRaw,AllocCPUS,AllocTRES,State")
+        usage = parse_accounting(result.stdout, job_id)
+        if usage:
+            collector.append(usage)
+            return
+    except Exception:  # accounting may be disabled
+        pass
+    if elapsed is not None:
+        # This timer starts after allocation, unlike the outer tool timer (which includes queuing).
+        collector.append({"seconds": elapsed, "source": "wall_clock"})
+
+
+def supervise_job(executor: RemoteExecutor, job_id: str, node: str, attempts: int, **kwargs) -> JobResult:
+    started = time.monotonic()
+    try:
+        return _supervise_job(executor, job_id, node, attempts, **kwargs)
+    finally:
+        collect_accounting(executor, job_id, max(0, time.monotonic() - started))
+
+
+def _supervise_job(
     executor: RemoteExecutor,
     job_id: str,
     node: str,
@@ -487,10 +560,33 @@ def run_batch_job(
     durably recorded the instant it is submitted — before it is supervised — closing the
     window where a gateway crash would orphan a running job with nothing tracking its id."""
     emit = emit or _noop_emit
-    job_id, node, attempts = acquire_allocation(
-        executor, spec, config=acquire, emit=emit, on_submit=on_submit, should_cancel=should_cancel
-    )
-    return supervise_job(executor, job_id, node, attempts, run=run, emit=emit, should_cancel=should_cancel)
+    submitted = []
+
+    def submitted_job(job_id: str) -> None:
+        submitted.append(job_id)
+        if on_submit:
+            on_submit(job_id)
+
+    try:
+        job_id, node, attempts = acquire_allocation(
+            executor, spec, config=acquire, emit=emit, on_submit=submitted_job, should_cancel=should_cancel
+        )
+    except Exception:
+        for previous in submitted:
+            collect_accounting(executor, previous, 0)
+        if not submitted:
+            from .estimates import job_usage
+
+            collector = job_usage.get()
+            if collector is not None:
+                collector.append({"seconds": 0, "source": "wall_clock"})
+        raise
+    try:
+        return supervise_job(executor, job_id, node, attempts, run=run, emit=emit, should_cancel=should_cancel)
+    finally:
+        for previous in submitted:
+            if previous != job_id:
+                collect_accounting(executor, previous, 0)
 
 
 def reattach_job(

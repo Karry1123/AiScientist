@@ -32,8 +32,8 @@ from ..agents.sandbox import sandbox_network_enabled
 from ..tools.api import ANALYSIS_ENTRYPOINT
 from .executor import RemoteExecutor
 from .slurm_job import (
-    AcquireConfig, JobCancelled, RunConfig, SlurmJobError, SlurmJobSpec, build_analysis_script,
-    run_batch_job, container_exec, slurm_time_to_seconds)
+    AcquireConfig, JobCancelled, RunConfig, SlurmJobError, SlurmJobSpec, SlurmQueueTimeout,
+    build_analysis_script, run_batch_job, container_exec, slurm_time_to_seconds)
 
 _ARGS_EOF = "AISCIENTIST_ANALYSIS_ARGS_EOF"
 _RESULT_MARKER = "AISCIENTIST_RESULT_JSON "
@@ -123,6 +123,12 @@ class SlurmAnalysisExecutor:
     container_module: str = ""
     container_bin: str = "apptainer"
     startup_timeout_s: int = 600
+    # How many ``startup_timeout_s`` windows a job may wait in the queue before it is cancelled
+    # (a queued job keeps its place across them). The corpus scan's paid GPU queue can be hours.
+    queue_windows: int = 3
+    # Forward the queue's progress (submitted, still queued and why, running on which node) to
+    # ``notify``: for a job someone is watching wait for a scarce card.
+    queue_progress: bool = False
     # 0 = AUTO: derive the job-wait from the SBATCH --time (`time_limit`) + a margin, so the gateway
     # waits as long as Slurm allows and never scancels a healthy, still-progressing job early. The old
     # fixed 1800s (30 min) silently killed a WGS VEP job that legitimately runs ~30-60 min under a 2h
@@ -195,6 +201,23 @@ class SlurmAnalysisExecutor:
     # handed to the job as ``--dataset-root``, so a tool can read the whole tree, not only the one
     # primary file ``remote_dataset`` names. None for a single-file dataset.
     dataset_root: str | None = None
+    # EVERY folder bound to the run, as ``{"name", "path"}`` with its dfs3b path (the primary's
+    # folder included): each is bound read-only and handed to the job as ``--input-folders``, so a
+    # tool such as run_cellqc reads the libraries of all of them (RCHENLAB/AiScientist issue 22).
+    input_folders: tuple[dict[str, str], ...] = ()
+    # A GPU for the job (``gres``, ``constraint``, ``exclude``: as in ``build_analysis_script``). Empty
+    # for every line but the corpus scan, which brings its own model (gateway/corpus_scan.py).
+    gres: str = ""
+    constraint: str = ""
+    exclude: str = ""
+    # The tool container's network. None = ``sandbox_network_enabled()``; the corpus scan needs the
+    # host's network, because its model listens on the node's 127.0.0.1.
+    network: bool | None = None
+    # ``(job name, scratch dir, result file) -> (shell, payload env)``: shell the job runs on the node
+    # BEFORE the tool's container (the corpus scan starts its vLLM there), and exports put in front of
+    # the tool's command inside the container. The shell may write the result file and ``exit 0`` to
+    # end the job with a result of its own (the model never came up).
+    job_prelude: Callable[[str, str, str], tuple[str, str]] | None = None
     _images: dict[str, str] = field(default_factory=dict, repr=False)
     _counter: int = field(default=0, repr=False)
     _scratch: str | None = field(default=None, repr=False)
@@ -223,7 +246,11 @@ class SlurmAnalysisExecutor:
                     self.on_fallback(f"Slurm job failed (no local fallback): {exc}")
                 except Exception:  # noqa: BLE001
                     pass
-            return {"status": "error", "execution_mode": "hpc_slurm",
+            # A job that never left the queue says so: nothing ran, and the caller may submit it
+            # again (the corpus scan does, as a retry of that one step).
+            queued = ({"queue_timeout": True, "slurm_reason": exc.reason}
+                      if isinstance(exc, SlurmQueueTimeout) else {})
+            return {"status": "error", "execution_mode": "hpc_slurm", **queued,
                     "error": (f"HPC3 analysis job failed: {exc}. Not run on the gateway host "
                               "(local fallback is disabled). Fix the cause and call the tool again "
                               "— it will be resubmitted to HPC3.")}
@@ -474,10 +501,17 @@ class SlurmAnalysisExecutor:
         # The job's CPU count, for a tool that runs a multi-threaded pipeline of its own.
         cpus_env = f"export AISCIENTIST_JOB_CPUS={int(job['cpus'])}; "
         root_arg = f" --dataset-root {shlex.quote(root)}" if root else ""
+        folders = [{"name": str(f.get("name") or ""), "path": str(f["path"])}
+                   for f in self.input_folders if isinstance(f, dict) and f.get("path")]
+        folders_arg = (f" --input-folders {shlex.quote(json.dumps(folders, ensure_ascii=False))}"
+                       if folders else "")
+        prelude, prelude_env = (self.job_prelude(name, scratch, res_f) if callable(self.job_prelude)
+                                else ("", ""))
         inner_payload = (
-            f"{pysrc_env}{deps_env}{cpus_env}export MPLBACKEND=Agg; "
+            f"{pysrc_env}{deps_env}{cpus_env}{prelude_env}export MPLBACKEND=Agg; "
             f"{self.entrypoint} --tool {shlex.quote(tool)} --workspace {shlex.quote(ws)} "
-            f"--dataset {shlex.quote(ds)}{root_arg} --args {shlex.quote(args_f)} > {res_f} 2> {log_f}"
+            f"--dataset {shlex.quote(ds)}{root_arg}{folders_arg} --args {shlex.quote(args_f)} "
+            f"> {res_f} 2> {log_f}"
         )
         # Bind the dataset's PARENT DIRECTORY, never the bare file: a file bind FATALs with
         # "destination ... doesn't exist in container" when that path is absent from the image
@@ -493,16 +527,25 @@ class SlurmAnalysisExecutor:
         root_dir = _outside_ws(root)
         if root_dir and ds_dir and (ds_dir.rstrip("/") + "/").startswith(root_dir.rstrip("/") + "/"):
             ds_dir = ""                          # the folder bind already exposes the primary file
-        binds_ro = tuple(p for p in (root_dir, ds_dir, self.source_dir, deps_dir,
+        folder_dirs: list[str] = []
+        for f in folders:
+            d = _outside_ws(f["path"])
+            if d and d != root_dir and d not in folder_dirs:
+                folder_dirs.append(d)
+        binds_ro = tuple(p for p in (root_dir, ds_dir, *folder_dirs, self.source_dir, deps_dir,
                                      *self.extra_ro_binds) if p)
         binds_rw = tuple(p for p in (ws, scratch, *self.extra_rw_binds) if p)
+        network = sandbox_network_enabled() if self.network is None else self.network
         inner = container_exec(
             job["image"], inner_payload,
-            binds_ro=binds_ro, binds_rw=binds_rw, nv=False, network=sandbox_network_enabled(),
+            binds_ro=binds_ro, binds_rw=binds_rw, nv=False, network=network,
             container_bin=self.container_bin)
+        if prelude:
+            inner = f"{prelude}\n{inner}"
         script = build_analysis_script(
             name, inner, partition=self.partition, cpus=job["cpus"], mem_gb=job["mem_gb"],
-            time_limit=job["time_limit"], account=self.account, gres="",  # CPU-only
+            time_limit=job["time_limit"], account=self.account, gres=self.gres,
+            exclude=self.exclude, constraint=self.constraint,
             container_module=self.container_module, log_dir=scratch)
         # run_timeout_s == 0 → AUTO: wait as long as the SBATCH --time allows (+5 min margin), so a
         # healthy long job (e.g. WGS VEP) isn't scancelled early. Completion still returns immediately.
@@ -511,8 +554,10 @@ class SlurmAnalysisExecutor:
         spec = SlurmJobSpec(script=script, job_name=name, submit_dir=scratch)
         result = run_batch_job(
             self.remote, spec,
-            acquire=AcquireConfig(startup_timeout_s=self.startup_timeout_s),
+            acquire=AcquireConfig(startup_timeout_s=self.startup_timeout_s,
+                                  max_attempts=max(1, self.queue_windows)),
             run=RunConfig(run_timeout_s=run_timeout),
+            emit=(lambda level, _stage, message: self._say(level, message)) if self.queue_progress else None,
             should_cancel=self.should_cancel)
 
         out = self._collect(res_f, log_f, result)

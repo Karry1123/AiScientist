@@ -10,8 +10,9 @@ import socketserver
 import subprocess
 import threading
 import time
+from contextlib import contextmanager
 from pathlib import Path
-from typing import Callable, Iterator
+from typing import Any, Callable, Iterator
 
 import paramiko
 
@@ -487,6 +488,11 @@ class SSHExecutor:
             client = self._client
         return client.open_sftp()
 
+    def open_sftp(self) -> "paramiko.SFTPClient":
+        """An SFTP channel on the transfer host that the caller keeps open and closes: for a loop
+        of many small reads and writes (``gateway/llm_relay.py``, the model calls of a job)."""
+        return self._open_sftp()
+
     def put_file(self, local_path: str, remote_path: str) -> None:
         """Upload ``local_path`` to ``remote_path`` via SFTP, mkdir-ing the remote parent
         first (SFTP does not auto-create dirs). Used to stage a dataset onto shared DFS for
@@ -782,6 +788,19 @@ class SSHExecutor:
         finally:
             sftp.close()
 
+    @contextmanager
+    def open_read(self, remote_path: str, bufsize: int = 1 << 16) -> Iterator[Any]:
+        """A remote file open for random-access reads over SFTP on the transfer host, for a reader
+        that seeks: h5py reading an ``.h5ad``'s metadata and first rows pulls only the byte ranges it
+        asks for, never the matrix. Each read that misses the buffer fetches at least ``bufsize``
+        bytes, so the many small metadata reads cost a few dozen round trips, not hundreds."""
+        sftp = self._open_sftp()
+        try:
+            with sftp.open(remote_path, "rb", bufsize=bufsize) as handle:
+                yield handle
+        finally:
+            sftp.close()
+
     def remote_size(self, remote_path: str) -> int:
         """Size of a remote file in bytes (0 when it is missing or unreadable)."""
         sftp = self._open_sftp()
@@ -789,6 +808,47 @@ class SSHExecutor:
             return int(sftp.stat(remote_path).st_size or 0)
         except (OSError, paramiko.SSHException, TypeError, ValueError):
             return 0
+        finally:
+            sftp.close()
+
+    def get_file_resumable(self, remote_path: str, local_path: str,
+                           progress: "Callable[[int, int], None] | None" = None,
+                           block: int = 16 * 1024 * 1024) -> None:
+        """:meth:`get_file` for large files, the way back of :meth:`put_file_resumable`: writes
+        ``<local>.part``, continuing from where an interrupted copy stopped, and renames it into
+        place once it holds every byte. Over SFTP on the transfer host, one window of ``block``
+        bytes at a time (as :meth:`read_stream`), so a 20 GB matrix never sits in memory.
+        ``progress(received, total)`` is called after each window; an exception it raises aborts the
+        copy and leaves the ``.part``."""
+        part = local_path + ".part"
+        sftp = self._open_sftp()
+        try:
+            with sftp.open(remote_path, "rb") as handle:
+                total = int(handle.stat().st_size or 0)
+                offset = os.path.getsize(part) if os.path.exists(part) else 0
+                if offset > total:
+                    offset = 0                      # not this file's: start again
+                with open(part, "ab" if offset else "wb") as out:
+                    while offset < total:
+                        for data in handle.readv([(offset, min(block, total - offset))]):
+                            if not data:
+                                raise GatewayError(f"{remote_path} ended at {offset} of {total} bytes.",
+                                                   stage="ssh_get")
+                            out.write(data)
+                            offset += len(data)
+                        if progress is not None:
+                            progress(offset, total)
+            landed = os.path.getsize(part)
+            if landed != total:
+                raise GatewayError(f"Download of {remote_path} stopped at {landed} of {total} bytes.",
+                                   stage="ssh_get")
+            os.replace(part, local_path)
+        except (OSError, paramiko.SSHException) as exc:
+            raise GatewayError(
+                f"Failed to download {remote_path} -> {local_path}.",
+                stage="ssh_get",
+                detail=error_detail(exc),
+            ) from exc
         finally:
             sftp.close()
 

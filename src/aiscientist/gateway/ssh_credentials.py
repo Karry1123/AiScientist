@@ -34,6 +34,11 @@ def _root() -> Path:
     return Path(os.environ.get("AISCIENTIST_STATE_DIR", ".")) / "ssh_creds"
 
 
+def private_paths() -> list[Path]:
+    """The key store: files no tool may read (``tools.sdk.confine_read``)."""
+    return [_root()]
+
+
 def _safe_owner(owner: str) -> str:
     cleaned = "".join(c for c in (owner or "") if c.isalnum() or c in "-_")
     return cleaned or "guest"
@@ -232,3 +237,16 @@ def delete_credential(owner: str, cred_id: str) -> bool:
         pass
     _save_index(owner, keep)
     return True
+
+
+def delete_owner(owner: str) -> int:
+    """Remove every saved key of ``owner`` when the account is deleted. The public halves stay in
+    HPC3's ``authorized_keys`` (they grant nothing without the private keys removed here).
+    Returns how many keys there were."""
+    d = _root() / _safe_owner(owner)
+    if not d.is_dir():
+        return 0
+    n = len(_load_index(owner))
+    import shutil
+    shutil.rmtree(d, ignore_errors=True)
+    return n

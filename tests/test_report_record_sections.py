@@ -93,6 +93,33 @@ def test_a_refused_call_is_not_reported_as_what_ran(tmp_path):
     assert "`force` = `False`" not in out
 
 
+def test_a_script_that_wrote_nothing_is_described_as_a_check():
+    """Run 6275df1213ab's only run_code call reloaded the QC checkpoint to print its shape; the
+    report said it ran "a purpose-written analysis script ... for a step no packaged tool covers"."""
+    look = ("import os, scanpy as sc\n"
+            "a = sc.read_h5ad(os.path.join(os.environ['AISCIENTIST_WORK'], 'adata_qc.h5ad'))\n"
+            "print(a.shape, list(a.layers.keys()))\n")
+    out = _pipeline_section(_result([{"tool": "run_code", "ok": True, "args": {"code": look},
+                                      "result": {"status": "ok"}}]))
+    assert "only read the run's data to check it" in out and "no packaged tool" not in out
+    # One call that writes a table makes the run_code entry an analysis again.
+    for writes in ("df.to_csv(os.path.join(os.environ['AISCIENTIST_ARTIFACTS'], 't.csv'))",
+                   "plt.savefig('figures/x.png')", "open('tables/n.txt', 'w').write('1')",
+                   "a.write_h5ad('x.h5ad')"):
+        out = _pipeline_section(_result([
+            {"tool": "run_code", "ok": True, "args": {"code": look}, "result": {"status": "ok"}},
+            {"tool": "run_code", "ok": True, "args": {"code": writes}, "result": {"status": "ok"}}]))
+        assert "no packaged tool covers" in out, writes
+    # A write the pattern misses (torch.save) but the sandbox reported: not a check either.
+    out = _pipeline_section(_result([
+        {"tool": "run_code", "ok": True, "args": {"code": look + "torch.save(m, p)\n"},
+         "result": {"status": "ok", "artifacts": ["model.pt"]}}]))
+    assert "no packaged tool covers" in out
+    # No code on record: nothing says it only read.
+    out = _pipeline_section(_result([{"tool": "run_code", "ok": True, "result": {"status": "ok"}}]))
+    assert "no packaged tool covers" in out
+
+
 def test_the_sections_land_after_the_abstract():
     body = "# T\n\n## Abstract\n\nabs\n\n## Results\n\nres\n"
     out = _insert_record_sections(body, "## The dataset\n\nd", "## What was run\n\nw")
@@ -203,6 +230,22 @@ def test_a_delivery_without_counts_gets_none_invented(tmp_path):
     input_line = next(ln for ln in _dataset_section(art, _cellqc_round(uncounted)).splitlines()
                       if ln.startswith("**Input.**"))
     assert "cells" not in input_line, "a sum over a library with no count is a floor, not the size"
+
+
+def test_two_kept_folders_are_named_after_their_datasets_in_the_input_line(tmp_path):
+    """Two folders kept on the server are both ``…/<uuid>/original``: the Input line used to name the
+    first one's directory, "`original/`", for a delivery of both (RCHENLAB/AiScientist issue 22)."""
+    lib = {"raw": ["h5"], "filtered": ["h5"], "bam": True, "clusters": True, "metrics": True,
+           "packed": False}
+    layout = {"root": "/data/aiscientist/data/users/u/datasets/aaa/original", "n_libraries": 2,
+              "datasets": ["Sample3_GSM5676874", "Sample1_WT"],
+              "libraries": [dict(lib, sample="Sample3_GSM5676874"), dict(lib, sample="Sample1_WT")]}
+    art = _bundle(tmp_path, {"dataset_kind": "single_cell_other", "cellranger_layout": layout})
+    input_line = next(ln for ln in _dataset_section(art, _result([])).splitlines()
+                      if ln.startswith("**Input.**"))
+    assert input_line.startswith("**Input.** `Sample3_GSM5676874/`, `Sample1_WT/` — a 10x Cell Ranger "
+                                 "delivery of 2 libraries (`Sample3_GSM5676874`, `Sample1_WT`)")
+    assert "original" not in input_line
 
 
 def test_a_single_10x_h5_takes_its_size_from_the_qc_step(tmp_path):

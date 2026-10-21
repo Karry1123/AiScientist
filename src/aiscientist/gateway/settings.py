@@ -31,6 +31,9 @@ class HPCSettings:
     The served model is the AWQ Qwen3.6 HF repo (``AISCIENTIST_VLLM_MODEL``).
     """
 
+    cpu_hour_rate: float = 0.0
+    gpu_hour_rate: float = 0.0
+
     host: str = "hpc3.rcic.uci.edu"
     ssh_port: int = 22
 
@@ -237,6 +240,40 @@ class HPCSettings:
     vlreview_dpi: int = 200                 # rasterization DPI (200 catches text overlap)
     vlreview_max_iters: int = 3             # render -> review -> re-render passes before giving up
 
+    # --- The corpus scan's own GPU (gateway/corpus_scan.py) ---------------------
+    # The scan has a model write search requests and read the passages they retrieve. It used to
+    # call the session's served model, so a session on the shared model or an API key could not run
+    # it at all, and a session with a GPU had that model busy for an hour. It now submits ONE job of
+    # its own: vLLM starts on the job's card, the scan runs against it on 127.0.0.1, the job exits
+    # and frees the card.
+    # Paid `gpu` partition, lab GPU account: 32 SU per GPU-hour whatever the card (2026-10). `gpu:1`
+    # + `nvme` takes the first free A30 or A100 (the V100 nodes lack the feature, and their 16 GB
+    # are too small). The 27B INT4 fits a 24 GB A30 only with the flags below: its image and video
+    # encoders off (the judge sends text) and at most 16 requests at once (the tool's concurrency).
+    # Measured 2026-10-19 on 400 sentences: an A100 judged them in 196 s, an A30 in 372 s.
+    corpus_scan_partition: str = "gpu"
+    corpus_scan_account: str | None = "ruic20_lab_gpu"
+    corpus_scan_gres: str = "gpu:1"
+    corpus_scan_constraint: str = "nvme"
+    corpus_scan_model: str = ""             # "" = vllm_model (the cluster sessions' model)
+    # The judge's prompts are a few thousand tokens: a short window costs less KV per request.
+    corpus_scan_max_model_len: int = 16384
+    # Extra `vllm serve` flags for this job only. The default suits the multimodal default model;
+    # a text-only `corpus_scan_model` takes "--max-num-seqs 16".
+    corpus_scan_vllm_args: str = ("--limit-mm-per-prompt '{\"image\":0,\"video\":0}' --max-num-seqs 16 "
+                                  "--max-num-batched-tokens 4096")
+    # The job's CPUs, memory and time come from the tool's TOOL.md, like every literature job's.
+    corpus_scan_ready_timeout_s: int = 1500  # model load; ~400 s measured for the 27B INT4 on A100
+    # How long the job may wait in the paid queue for a card. 30 min (the analysis jobs' 3 x 600 s)
+    # was too short: on 2026-10-19 21:13 a scan queued behind 40 others (Slurm: Priority) and was
+    # cancelled at 21:43 without starting. A queued job keeps its place for the whole wait; the
+    # window is how often the chat hears where it stands.
+    corpus_scan_queue_wait_s: int = 7200
+    corpus_scan_queue_window_s: int = 1800
+    # After a wait that ends with no card, submit the job again this many times (a retry of that one
+    # step: the run is not failed while a retry is left). Nothing runs, so nothing is lost.
+    corpus_scan_queue_retries: int = 2
+
     # --- CodeAct (run_code) as a CPU Slurm batch job (opt-in) -------------------
     # By default run_code executes in the LOCAL CodeSandbox on the gateway host (uncapped
     # subprocess), which only a console WITHOUT accounts may do: with accounts on, run_code never
@@ -259,15 +296,19 @@ class HPCSettings:
     # anything that moves bytes or burns CPU belongs on a node you hold. Metadata (ls/stat/du)
     # stays on the login node, where it is cheap and allowed.
     #
-    # Unlike the GPU serve job this costs nothing scarce (free `standard` partition) and holds no
-    # accelerator, so it is safe to keep for the whole session. Off by default: enabling it
-    # changes what connect does, and the shell tools that need it are themselves opt-in.
+    # It holds no accelerator, but it is charged to the lab's account and its CPUs and memory are
+    # nobody else's while it runs, so it is held only while the agent uses it: released after
+    # `worker_idle_timeout_s` without a command, and on disconnect, logout and server stop (see
+    # gateway/worker.py). Off by default: the shell tools that need it are themselves opt-in.
     worker_enabled: bool = False
     worker_cpus: int = 4
     worker_mem_gb: int = 16
-    # Long enough to outlive a working session without pinning a node overnight. Slurm kills the
-    # allocation at this wall limit; the session re-acquires one on the next command.
+    # Slurm's hard limit on one holder. An idle holder is released long before it; a busy session
+    # that reaches it gets a new holder on its next command.
     worker_time_limit: str = "08:00:00"
+    # Released after this long without a command. The holder ends itself
+    # `worker.HOLDER_GRACE_S` later if the gateway could not release it (restart, crash).
+    worker_idle_timeout_s: int = 900
     worker_startup_timeout_s: int = 180      # a free-partition CPU node should come up fast
     # Per-command wall cap for `srun --overlap` work. Distinct from the ALLOCATION's time limit:
     # this bounds one agent command so a runaway `find /` cannot hold the session forever.
@@ -478,7 +519,15 @@ class HPCSettings:
             except ValueError:
                 return default
 
+        def _rate(name: str) -> float:
+            import math
+
+            value = _float(name, 0.0)
+            return value if math.isfinite(value) and value >= 0 else 0.0
+
         return cls(
+            cpu_hour_rate=_rate("AISCIENTIST_CPU_HOUR_RATE"),
+            gpu_hour_rate=_rate("AISCIENTIST_GPU_HOUR_RATE"),
             host=os.environ.get("AISCIENTIST_HPC_HOST", cls.host),
             ssh_port=_int("AISCIENTIST_HPC_SSH_PORT", cls.ssh_port),
             # "" is a MEANINGFUL value here (= stage over the login node), so keep an explicitly
@@ -538,6 +587,20 @@ class HPCSettings:
             vlreview_time_limit=os.environ.get("AISCIENTIST_VLREVIEW_TIME_LIMIT", cls.vlreview_time_limit),
             vlreview_dpi=_int("AISCIENTIST_VLREVIEW_DPI", cls.vlreview_dpi),
             vlreview_max_iters=_int("AISCIENTIST_VLREVIEW_MAX_ITERS", cls.vlreview_max_iters),
+            corpus_scan_partition=os.environ.get("AISCIENTIST_CORPUS_SCAN_PARTITION", cls.corpus_scan_partition),
+            corpus_scan_account=(os.environ.get("AISCIENTIST_CORPUS_SCAN_ACCOUNT", cls.corpus_scan_account or "")
+                                 or None),
+            corpus_scan_gres=os.environ.get("AISCIENTIST_CORPUS_SCAN_GRES", cls.corpus_scan_gres),
+            corpus_scan_constraint=os.environ.get("AISCIENTIST_CORPUS_SCAN_CONSTRAINT", cls.corpus_scan_constraint),
+            corpus_scan_model=os.environ.get("AISCIENTIST_CORPUS_SCAN_MODEL", cls.corpus_scan_model),
+            corpus_scan_max_model_len=_int("AISCIENTIST_CORPUS_SCAN_MAX_MODEL_LEN", cls.corpus_scan_max_model_len),
+            corpus_scan_vllm_args=os.environ.get("AISCIENTIST_CORPUS_SCAN_VLLM_ARGS", cls.corpus_scan_vllm_args),
+            corpus_scan_ready_timeout_s=_int("AISCIENTIST_CORPUS_SCAN_READY_TIMEOUT_S",
+                                             cls.corpus_scan_ready_timeout_s),
+            corpus_scan_queue_wait_s=_int("AISCIENTIST_CORPUS_SCAN_QUEUE_WAIT_S", cls.corpus_scan_queue_wait_s),
+            corpus_scan_queue_window_s=_int("AISCIENTIST_CORPUS_SCAN_QUEUE_WINDOW_S",
+                                            cls.corpus_scan_queue_window_s),
+            corpus_scan_queue_retries=_int("AISCIENTIST_CORPUS_SCAN_QUEUE_RETRIES", cls.corpus_scan_queue_retries),
             run_code_on_hpc=(os.environ.get("AISCIENTIST_RUN_CODE_ON_HPC", "").strip().lower()
                              in ("1", "true", "yes", "on")),
             uploads_on_hpc=(os.environ.get("AISCIENTIST_UPLOADS_ON_HPC", "").strip().lower()
@@ -558,6 +621,8 @@ class HPCSettings:
             worker_cpus=_int("AISCIENTIST_WORKER_CPUS", cls.worker_cpus),
             worker_mem_gb=_int("AISCIENTIST_WORKER_MEM_GB", cls.worker_mem_gb),
             worker_time_limit=os.environ.get("AISCIENTIST_WORKER_TIME_LIMIT", cls.worker_time_limit),
+            worker_idle_timeout_s=max(60, _int("AISCIENTIST_WORKER_IDLE_TIMEOUT_S",
+                                               cls.worker_idle_timeout_s)),
             worker_startup_timeout_s=_int("AISCIENTIST_WORKER_STARTUP_TIMEOUT_S", cls.worker_startup_timeout_s),
             worker_command_timeout_s=_int("AISCIENTIST_WORKER_COMMAND_TIMEOUT_S", cls.worker_command_timeout_s),
             variant_on_hpc=(os.environ.get("AISCIENTIST_VARIANT_ON_HPC", "").strip().lower()

@@ -432,11 +432,17 @@ def _usage(message: Any, model: str) -> dict:
     u = getattr(message, "usage", None)
     get = (lambda k: getattr(u, k, None) or 0) if u is not None else (lambda k: 0)
     cache_read, cache_write = int(get("cache_read_input_tokens")), int(get("cache_creation_input_tokens"))
+    # The cache writes split by lifetime (they are billed at 1.25x and 2x input); requests here only
+    # write 5-minute entries, but a proxy or a server tool may add 1-hour ones.
+    by_ttl = get("cache_creation") if u is not None else None
+    write_1h = int(getattr(by_ttl, "ephemeral_1h_input_tokens", 0) or 0) if by_ttl else 0
     prompt = int(get("input_tokens")) + cache_read + cache_write
     stop = str(getattr(message, "stop_reason", "") or "")
     return {"prompt_tokens": prompt, "completion_tokens": int(get("output_tokens")),
             "total_tokens": prompt + int(get("output_tokens")),
+            "input_tokens": int(get("input_tokens")),
             "cache_read_input_tokens": cache_read, "cache_creation_input_tokens": cache_write,
+            "cache_creation_1h_input_tokens": write_1h,
             "finish_reason": {"max_tokens": "length", "tool_use": "tool_calls",
                               "end_turn": "stop", "stop_sequence": "stop"}.get(stop, stop),
             "stop_reason": stop, "model": str(getattr(message, "model", "") or model)}
@@ -457,14 +463,23 @@ def _check_refusal(message: Any) -> None:
 
 
 def _prepare(*, model: str, system: list[dict], messages: list[dict], max_tokens: int,
-             effort: str | None, tools: list[dict] | None, binding: bool) -> tuple[dict, list[str]]:
-    """The request body and the betas it needs."""
+             effort: str | None, tools: list[dict] | None, binding: bool,
+             cache: str = "auto") -> tuple[dict, list[str]]:
+    """The request body and the betas it needs.
+
+    ``cache``: ``"auto"`` caches the whole prompt (a conversation re-reads it on its next turn);
+    ``"system"`` caches only the system prompt, for many one-off calls that share their
+    instructions and differ in the rest (the corpus scan reads 1,500 different passages under one
+    set of rules: auto-caching wrote every prompt to cache at 1.25x and never read one back)."""
     eff = _effort_for(model, effort)
     betas: list[str] = []
-    kwargs: dict[str, Any] = {"model": model, "max_tokens": max_tokens, "messages": messages,
-                              # Auto-caching: the system prompt, the tool catalogue and the history
-                              # so far are re-read from cache on the next turn of the loop.
-                              "cache_control": {"type": "ephemeral"}}
+    kwargs: dict[str, Any] = {"model": model, "max_tokens": max_tokens, "messages": messages}
+    if cache == "auto":
+        # Auto-caching: the system prompt, the tool catalogue and the history so far are re-read
+        # from cache on the next turn of the loop.
+        kwargs["cache_control"] = {"type": "ephemeral"}
+    if system and cache == "system":
+        system = [*system[:-1], {**system[-1], "cache_control": {"type": "ephemeral"}}]
     if system:
         kwargs["system"] = system
     if tools:
@@ -547,13 +562,14 @@ def _turn(final: Any, model: str) -> dict:
 
 def complete_ex(model: str, messages: list[dict], *, api_key: str, base_url: str | None = None,
                 max_tokens: int = 16000, effort: str | None = None,
-                timeout: float = _TIMEOUT) -> tuple[str, dict]:
+                timeout: float = _TIMEOUT, cache: str = "auto") -> tuple[str, dict]:
     """A plain completion for a lab role: ``(text, usage)`` like :func:`vllm_client.complete_ex`.
-    These are fresh conversations with no tools, so no thinking is replayed."""
+    These are fresh conversations with no tools, so no thinking is replayed. ``cache``: see
+    :func:`_prepare`."""
     client = _client(api_key, base_url, timeout)
     system, msgs = to_anthropic(messages)
     kwargs, betas = _prepare(model=model, system=system, messages=msgs, max_tokens=max_tokens,
-                             effort=effort, tools=None, binding=False)
+                             effort=effort, tools=None, binding=False, cache=cache)
     final = _final(client, kwargs, betas, api_key)
     _check_refusal(final)
     _, blocks = _replayable(_blocks_of(final))
