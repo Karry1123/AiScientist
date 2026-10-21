@@ -74,6 +74,7 @@ class SlurmCodeExecutor:
     """
 
     remote: RemoteExecutor | None
+    supports_skill_policy = True
     container_image: str
     # These three are BIND-MOUNTED into the container on the COMPUTE NODE, so they must be paths the
     # HPC3 node can see — i.e. dfs3b, NOT the eyeserver-local /data/aiscientist run dir (binding a local
@@ -193,6 +194,10 @@ class SlurmCodeExecutor:
         so a pipeline's intermediate output survives to the next step); ``files`` are the skill's
         bundled files, ``{relative path: local path}``, staged into ``<workdir>/.skill``. Resources
         default to this executor's. There is no local fallback: the command needs the image."""
+        from ..agents.skills_registry import POLICY
+        policy = POLICY.get()
+        if policy and policy["scheduler"] == "none":
+            return {"status": "error", "error": "skill does not declare Slurm scheduler access"}
         command = (command or "").strip()
         if not command:
             return {"status": "error", "error": "no command provided"}
@@ -232,6 +237,14 @@ class SlurmCodeExecutor:
 
     def _image(self, ref: str) -> str:
         if ref not in self._images:
+            from ..agents.skills_registry import POLICY
+            policy = POLICY.get()
+            if policy and policy["network"] == "none":
+                from .tool_images import image_sif_name
+                sif = f"{self.images_dir.rstrip('/')}/{image_sif_name(ref)}"
+                if not self.remote.exec(f"test -s {shlex_quote(sif)}").ok:
+                    raise SlurmJobError("skill does not declare network access for image installation")
+                return sif
             from .slurm_analysis import provision_image
             self._counter += 1
             self._images[ref] = provision_image(
@@ -246,6 +259,9 @@ class SlurmCodeExecutor:
     # -- internals ------------------------------------------------------------
 
     def _fallback(self, code: str, reason: str) -> dict[str, object]:
+        from ..agents.skills_registry import POLICY
+        if POLICY.get() is not None:
+            return {"status": "error", "error": f"registry skill cannot use local fallback: {reason}"}
         if callable(self.local_fallback):
             out = self.local_fallback(code)
             if isinstance(out, dict):
@@ -296,10 +312,37 @@ class SlurmCodeExecutor:
                             extra_exports={"MPLBACKEND": "Agg"}, package_cache=True,
                             run_timeout_s=self.run_timeout_s)
 
-    def _submit(self, source: str, *, kind: str, runner: str, image: str, cpus: int, mem_gb: int,
+    def _submit(self, source: str, **kwargs) -> dict[str, object]:
+        from ..agents.skills_registry import POLICY
+        import tempfile
+        import uuid
+        policy = POLICY.get()
+        if policy and policy["scheduler"] == "none":
+            return {"status": "error", "error": "skill does not declare Slurm scheduler access"}
+        secret_file = ""
+        try:
+            if policy and policy["secret_values"]:
+                secret_file = f"{self._resolved_scratch()}/.secrets-{uuid.uuid4().hex}"
+                made = self.remote.exec(f"umask 077; mkdir -p {shlex_quote(self._resolved_scratch())} "
+                                        f"&& : > {shlex_quote(secret_file)}")
+                if not made.ok:
+                    raise SlurmJobError("cannot create per-run credential directory")
+                with tempfile.TemporaryDirectory(prefix="aiscientist-credentials-") as temp:
+                    path = Path(temp) / "env"
+                    path.write_text("\n".join(f"export {k}={shlex_quote(v)}" for k, v in
+                                              policy["secret_values"].items()), encoding="utf-8")
+                    self.remote.put_file(str(path), secret_file)
+                if not self.remote.exec(f"chmod 600 {shlex_quote(secret_file)}").ok:
+                    raise SlurmJobError("cannot protect per-run credentials")
+            return self._submit_job(source, secret_file=secret_file, **kwargs)
+        finally:
+            if secret_file:
+                self.remote.exec(f"rm -f -- {shlex_quote(secret_file)}")
+
+    def _submit_job(self, source: str, *, kind: str, runner: str, image: str, cpus: int, mem_gb: int,
                 time_limit: str, run_timeout_s: int, cwd: str = "",
                 extra_exports: "dict[str, str] | None" = None,
-                package_cache: bool = False) -> dict[str, object]:
+                package_cache: bool = False, secret_file: str = "") -> dict[str, object]:
         """Stage ``source`` as a script, run it with ``runner`` inside ``image`` as a contained Slurm
         job, and collect stdout/stderr/exit code plus the artifacts it wrote."""
         self._counter += 1
@@ -334,6 +377,8 @@ class SlurmCodeExecutor:
         # sys.path rather than going through PYTHONPATH.
         preamble, cache_binds = self._package_cache_preamble() if package_cache else ("", ())
         enter = f"cd {shlex_quote(cwd)}; " if cwd else ""
+        if secret_file:
+            enter = f". {shlex_quote(secret_file)}; " + enter
         inner_payload = (f"{preamble}{exports}; {enter}{runner} {snippet} > {out_f} 2> {err_f}; "
                          f"echo $? > {rc_f}")
         root = (self.dataset_root or "").rstrip("/")
@@ -343,14 +388,21 @@ class SlurmCodeExecutor:
                                      *self._input_binds())
                          if p)
         binds_rw = tuple(p for p in (self.work_dir, self.artifacts_dir, scratch) if p)
+        from ..agents.skills_registry import POLICY
+        policy = POLICY.get()
+        gpu = bool(policy and policy["gpu"])
+        network = (policy["network"] in {"required", "optional", "runtime"}
+                   if policy else sandbox_network_enabled())
         inner = container_exec(
             image, inner_payload,
-            binds_ro=binds_ro, binds_rw=binds_rw, nv=False, network=sandbox_network_enabled(),
+            binds_ro=binds_ro, binds_rw=binds_rw, nv=gpu, network=network,
             container_bin=self.container_bin,
         )
+        if policy:
+            inner = inner.replace(" exec ", " exec --cleanenv ", 1)
         script = build_analysis_script(
             name, inner, partition=self.partition, cpus=cpus, mem_gb=mem_gb,
-            time_limit=time_limit, account=self.account, gres="",  # CPU-only analysis job
+            time_limit=time_limit, account=self.account, gres="gpu:1" if gpu else "",
             container_module=self.container_module, log_dir=scratch,
         )
         spec = SlurmJobSpec(script=script, job_name=name, submit_dir=scratch)

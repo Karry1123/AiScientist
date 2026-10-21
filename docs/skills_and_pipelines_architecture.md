@@ -1,5 +1,47 @@
 # Skills / Preset-pipelines / Registry — architecture
 
+## Pinned skill releases (2026-10)
+
+The atomic library now prefers the offline `aiscientist-skills` release installed at
+`skills/releases/0.1.0/`. `configs/skills_registry.json` pins `v0.1.0`, permits `core` and
+`verified`, and explicitly enables the logged transitional local-folder fallback when that
+release is absent. An installed but corrupt/incomplete release never falls back. Branch names
+are rejected. No download is performed by the application.
+
+Each config key has an `AISCIENTIST_SKILLS_REGISTRY_<UPPERCASE_KEY>` override; `ALLOWED_TIERS`
+is comma-separated (`community` requires opt-in). `AISCIENTIST_SKILLS_REGISTRY_CONFIG` selects
+another JSON config. Relative release roots resolve against the repository root.
+`SHA256SUMS` must cover `catalog.json`, every referenced zip, and every file of an unpacked skill.
+Catalog name, description, category, tags, version, status and requirements are authoritative;
+`Skill.metadata["compute"]` exposes the declared estimate. Description matching is unchanged.
+
+`read_skill_reference` records the skill and selects its policy for subsequent `run_code` calls;
+`run_code(skill=...)` can select explicitly. `run_in_environment` selects by its required skill
+argument. These calls enforce requirements at `CodeSandbox`/`SlurmCodeExecutor` container execution:
+runtime network is denied for `none` and `install`, GPU passthrough and allocation require `gpu`,
+and Slurm execution requires scheduler `optional` or `required`. An image needing provisioning
+requires installation network access. Local uncontained execution and Slurm-to-host fallback are
+refused for registry skills; local GPU/required-scheduler requests are refused. Direct `run_shell`
+is refused while a registry skill is selected, because it cannot enforce container policy.
+Declared `allowed_tools`, when nonempty, further restricts these execution tools.
+The uncontained shared-cache dependency preflight is skipped for registry execution; missing
+imports must be supplied by the analysis image/cache or the skill's declared environment.
+
+Credentials are resolved per invocation from server-side `AISCIENTIST_SKILL_SECRET_<NAME>` variables,
+only for names in `requirements.secrets`. They are injected into the contained process environment,
+never skill bundles or prompts. Slurm uses a private temporary credential file, removed after the
+job; returned credential values are redacted before reaching the model. Requirements are capability
+limits for attributed skill execution; they do not identify arbitrary copied code as a skill.
+
+Each research run initializes `<run workspace>/manifest.json`; reading or explicitly executing a
+skill appends its name, version and release tag. Transitional local skills are marked `local`.
+Execution successes/errors accumulate by release/name/version in SQLite at
+`<run workspace parent>/skill_versions.sqlite3`, overridable with
+`AISCIENTIST_SKILLS_REGISTRY_STATS`. These counters expose bad versions for operator rollback by
+changing the pin; automatic rollback is not implemented. Approved induced skills retain their
+existing separate review gate. The older folder-layout discussion below describes bundle format
+and the transitional fallback, rather than the primary curated source.
+
 Status: **BUILT** (2026-07-07). The three layers exist and are wired end-to-end (full suite green).
 What remains is additive, not structural: **skill induction** (grow the library from successful
 runs), a **`search_skills(query)`** retrieval step for when the library gets large, and making the

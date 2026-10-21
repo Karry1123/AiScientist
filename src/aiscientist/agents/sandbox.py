@@ -218,6 +218,7 @@ class CodeSandbox:
     """A callable ``CodeExecutor``. Default = restricted subprocess; set
     ``container_image`` for container isolation on the HPC nodes."""
 
+    supports_skill_policy = True
     timeout_s: float = 180.0   # CodeAct now does real data work (read the dataset, compute) — give it room
     mem_mb: int = 2048
     python_bin: str = sys.executable
@@ -253,6 +254,10 @@ class CodeSandbox:
         return self.run(code)
 
     def run(self, code: str) -> dict[str, object]:
+        from .skills_registry import POLICY
+        policy = POLICY.get()
+        if policy and (not self.container_image or policy["gpu"] or policy["scheduler"] == "required"):
+            return {"status": "error", "error": "local executor cannot enforce this skill's isolation/GPU/scheduler requirements"}
         code = (code or "").strip()
         if not code:
             return {"status": "error", "error": "no code provided"}
@@ -332,7 +337,12 @@ class CodeSandbox:
 
     def _command(self, script: str, workdir: str):
         if self.container_image:
-            net = [] if self.allow_network else ["--net", "--network", "none"]
+            from .skills_registry import POLICY
+            policy = POLICY.get()
+            network = policy["network"] in {"required", "optional", "runtime"} if policy else self.allow_network
+            net = [] if network else ["--net", "--network", "none"]
+            if policy:
+                net += ["--cleanenv"]
             binds = ["-B", f"{workdir}:{workdir}"]
             for p in self._data_paths():            # mount the dataset + run dirs read/write
                 binds += ["-B", f"{p}:{p}"]
@@ -397,4 +407,8 @@ class CodeSandbox:
         if self.dataset_root:
             env["AISCIENTIST_DATASET_ROOT"] = str(self.dataset_root)
         env.update(input_env(self.inputs))
+        from .skills_registry import POLICY
+        policy = POLICY.get()
+        if policy:
+            env.update({"APPTAINERENV_" + k: v for k, v in policy["secret_values"].items()})
         return env

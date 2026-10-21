@@ -768,7 +768,12 @@ def make_run_code_tool(executor: CodeExecutor | None) -> HarnessTool:
         seed = _prov.resolve_seed() if _prov.seeding_enabled() else None
         to_run = (_prov.seed_preamble(seed) + code) if seed is not None else code
         started_at, t0 = _prov.now_iso(), _prov.perf_now()
-        result = executor(to_run)
+        from .skills_registry import active_skill, execute
+        try:
+            skill = active_skill(ctx, str(args.get("skill") or ""))
+        except ValueError as exc:
+            return {"status": "error", "error": str(exc)}
+        result = execute(skill, ctx, executor, lambda: executor(to_run), "run_code")
         duration_ms = int((_prov.perf_now() - t0) * 1000)
         if isinstance(result, dict):
             try:
@@ -810,7 +815,9 @@ def make_run_code_tool(executor: CodeExecutor | None) -> HarnessTool:
     return HarnessTool(
         name="run_code",
         description=description,
-        parameters={"type": "object", "properties": {"code": {"type": "string"}}, "required": ["code"]},
+        parameters={"type": "object", "properties": {"code": {"type": "string"},
+                    "skill": {"type": "string", "description": "Skill being applied; defaults to the last skill read."}},
+                    "required": ["code"]},
         executor=_exec,
         reads_private_data=False, category="codeact",
     )
@@ -853,8 +860,22 @@ def make_run_in_environment_tool(executor: Any) -> "HarnessTool | None":
         files = {rel: str(folder / rel) for rel in skill.files
                  if folder is not None and (folder / rel).is_file()}
         workdir = "env/" + re.sub(r"[^\w.\-]", "_", skill.name)
-        result = runner(command, skill.image, workdir=workdir, cpus=skill.cpus,
-                        mem_gb=skill.mem_gb, time_limit=skill.time_limit, files=files)
+        from .skills_registry import execute
+        def run():
+            if skill.registry_release:
+                import tempfile
+                with tempfile.TemporaryDirectory(prefix="aiscientist-skill-run-") as temp:
+                    staged = {}
+                    for rel, text in skill.files.items():
+                        path = _Path(temp) / rel
+                        path.parent.mkdir(parents=True, exist_ok=True)
+                        path.write_text(text, encoding="utf-8")
+                        staged[rel] = str(path)
+                    return runner(command, skill.image, workdir=workdir, cpus=skill.cpus,
+                                  mem_gb=skill.mem_gb, time_limit=skill.time_limit, files=staged)
+            return runner(command, skill.image, workdir=workdir, cpus=skill.cpus,
+                          mem_gb=skill.mem_gb, time_limit=skill.time_limit, files=files)
+        result = execute(skill, ctx, executor, run, "run_in_environment")
         if isinstance(result, dict):
             result["skill"] = skill.name
             result["provenance"] = {
@@ -3532,6 +3553,8 @@ class ResearchLab:
         code_executor: CodeExecutor | None = None,
     ) -> None:
         self.ctx = ctx
+        from .skills_registry import init_manifest
+        init_manifest(ctx)
         self.config = config or LabConfig()
         self._complete_fn = complete_fn
         # Scientist = the tool-calling harness with the FULL registry catalog (curated
