@@ -210,6 +210,9 @@ EXCLUDE_PATTERNS=(
   # This script's own settings file (gitignored, sourced above). The server has no use for it, and a
   # copy placed in a worktree to deploy from there was about to be shipped (2026-10-12).
   '.deploy.env'
+  # The pinned aiscientist-skills release (configs/skills_registry.json) is installed on the server
+  # itself and is not in git: a --delete deploy must never remove it, nor ship a laptop's copy.
+  'skills/releases/'
 )
 RSYNC_EXCLUDES=()
 for _p in "${EXCLUDE_PATTERNS[@]}"; do RSYNC_EXCLUDES+=(--exclude "$_p"); done

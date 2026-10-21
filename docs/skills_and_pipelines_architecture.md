@@ -90,23 +90,31 @@ must be added), the releases root, and whether the fallback to `skills/` is allo
 an `AISCIENTIST_SKILLS_REGISTRY_<KEY>` override. Updating skills means changing the tag and
 deploying the release.
 
-`agents/skills_registry.py` reads `skills/releases/<version>/`. It checks `SHA256SUMS` against
-`catalog.json`, every skill zip and every unpacked file, and refuses the release if any is missing
-or differs; a corrupt release never falls back. The skill list comes from the catalog: name,
-description, tags, version, tier and requirements. `requirements.compute` is also exposed as
-`metadata["compute"]` for plan estimates.
+`agents/skills_registry.py` reads `skills/releases/<version>/`, which holds the release's assets
+as published: `catalog.json`, `SHA256SUMS` and one `<name>-<version>.zip` per skill. The folder is
+installed on the server, outside git (`.gitignore`, and `scripts/sync_deploy.sh` never ships or
+deletes it). The loader checks `SHA256SUMS` against `catalog.json`, every skill zip and every
+unpacked file, and refuses the release if any is missing or differs. A refused release gives no
+curated skills at all, logged as an error; it never falls back to `skills/`, and the rest of the
+platform keeps working. The skill list comes from the catalog: name, description, tags, version,
+tier and requirements. `requirements.compute` is also exposed as `metadata["compute"]` for plan
+estimates.
 
 A registry skill gets only what it declares. When it is read with `read_skill_reference`, or named
 in `run_code(skill=...)` or `run_in_environment`, the code runs in a container with network access,
-GPU, Slurm access and tools limited to its declaration. Uncontained local execution, the
+GPU, secrets and tools limited to its declaration. Its `scheduler` says whether the skill needs
+Slurm: the platform runs every snippet as a contained Slurm job whatever it says, and code inside
+that container cannot submit jobs of its own, so no skill gets scheduler access. The local sandbox
+refuses a skill that requires a scheduler or a GPU. Uncontained local execution, the
 Slurm-to-host fallback, the dependency preflight and `run_shell` are refused for it. Each secret it
 names is read per call from the server's `AISCIENTIST_SKILL_SECRET_<NAME>`, passed to the job in a
 private temporary file, and redacted from the output the model sees.
 
 Every run's `manifest.json` lists the skills it used, with name, version and release tag.
-Successes and errors are counted per release, skill and version in `skill_versions.sqlite3` next
-to the run workspaces (`AISCIENTIST_SKILLS_REGISTRY_STATS` overrides it), so a broken version can
-be found and the pin rolled back.
+Successes and errors are counted per release, skill and version in one file for the deployment,
+`<AISCIENTIST_STATE_DIR>/skill_versions.sqlite3` (`AISCIENTIST_SKILLS_REGISTRY_STATS` overrides
+it), so a broken version can be found and the pin rolled back. A run the user stops is not
+counted.
 
 ### Skills learned from runs
 

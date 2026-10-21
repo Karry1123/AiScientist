@@ -21,13 +21,16 @@ def release(tmp_path, monkeypatch):
     rows = []
     for tier in ("core", "verified", "community"):
         name = "skill-" + tier
-        with zipfile.ZipFile(root / (name + ".zip"), "w") as zf:
+        with zipfile.ZipFile(root / f"{name}-1.2.3.zip", "w") as zf:
             zf.writestr(name + "/SKILL.md", f"---\nname: {name}\ndescription: old description\n---\nGuidance")
             zf.writestr(name + "/scripts/run.sh", "echo hello")
         rows.append({"name": name, "description": "catalog description", "category": "test",
                      "path": "skills/test/" + name, "version": "1.2.3", "status": tier,
-                     "tags": ["biology"], "requirements": {"compute": "16 CPUs, 80 GB, 20 min",
-                     "gpu": False, "scheduler": "optional", "network": "none", "secrets": []}})
+                     "tags": ["biology"], "license": "MIT", "tested_with": "tool 1.0", "author": "",
+                     "requirements": {"compute": "16 CPUs, 80 GB, 20 min", "gpu": False,
+                                      "scheduler": "optional", "network": "none", "secrets": [],
+                                      "allowed_tools": ""},
+                     "has_code": True, "has_tests": False})
     (root / "catalog.json").write_text(json.dumps({"schema_version": 1,
         "registry": "aiscientist-skills", "registry_version": "0.1.0", "skills": rows}))
     checksums(root)
@@ -37,9 +40,9 @@ def release(tmp_path, monkeypatch):
 
 
 def checksums(root):
-    (root / "SHA256SUMS").write_text("\n".join(
-        hashlib.sha256(p.read_bytes()).hexdigest() + "  " + p.name
-        for p in root.iterdir() if p.is_file() and p.name != "SHA256SUMS"))
+    (root / "SHA256SUMS").write_text("".join(
+        hashlib.sha256(p.read_bytes()).hexdigest() + "  " + p.name + "\n"
+        for p in sorted(root.iterdir()) if p.is_file() and p.name != "SHA256SUMS"))
 
 
 def test_checksum_ok_catalog_metadata_and_tiers(release, monkeypatch):
@@ -55,14 +58,20 @@ def test_checksum_ok_catalog_metadata_and_tiers(release, monkeypatch):
 
 
 @pytest.mark.parametrize("missing", [False, True])
-def test_checksum_mismatch_or_missing_never_falls_back(release, missing):
-    path = release / "skill-core.zip"
+def test_checksum_mismatch_or_missing_never_falls_back(release, missing, caplog):
+    path = release / "skill-core-1.2.3.zip"
     if missing:
         path.unlink()
     else:
         path.write_bytes(b"tampered")
     with pytest.raises(ValueError, match="checksum"):
-        sk._load_skills()
+        registry.load(sk._load_from)
+    # The library is empty, not the repository's skills/, and loading does not raise: it runs at
+    # import, so raising would keep the gateway from starting.
+    fallback = set(sk._load_from(sk._skills_dir()))
+    assert fallback
+    assert not set(sk._load_skills()) & fallback
+    assert "Pinned skills release refused" in caplog.text and "checksum" in caplog.text
 
 
 @pytest.mark.parametrize("tag", ["main", "develop", "v0.1", "v0.1.0/branch", "../v0.1.0"])
@@ -81,8 +90,8 @@ def test_fallback_is_explicit_and_logged(tmp_path, monkeypatch, caplog):
     assert "example" in sk._load_skills()
     assert "transitional local skills fallback" in caplog.text
     monkeypatch.setenv("AISCIENTIST_SKILLS_REGISTRY_TRANSITIONAL_FALLBACK", "false")
-    with pytest.raises(FileNotFoundError):
-        sk._load_skills()
+    assert "example" not in sk._load_skills()
+    assert "not installed" in caplog.text
 
 
 def test_unpacked_files_must_all_be_verified(release):
@@ -101,7 +110,7 @@ def test_unpacked_files_must_all_be_verified(release):
 
 
 def test_zip_traversal_refused(release):
-    with zipfile.ZipFile(release / "skill-core.zip", "a") as zf:
+    with zipfile.ZipFile(release / "skill-core-1.2.3.zip", "a") as zf:
         zf.writestr("../outside", "bad")
     checksums(release)
     with pytest.raises(ValueError, match="unsafe"):
@@ -149,20 +158,6 @@ def test_run_code_policy_and_local_isolation_gate(release, tmp_path):
         registry.POLICY.reset(token)
 
 
-def test_slurm_scheduler_gate_before_remote_execution(release):
-    from aiscientist.gateway.slurm_sandbox import SlurmCodeExecutor
-    skill = registry.load(sk._load_from)["skill-core"]
-    token = registry.POLICY.set({**skill.requirements, "scheduler": "none", "secret_values": {}})
-    try:
-        executor = SlurmCodeExecutor(remote=object(), container_image="test.sif", scratch_dir="/tmp/test")
-        result = executor("print(1)")
-        assert "does not declare Slurm" in result["error"]
-        result = executor.run_in_image("echo hello", "test.sif", workdir="test")
-        assert "does not declare Slurm" in result["error"]
-    finally:
-        registry.POLICY.reset(token)
-
-
 def test_read_reference_records_version(release, tmp_path):
     lib = registry.load(sk._load_from)
     ctx = HarnessContext(workspace=tmp_path / "run")
@@ -172,13 +167,15 @@ def test_read_reference_records_version(release, tmp_path):
     assert json.loads((ctx.workspace / "manifest.json").read_text())["skills"][0]["version"] == "1.2.3"
 
 
-@pytest.mark.parametrize("gpu,network", [(False, "none"), (True, "runtime"), (False, "install")])
-def test_slurm_container_permissions_and_private_credentials(release, tmp_path, monkeypatch, gpu, network):
+@pytest.mark.parametrize("gpu,network,scheduler", [(False, "none", "none"), (True, "runtime", "required"),
+                                                   (False, "install", "optional")])
+def test_slurm_container_permissions_and_private_credentials(release, tmp_path, monkeypatch, gpu, network,
+                                                             scheduler):
     from aiscientist.gateway import slurm_sandbox as slurm
     from aiscientist.gateway.executor import ExecResult
     skill = registry.load(sk._load_from)["skill-core"]
-    skill = replace(skill, requirements={**skill.requirements, "gpu": gpu,
-                    "network": network, "secrets": ["TOKEN"]})
+    skill = replace(skill, requirements={**skill.requirements, "gpu": gpu, "network": network,
+                    "scheduler": scheduler, "secrets": ["TOKEN"]})
     monkeypatch.setenv("AISCIENTIST_SKILL_SECRET_TOKEN", "private-value")
     class Remote:
         commands = []
@@ -203,8 +200,10 @@ def test_slurm_container_permissions_and_private_credentials(release, tmp_path, 
     ctx = HarnessContext(workspace=tmp_path / "run")
     result = registry.execute(skill, ctx, executor, lambda: executor("print(1)"), "run_code")
     assert result["status"] == "ok" and result["stdout"] == "[REDACTED]"
+    # Every skill runs as a contained job, scheduler: none included (the job is the platform's
+    # container; the code in it cannot reach Slurm).
     script = scripts[0]
-    assert "--cleanenv" in script
+    assert "--containall" in script and "--cleanenv" in script
     assert ("--nv" in script) == gpu and ("--gres=gpu:1" in script) == gpu
     assert ("--network none" in script) == (network != "runtime")
     assert "private-value" not in script
@@ -223,6 +222,8 @@ def test_restricted_tools_and_executor_capability(release, tmp_path):
         supports_skill_policy = True
     skill = replace(skill, requirements={**skill.requirements, "allowed_tools": "run_in_environment"})
     assert "does not declare tool" in registry.execute(skill, ctx, Executor(), forbidden, "run_code")["error"]
+    skill = replace(skill, requirements={**skill.requirements, "allowed_tools": "Read run_code"})
+    assert registry.execute(skill, ctx, Executor(), lambda: {"status": "ok"}, "run_code")["status"] == "ok"
 
 
 def test_registry_policy_does_not_use_uncontained_dependency_preflight(monkeypatch):
@@ -236,3 +237,71 @@ def test_registry_policy_does_not_use_uncontained_dependency_preflight(monkeypat
         assert wrapper("import missing")["status"] == "ok"
     finally:
         registry.POLICY.reset(token)
+
+
+def test_release_as_the_registry_publishes_it(tmp_path, monkeypatch):
+    """The assets of a GitHub release of lijinbio/aiscientist-skills, built the way its
+    aiscientist_skills/package.py builds them: <name>-<version>.zip with <name>/ inside, fixed
+    timestamps, SHA256SUMS over the zips and catalog.json."""
+    root = tmp_path / "releases" / "0.1.0"
+    root.mkdir(parents=True)
+    monkeypatch.setenv("AISCIENTIST_SKILLS_REGISTRY_RELEASES_ROOT", str(root.parent))
+    name = "qc-snrna-with-cellqc-standalone"
+    with zipfile.ZipFile(root / f"{name}-1.0.0.zip", "w", zipfile.ZIP_DEFLATED) as zf:
+        for rel, text in (("SKILL.md", f"---\nname: {name}\ndescription: d\nmetadata:\n"
+                                       "  category: single-cell\n  status: core\n---\n# CellQC\n"),
+                          ("references/scripts.md", "cellqc -c config.yaml\n")):
+            info = zipfile.ZipInfo(f"{name}/{rel}", (1980, 1, 1, 0, 0, 0))
+            info.external_attr = 0o644 << 16
+            zf.writestr(info, text)
+    (root / "catalog.json").write_text(json.dumps({
+        "schema_version": 1, "registry": "aiscientist-skills", "registry_version": "0.1.0",
+        "generator": "aiscientist-skills 0.1.0",
+        "categories": [{"name": "single-cell", "description": "Single-cell"}],
+        "skills": [{"name": name, "category": "single-cell",
+                    "path": "skills/single-cell/" + name, "version": "1.0.0", "status": "core",
+                    "description": "Run the CellQC pipeline over a cohort of 10x libraries.",
+                    "tags": ["qc", "snakemake"], "license": "MIT", "tested_with": "cellqc 0.3.6",
+                    "author": "Jin Li",
+                    "requirements": {"compute": "16 CPUs, 80 GB requested, 20 min for 4 libraries",
+                                     "gpu": False, "scheduler": "optional", "network": "install",
+                                     "secrets": [], "allowed_tools": ""},
+                    "has_code": False, "has_tests": False}]}, indent=2) + "\n")
+    checksums(root)
+    try:
+        skill = registry.load(sk._load_from)[name]
+        assert skill.version == "1.0.0" and skill.status == "core" and skill.registry_release == "v0.1.0"
+        assert skill.files["references/scripts.md"] == "cellqc -c config.yaml\n"
+        assert skill.metadata["compute"].startswith("16 CPUs")
+        assert set(sk._load_skills()) >= {name}
+    finally:
+        monkeypatch.undo()
+        sk.refresh_skills()
+
+
+def test_bad_config_leaves_no_skills_and_no_crash(release, tmp_path, monkeypatch, caplog):
+    monkeypatch.setenv("AISCIENTIST_SKILLS_REGISTRY_RELEASE_TAG", "main")
+    assert not set(sk._load_skills()) & set(sk._load_from(sk._skills_dir()))
+    assert "pinned" in caplog.text
+    sk.refresh_skills()                     # the re-scan signature must not raise either
+    ctx = HarnessContext(workspace=tmp_path / "run")
+    registry.init_manifest(ctx)            # a run still gets its manifest
+    assert json.loads((ctx.workspace / "manifest.json").read_text()) == {
+        "registry_release": None, "skills": []}
+
+
+def test_counts_live_in_the_state_dir_and_skip_a_stop(release, tmp_path, monkeypatch):
+    monkeypatch.delenv("AISCIENTIST_SKILLS_REGISTRY_STATS")
+    monkeypatch.setenv("AISCIENTIST_STATE_DIR", str(tmp_path / "state"))
+    skill = registry.load(sk._load_from)["skill-core"]
+    class Executor:
+        supports_skill_policy = True
+    for user in ("alice", "bob"):          # two accounts, one file
+        ctx = HarnessContext(workspace=tmp_path / "runs" / user / "run1")
+        registry.execute(skill, ctx, Executor(), lambda: {"status": "ok"}, "run_code")
+    registry.execute(skill, ctx, Executor(), lambda: {"status": "cancelled"}, "run_code")
+    path = tmp_path / "state" / "skill_versions.sqlite3"
+    assert registry.stats_path(ctx) == path
+    with sqlite3.connect(path) as db:
+        assert db.execute("SELECT success,error FROM skill_versions").fetchall() == [(2, 0)]
+    assert not list((tmp_path / "runs").rglob("*.sqlite3"))

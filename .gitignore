@@ -18,6 +18,9 @@ runs/
 # Raw datasets (never commit; provided per-run)
 *.h5ad
 
+# The pinned aiscientist-skills release, installed on the server (configs/skills_registry.json)
+skills/releases/
+
 # Local databases (dev SQLite created by running the gateway; prod uses PostgreSQL)
 *.db
 *.sqlite

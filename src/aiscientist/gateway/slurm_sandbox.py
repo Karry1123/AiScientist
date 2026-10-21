@@ -194,10 +194,6 @@ class SlurmCodeExecutor:
         so a pipeline's intermediate output survives to the next step); ``files`` are the skill's
         bundled files, ``{relative path: local path}``, staged into ``<workdir>/.skill``. Resources
         default to this executor's. There is no local fallback: the command needs the image."""
-        from ..agents.skills_registry import POLICY
-        policy = POLICY.get()
-        if policy and policy["scheduler"] == "none":
-            return {"status": "error", "error": "skill does not declare Slurm scheduler access"}
         command = (command or "").strip()
         if not command:
             return {"status": "error", "error": "no command provided"}
@@ -313,12 +309,14 @@ class SlurmCodeExecutor:
                             run_timeout_s=self.run_timeout_s)
 
     def _submit(self, source: str, **kwargs) -> dict[str, object]:
+        # A registry skill's ``scheduler`` says whether the skill itself needs Slurm. It does not
+        # gate this job: the job is how the platform contains every snippet, and the code inside
+        # (--containall, no Slurm client or munge socket bound) cannot submit jobs of its own, so no
+        # skill is given scheduler access whatever it declares.
         from ..agents.skills_registry import POLICY
         import tempfile
         import uuid
         policy = POLICY.get()
-        if policy and policy["scheduler"] == "none":
-            return {"status": "error", "error": "skill does not declare Slurm scheduler access"}
         secret_file = ""
         try:
             if policy and policy["secret_values"]:
@@ -396,10 +394,8 @@ class SlurmCodeExecutor:
         inner = container_exec(
             image, inner_payload,
             binds_ro=binds_ro, binds_rw=binds_rw, nv=gpu, network=network,
-            container_bin=self.container_bin,
+            container_bin=self.container_bin, cleanenv=bool(policy),
         )
-        if policy:
-            inner = inner.replace(" exec ", " exec --cleanenv ", 1)
         script = build_analysis_script(
             name, inner, partition=self.partition, cpus=cpus, mem_gb=mem_gb,
             time_limit=time_limit, account=self.account, gres="gpu:1" if gpu else "",

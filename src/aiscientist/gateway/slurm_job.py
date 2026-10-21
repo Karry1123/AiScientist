@@ -171,16 +171,21 @@ def container_exec(
     nv: bool = False,
     network: bool = False,
     container_bin: str = "apptainer",
+    cleanenv: bool = False,
 ) -> str:
     """Build an ``apptainer exec`` line that runs ``command`` fully contained.
 
     - ``--containall`` hides every host path except the explicit binds (no $HOME, /tmp).
+    - ``cleanenv`` also states ``--cleanenv`` explicitly (``--containall`` implies it), for the
+      registry skills whose job must carry no host environment.
     - ``--writable-tmpfs`` gives an ephemeral writable overlay, discarded on exit.
     - ``binds_ro`` (the dataset) mount **read-only** — contained code cannot delete or
       modify the raw data; ``binds_rw`` (work/artifacts) are writable for outputs.
     - network is OFF unless ``network=True``; ``nv`` adds GPU passthrough.
     """
     parts = [container_bin, "exec", "--containall", "--writable-tmpfs"]
+    if cleanenv:
+        parts.append("--cleanenv")
     if not network:
         parts += ["--net", "--network", "none"]
     if nv:

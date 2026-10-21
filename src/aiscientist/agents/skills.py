@@ -207,8 +207,16 @@ def _load_skills() -> dict[str, Skill]:
     is its frontmatter ``name`` or, failing that, its folder name. Everything in the induced root is
     induced — whatever its frontmatter says — and carries its review status (``pending`` until an
     admin decides), so a folder dropped there cannot skip the review."""
-    from .skills_registry import load
-    out = load(_load_from)
+    from .skills_registry import LOG, load
+    try:
+        out = load(_load_from)
+    except Exception as exc:  # noqa: BLE001 - fail closed for skills, not for the whole service
+        # A pinned release that is installed but corrupt, incomplete or misconfigured gives NO
+        # curated skills (never the repo fallback). This runs at import, so raising would stop the
+        # gateway, and every request that never touches a skill, from starting.
+        LOG.error("Pinned skills release refused, no curated skills are loaded: %s: %s",
+                  type(exc).__name__, exc)
+        out = {}
     if out is None:
         out = _load_from(_skills_dir())
     induced = _induced_dir()
@@ -363,9 +371,13 @@ def _signature() -> tuple:
     """What the skill roots look like on disk: every file's path, size and mtime. Cheap — a stat per
     file — and it changes whenever a skill folder is added, removed or edited."""
     from .skills_registry import config, release_dir
-    cfg = config()
-    sig: list[tuple] = [(repr(cfg),)]
-    for root in [*_roots(), release_dir(cfg)]:
+    try:
+        cfg = config()
+        sig: list[tuple] = [(repr(cfg),)]
+        release = [release_dir(cfg)]
+    except Exception as exc:  # noqa: BLE001 - _load_skills reports a bad config; re-scan once it changes
+        sig, release = [("registry config error", repr(exc))], []
+    for root in [*_roots(), *release]:
         if not root.is_dir():
             sig.append((str(root), None))
             continue

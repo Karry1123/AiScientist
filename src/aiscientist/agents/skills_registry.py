@@ -27,7 +27,7 @@ def config() -> dict:
     for key in ("release_tag", "releases_root", "allowed_tiers", "transitional_fallback"):
         value = os.environ.get("AISCIENTIST_SKILLS_REGISTRY_" + key.upper())
         if value is not None:
-            cfg[key] = (value.split(",") if key == "allowed_tiers" else
+            cfg[key] = ([v.strip() for v in value.split(",") if v.strip()] if key == "allowed_tiers" else
                         value.lower() in {"1", "true", "yes"} if key == "transitional_fallback"
                         else value)
     if not re.fullmatch(r"v\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?", cfg["release_tag"]):
@@ -109,6 +109,8 @@ def load(load_from) -> dict | None:
             raise ValueError("invalid catalog skill status")
         if row["status"] not in cfg["allowed_tiers"]:
             continue
+        if not row.get("version"):
+            raise ValueError(f"missing skill version: {name}")
         req = requirements(row["requirements"])
         folder = safe_path(root, row["path"])
         if folder.is_dir():
@@ -118,7 +120,9 @@ def load(load_from) -> dict | None:
                     raise ValueError(f"unverified skill file: {path}")
             loaded = load_from(folder)
         else:
-            candidates = [f"{name}.zip", row["path"] + ".zip"]
+            # The registry's release workflow names each bundle <name>-<version>.zip
+            # (aiscientist_skills/package.py); the other two names are accepted as well.
+            candidates = [f"{name}-{row['version']}.zip", f"{name}.zip", row["path"] + ".zip"]
             archive = next((p for p in candidates if p in checked), None)
             if archive is None:
                 raise ValueError(f"missing verified bundle for skill {name}")
@@ -135,8 +139,6 @@ def load(load_from) -> dict | None:
         if len(loaded) != 1:
             raise ValueError(f"bundle must contain exactly one skill: {name}")
         skill = next(iter(loaded.values()))
-        if not row.get("version"):
-            raise ValueError(f"missing skill version: {name}")
         out[name] = replace(skill, name=name, summary=row["description"], category=row["category"],
                             version=row["version"], status=row["status"], tags=tuple(row.get("tags", [])),
                             requirements=req, registry_release=cfg["release_tag"], folder="",
@@ -149,10 +151,14 @@ def init_manifest(ctx) -> None:
     if ctx is None or ctx.workspace is None:
         return
     path = Path(ctx.workspace) / "manifest.json"
+    try:
+        release = config()["release_tag"]
+    except Exception:  # noqa: BLE001 - a bad registry config leaves the run without curated skills, not without a manifest
+        release = None
     with _MANIFEST_LOCK:
         if not path.exists():
             path.parent.mkdir(parents=True, exist_ok=True)
-            _write(path, {"registry_release": config()["release_tag"], "skills": []})
+            _write(path, {"registry_release": release, "skills": []})
 
 
 def _write(path: Path, value: dict) -> None:
@@ -205,8 +211,9 @@ def execute(skill, ctx, executor, call, tool: str):
         if not getattr(executor, "supports_skill_policy", False):
             raise ValueError("executor cannot enforce registry skill requirements")
         allowed = req.get("allowed_tools")
-        allowed = [v.strip() for v in allowed.split(",") if v.strip()] if isinstance(allowed, str) else allowed
-        if allowed and tool not in [v.strip() for v in allowed]:
+        # Agent Skills writes allowed-tools space-separated; commas are accepted too.
+        allowed = [v for v in re.split(r"[\s,]+", allowed) if v] if isinstance(allowed, str) else allowed
+        if allowed and tool not in [str(v).strip() for v in allowed]:
             raise ValueError(f"skill does not declare tool {tool}")
         for name in req["secrets"]:
             # A skill can name a credential, but cannot choose its source or receive its value.
@@ -233,20 +240,42 @@ def execute(skill, ctx, executor, call, tool: str):
             value = [redact(v) for v in value]
         return value
     result = redact(result)
-    ok = isinstance(result, dict) and result.get("status") in {"ok", "success"}
-    state = "success" if ok else "error"
-    default = Path(ctx.workspace).parent / "skill_versions.sqlite3" if ctx and ctx.workspace else ROOT / ".skill_versions.sqlite3"
-    path = Path(os.environ.get("AISCIENTIST_SKILLS_REGISTRY_STATS", default))
+    status = result.get("status") if isinstance(result, dict) else None
+    if status != "cancelled":   # the user pressed Stop: not a verdict on the skill version
+        _count(skill, "success" if status in {"ok", "success"} else "error", ctx)
+    return result
+
+
+def stats_path(ctx=None) -> Path:
+    """One file for the whole deployment, so error rates per version are counted across every
+    account: ``AISCIENTIST_SKILLS_REGISTRY_STATS``, else ``<AISCIENTIST_STATE_DIR>``, else next to
+    the run folders (a console without a state dir)."""
+    explicit = os.environ.get("AISCIENTIST_SKILLS_REGISTRY_STATS", "").strip()
+    if explicit:
+        return Path(explicit)
+    state = os.environ.get("AISCIENTIST_STATE_DIR", "").strip()
+    if state:
+        return Path(state) / "skill_versions.sqlite3"
+    if ctx is not None and getattr(ctx, "workspace", None):
+        return Path(ctx.workspace).parent / "skill_versions.sqlite3"
+    return ROOT / ".skill_versions.sqlite3"
+
+
+def _count(skill, state: str, ctx) -> None:
+    path = stats_path(ctx)
     try:
         path.parent.mkdir(parents=True, exist_ok=True)
-        with sqlite3.connect(path) as db:
-            db.execute("CREATE TABLE IF NOT EXISTS skill_versions (release TEXT, name TEXT, version TEXT, "
-                       "success INTEGER DEFAULT 0, error INTEGER DEFAULT 0, PRIMARY KEY(release,name,version))")
-            db.execute("INSERT OR IGNORE INTO skill_versions(release,name,version) VALUES(?,?,?)",
-                       (skill.registry_release, skill.name, skill.version))
-            db.execute(f"UPDATE skill_versions SET {state}={state}+1 WHERE release=? AND name=? AND version=?",
-                       (skill.registry_release, skill.name, skill.version))
+        db = sqlite3.connect(path, timeout=10)
+        try:
+            with db:
+                db.execute("CREATE TABLE IF NOT EXISTS skill_versions (release TEXT, name TEXT, version TEXT, "
+                           "success INTEGER DEFAULT 0, error INTEGER DEFAULT 0, PRIMARY KEY(release,name,version))")
+                db.execute("INSERT OR IGNORE INTO skill_versions(release,name,version) VALUES(?,?,?)",
+                           (skill.registry_release, skill.name, skill.version))
+                db.execute(f"UPDATE skill_versions SET {state}={state}+1 WHERE release=? AND name=? AND version=?",
+                           (skill.registry_release, skill.name, skill.version))
+        finally:
+            db.close()
     except (OSError, sqlite3.Error) as exc:
         # The counter is for rollback decisions; it must never fail the run itself.
         LOG.warning("could not record skill version outcome in %s: %s", path, exc)
-    return result
