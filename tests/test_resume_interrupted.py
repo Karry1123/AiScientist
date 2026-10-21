@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import tempfile
 import types
 from pathlib import Path
 
@@ -98,7 +99,8 @@ def _lab() -> tuple[ResearchLab, list[str]]:
                                    "figures": ["figures/violin_qc_violin.png"]}}],
                 errors=[])
 
-    lab = ResearchLab(HarnessContext(decisions={}, workspace=Path(".")),
+    # A throwaway workspace: the lab writes the run's manifest.json there on construction.
+    lab = ResearchLab(HarnessContext(decisions={}, workspace=Path(tempfile.mkdtemp())),
                       LabConfig(max_steps=len(AGENDA), auto_select_skill=False),
                       complete_fn=complete_fn, scientist=_Scientist())
     ran: list[str] = []

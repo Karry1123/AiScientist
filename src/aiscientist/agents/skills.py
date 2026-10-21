@@ -1,5 +1,9 @@
 """Atomic skill library — small, model-rewritable code capabilities surfaced on demand.
 
+Curated skills come from the pinned, checksum-verified release configured in
+``configs/skills_registry.json``. The folder scanning described below is also used to read
+release bundles and for the explicitly configured transitional fallback and induced skills.
+
 A *skill* is any folder holding a ``SKILL.md``, at ANY depth under ``skills/`` (repo root), in the
 Anthropic Agent-Skills shape — so ``skills/<name>/`` and a category layout such as
 ``skills/single-cell/qc-snrna-with-cellqc-standalone/`` both work, and a skill written for another
@@ -90,6 +94,11 @@ class Skill:
     mem_gb: int = 0
     time_limit: str = ""
     env_problem: str = ""                      # why a declared environment was not accepted
+    version: str = ""
+    status: str = ""
+    tags: tuple[str, ...] = ()
+    requirements: dict[str, Any] = field(default_factory=dict)
+    registry_release: str = ""
 
 
 def _skills_dir() -> Path:
@@ -198,7 +207,18 @@ def _load_skills() -> dict[str, Skill]:
     is its frontmatter ``name`` or, failing that, its folder name. Everything in the induced root is
     induced — whatever its frontmatter says — and carries its review status (``pending`` until an
     admin decides), so a folder dropped there cannot skip the review."""
-    out = _load_from(_skills_dir())
+    from .skills_registry import LOG, load
+    try:
+        out = load(_load_from)
+    except Exception as exc:  # noqa: BLE001 - fail closed for skills, not for the whole service
+        # A pinned release that is installed but corrupt, incomplete or misconfigured gives NO
+        # curated skills (never the repo fallback). This runs at import, so raising would stop the
+        # gateway, and every request that never touches a skill, from starting.
+        LOG.error("Pinned skills release refused, no curated skills are loaded: %s: %s",
+                  type(exc).__name__, exc)
+        out = {}
+    if out is None:
+        out = _load_from(_skills_dir())
     induced = _induced_dir()
     if induced is not None:
         reviews = _load_reviews()
@@ -251,6 +271,8 @@ def _skill_md_files(root: Path) -> "list[Path]":
     found: list[Path] = []
     for dirpath, dirnames, filenames in os.walk(root):
         dirnames[:] = sorted(d for d in dirnames if not d.startswith(_SKIP_PREFIXES))
+        if Path(dirpath) == root and root == _skills_dir():
+            dirnames[:] = [d for d in dirnames if d != "releases"]
         if "SKILL.md" in filenames:
             found.append(Path(dirpath) / "SKILL.md")
     return found
@@ -348,8 +370,14 @@ def _load_from(root: Path) -> dict[str, Skill]:
 def _signature() -> tuple:
     """What the skill roots look like on disk: every file's path, size and mtime. Cheap — a stat per
     file — and it changes whenever a skill folder is added, removed or edited."""
-    sig: list[tuple] = []
-    for root in _roots():
+    from .skills_registry import config, release_dir
+    try:
+        cfg = config()
+        sig: list[tuple] = [(repr(cfg),)]
+        release = [release_dir(cfg)]
+    except Exception as exc:  # noqa: BLE001 - _load_skills reports a bad config; re-scan once it changes
+        sig, release = [("registry config error", repr(exc))], []
+    for root in [*_roots(), *release]:
         if not root.is_dir():
             sig.append((str(root), None))
             continue
@@ -520,7 +548,9 @@ def list_skills() -> list[dict]:
     """All atomic skills as plain dicts (name, summary, category) for the console's skill picker.
     Re-scans first, so a folder dropped in since the last call is listed."""
     refresh_skills()
-    return [{"name": s.name, "summary": s.summary, "category": s.category, "image": s.image}
+    return [{"name": s.name, "summary": s.summary, "category": s.category, "image": s.image,
+             "version": s.version, "status": s.status, "tags": list(s.tags),
+             "requirements": s.requirements, "registry_release": s.registry_release}
             for s in list(SKILLS.values())]
 
 
@@ -633,6 +663,8 @@ def make_search_skills_tool(get_skills: "Callable[[], dict[str, Skill]] | None" 
     _get = get_skills if get_skills is not None else (lambda: SKILLS)
 
     def _exec(args: dict[str, Any], _ctx: HarnessContext) -> dict[str, Any]:
+        if get_skills is None:
+            refresh_skills()
         lib = _get()
         if not lib:
             return {"results": [], "hint": "no skills are available for this run"}
@@ -676,6 +708,8 @@ def make_skill_reference_tool(get_skills: "Callable[[], dict[str, Skill]] | None
     _get = get_skills if get_skills is not None else (lambda: SKILLS)
 
     def _exec(args: dict[str, Any], _ctx: HarnessContext) -> dict[str, Any]:
+        if get_skills is None:
+            refresh_skills()
         lib = _get()
         if not lib:
             return {"error": "no skills are available for this run"}
@@ -683,6 +717,8 @@ def make_skill_reference_tool(get_skills: "Callable[[], dict[str, Skill]] | None
         hit = _resolve(lib, name)
         if hit is None:
             return {"error": f"unknown skill {name!r}", "available": sorted(lib)}
+        from .skills_registry import record_use
+        record_use(_ctx, hit)
         requested = str(args.get("file", "")).strip()
         if requested:
             code = hit.files.get(requested)
@@ -694,6 +730,8 @@ def make_skill_reference_tool(get_skills: "Callable[[], dict[str, Skill]] | None
         files = sorted(hit.files)
         default = "reference.py" if "reference.py" in files else (files[0] if files else None)
         out = {"name": hit.name, "summary": hit.summary, "doc": hit.doc, "files": files}
+        out.update(version=hit.version, status=hit.status, requirements=hit.requirements,
+                   registry_release=hit.registry_release)
         if hit.metadata:
             out["metadata"] = hit.metadata   # e.g. compute, requires-gpu, requires-network, tested-with
         if default is not None:

@@ -494,6 +494,12 @@ def hpc_shell_catalog(shell: HpcShell | None) -> list[HarnessTool]:
         except (TypeError, ValueError):
             return d
 
+    def _run_skill_shell(args, ctx):
+        from ..agents.skills_registry import active_skill
+        if active_skill(ctx) is not None:
+            return {"status": "error", "error": "Registry skills require a policy-enforcing container; use run_code or run_in_environment."}
+        return shell.run_shell(_str(args, "command"), _int(args, "timeout_s", 0), _str(args, "workdir"))
+
     return [
         HarnessTool(
             name="list_dir",
@@ -565,8 +571,7 @@ def hpc_shell_catalog(shell: HpcShell | None) -> list[HarnessTool]:
                 "workdir": {"type": "string", "description": "Optional directory to run in."},
                 "timeout_s": {"type": "integer", "description": "Per-command wall limit."},
             }, "required": ["command"]},
-            executor=_ok(lambda a, _c: shell.run_shell(
-                _str(a, "command"), _int(a, "timeout_s", 0), _str(a, "workdir"))),
+            executor=_ok(_run_skill_shell),
             reads_private_data=True,
             category="shell",
             requires=("hpc_worker",),
