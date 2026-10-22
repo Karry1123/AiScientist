@@ -32,7 +32,7 @@ CORPUS_TOOL = "search_corpus"
 MAX_QUERIES = 4
 MAX_TERMS = 12
 CORPUS_PASSAGES = 12
-PER_QUERY = 8
+PER_QUERY = 12      # kept per query; each search reads 100 hits and ranks them itself
 MAX_PAPERS = 12
 ABSTRACT_CHARS = 1400
 

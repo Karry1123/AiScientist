@@ -171,3 +171,17 @@ def test_the_plan_step_says_when_the_corpus_is_searched_too():
     step = lit.plan_step("How does the rod ERG change?", corpus=True)
     assert "RetiGene corpus" in step and "`search_corpus`" in step and "PubMed" in step
     assert "no HPC3 job" not in step
+
+
+def test_deeper_queries_still_read_only_twelve_papers():
+    calls = []
+
+    def search(query, limit):
+        calls.append((query, limit))
+        return {"status": "ok", "results": [_hit(i) for i in range(100)]}
+
+    got = lit.collect_papers(search, ["RHO retina", "RHO degeneration"])
+    assert calls == [("RHO retina", 12), ("RHO degeneration", 12)]
+    assert len(got.papers) == lit.MAX_PAPERS == 12
+    assert [p.number for p in got.papers] == list(range(1, 13))
+    assert all(p.queries == ["RHO retina", "RHO degeneration"] for p in got.papers)
