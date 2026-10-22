@@ -35,7 +35,7 @@ Ranks the chunks of the corpus text cache (`mechanism_cache/chunks.jsonl`, vecto
 
 ## Outputs
 
-- `contexts`: one item per passage, with `citation`, `pmid`, `page`, `chunk`, `text`, `score` (the fused rank score), `cosine` and the `query` that found it. The key and its shape are the ones `deep_literature` returns, so the References builder and the chat grounding read both.
+- `contexts`: one item per passage, with `citation`, the paper's `title`, `authors`, `year`, `journal` and `doi` (from the corpus manifest, when it has them), `pmid`, `page`, `chunk`, `text`, `score` (the fused rank score), `cosine` and the `query` that found it. The key and its shape are the ones `deep_literature` returns, so the References builder and the chat grounding read both.
 - `terms`: every word and term used, with its `kind` (`gene` or `word`), `source` (`query` or `model`), `n_passages` (how many chunks hold it) and `use` (`filter`: rare, `rank`: common, `absent`: in no chunk), so the model can see what its words did.
 - `failed` with a reason when no passage matched, never `ok` with an empty list.
 

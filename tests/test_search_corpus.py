@@ -273,3 +273,20 @@ def test_manifest_metadata_reaches_the_answer_csv_without_changing_the_citation(
     row, = csv.DictReader(io.StringIO(lit.papers_csv(got.papers)))
     assert {k: row[k] for k in expected} == expected
     assert got.papers[0].line() == "Smith J. PRPF31 in adRP. 2001. https://pubmed.ncbi.nlm.nih.gov/11111111/"
+
+
+def test_the_retigene_manifest_column_names_reach_the_contexts(corpus):
+    # The RetiGene manifest names its columns title, authors, year, journal and doi.
+    manifest = corpus / "paperqa_manifest.csv"
+    with manifest.open(newline="") as fh:
+        rows = list(csv.DictReader(fh))
+    rows[0].update(title="PRPF31 in adRP", authors="Smith J, Jones A", year="2001", journal="Hum Mol Genet",
+                   doi="10.1/real")
+    with manifest.open("w", newline="") as fh:
+        writer = csv.DictWriter(fh, fieldnames=list(rows[0]))
+        writer.writeheader()
+        writer.writerows(rows)
+    context, = run({"queries": ["PRPF31 haploinsufficiency splicing"], "top_k": 1})["contexts"]
+    assert {k: context[k] for k in ("title", "authors", "year", "journal", "doi")} == {
+        "title": "PRPF31 in adRP", "authors": "Smith J, Jones A", "year": "2001", "journal": "Hum Mol Genet",
+        "doi": "10.1/real"}
