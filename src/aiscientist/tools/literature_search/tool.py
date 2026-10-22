@@ -43,6 +43,7 @@ _BRIEF_FUNCTION_WORDS = {"against", "known", "using", "within", "between", "acro
 _QUERY_MAX_CHARS = 180
 _ABSTRACT_MAX_CHARS = 2000
 SEARCH_DEPTH = 100
+MAX_RESULTS = 25    # papers returned: what the `limit` schema promises (1-25)
 _RANK_WORD = re.compile(r"[a-z][a-z0-9]*")
 _RANK_STOPWORDS = set("a an and are as at be by for from in is it not of on or that the this to was were with".split())
 #throw a series of garbage words
@@ -234,7 +235,7 @@ def search_europepmc(query: str, limit: int = 8, timeout_s: float = 20.0, *,
     query = focus_literature_query(query)
     if not query:
         return {"status": "error", "error": "empty query"}
-    limit = max(1, min(int(limit or 8), SEARCH_DEPTH))
+    limit = max(1, min(int(limit or 8), MAX_RESULTS))
     sent = f"({query}) AND SRC:MED" if pubmed_only else query
     try:
         import httpx

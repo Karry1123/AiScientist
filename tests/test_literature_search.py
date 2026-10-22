@@ -230,3 +230,12 @@ def test_deep_search_returns_ranked_candidates_but_answer_reads_only_twelve(monk
     assert calls[0]["params"]["pageSize"] == 100          # reads 100 hits ...
     assert got.searched == [{"query": "RHO retina", "count": 12}]   # ... keeps the best 12
     assert len(got.papers) == 12
+
+
+def test_a_large_limit_still_returns_at_most_twenty_five_papers(monkeypatch):
+    # The search reads 100 hits, but the tool's schema promises 1-25 results to the model.
+    hits = [{"title": f"RHO retina study {i}", "abstractText": "RHO degeneration.", "pmid": str(2000 + i)}
+            for i in range(100)]
+    monkeypatch.setattr(httpx, "get", lambda *a, **k: _Resp({"resultList": {"result": hits}}))
+    out = search_europepmc("RHO retina", limit=100)
+    assert out["unfiltered_count"] == 100 and out["count"] == 25
