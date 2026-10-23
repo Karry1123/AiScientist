@@ -78,8 +78,8 @@ snapshot before then.
 
 ## Model behaviour: probes, smoke tests, demos
 
-These call a real model, either OpenRouter or the model served on HPC3, to measure what the unit
-tests cannot. They start no HPC3 jobs unless stated.
+These call a real model, either OpenRouter or the model served on HPC3, or a live service, to measure
+what the unit tests cannot. They start no HPC3 jobs unless stated.
 
 | Script | What it measures |
 |---|---|
@@ -94,6 +94,7 @@ tests cannot. They start no HPC3 jobs unless stated.
 | `probe_relay.py` | Helper for the probes: posts prepared chat completions to a vLLM on an HPC3 node, from inside HPC3. |
 | `hpo_mapper_smoke.py` | Free-text → HPO mapping with a real model: translation, negation, family history. |
 | `biomni_local_smoke.py` | Biomni A1 against a local model, without the data lake. Historical. |
+| `measure_pubmed_depth.py` | The PubMed search (`literature_search`) against live Europe PMC, no model: for each query, the papers kept, the time, and whether three reference papers on RDH5 fundus albipunctatus are among them, for the former 8-hit search and the current 100-hit ranking. |
 
 ## RetiGene literature corpus (PaperQA)
 

@@ -225,3 +225,17 @@ def test_manifest_title_disambiguates_periods_in_a_legacy_journal_name():
     paper, = lit.add_corpus(lit.Collected([], []), {"status": "ok", "contexts": [context]}).papers
     assert (paper.title, paper.authors, paper.journal, paper.year) == (
         "Vitamin A. A follow-up study", "Smith J et al.", "J. Med. Genet", "2003")
+
+
+def test_deeper_queries_still_read_only_twelve_papers():
+    calls = []
+
+    def search(query, limit):
+        calls.append((query, limit))
+        return {"status": "ok", "results": [_hit(i) for i in range(100)]}
+
+    got = lit.collect_papers(search, ["RHO retina", "RHO degeneration"])
+    assert calls == [("RHO retina", 12), ("RHO degeneration", 12)]
+    assert len(got.papers) == lit.MAX_PAPERS == 12
+    assert [p.number for p in got.papers] == list(range(1, 13))
+    assert all(p.queries == ["RHO retina", "RHO degeneration"] for p in got.papers)
