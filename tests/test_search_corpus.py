@@ -5,6 +5,7 @@ no paperqa and needs no model; and an answer written from the passages is cut ba
 from __future__ import annotations
 
 import csv
+import io
 import json
 import sys
 import types
@@ -248,3 +249,44 @@ def test_the_literature_branch_passes_the_plans_search_corpus_settings():
         _run_search_corpus_step=run_step)
     ResearchLab._scientist(lab, "q", step, types.SimpleNamespace(name="G"), "", [], lambda _e: None)
     assert seen["pinned"] == {"queries": ["Is PRPF31 haploinsufficient?"]}
+
+
+def test_manifest_metadata_reaches_the_answer_csv_without_changing_the_citation(corpus):
+    from aiscientist.agents import literature_answer as lit
+
+    manifest = corpus / "paperqa_manifest.csv"
+    with manifest.open(newline="") as fh:
+        rows = list(csv.DictReader(fh))
+    rows[0].update(title="Full title. With periods.", authorString="Smith J, Jones A", pubYear="2001",
+                   journalTitle="J. Eye Res.", doi="10.1/manifest")
+    with manifest.open("w", newline="") as fh:
+        writer = csv.DictWriter(fh, fieldnames=list(rows[0]))
+        writer.writeheader()
+        writer.writerows(rows)
+    out = run({"queries": ["PRPF31 haploinsufficiency splicing"], "top_k": 1})
+    context, = out["contexts"]
+    expected = {"title": "Full title. With periods.", "authors": "Smith J, Jones A", "year": "2001",
+                "journal": "J. Eye Res.", "doi": "10.1/manifest"}
+    assert {k: context[k] for k in expected} == expected
+    assert context["citation"] == rows[0]["citation"]
+    got = lit.add_corpus(lit.Collected([], []), out)
+    row, = csv.DictReader(io.StringIO(lit.papers_csv(got.papers)))
+    assert {k: row[k] for k in expected} == expected
+    assert got.papers[0].line() == "Smith J. PRPF31 in adRP. 2001. https://pubmed.ncbi.nlm.nih.gov/11111111/"
+
+
+def test_the_retigene_manifest_column_names_reach_the_contexts(corpus):
+    # The RetiGene manifest names its columns title, authors, year, journal and doi.
+    manifest = corpus / "paperqa_manifest.csv"
+    with manifest.open(newline="") as fh:
+        rows = list(csv.DictReader(fh))
+    rows[0].update(title="PRPF31 in adRP", authors="Smith J, Jones A", year="2001", journal="Hum Mol Genet",
+                   doi="10.1/real")
+    with manifest.open("w", newline="") as fh:
+        writer = csv.DictWriter(fh, fieldnames=list(rows[0]))
+        writer.writeheader()
+        writer.writerows(rows)
+    context, = run({"queries": ["PRPF31 haploinsufficiency splicing"], "top_k": 1})["contexts"]
+    assert {k: context[k] for k in ("title", "authors", "year", "journal", "doi")} == {
+        "title": "PRPF31 in adRP", "authors": "Smith J, Jones A", "year": "2001", "journal": "Hum Mol Genet",
+        "doi": "10.1/real"}

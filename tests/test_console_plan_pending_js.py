@@ -54,7 +54,7 @@ const log = [];
 const els = {};
 const el = (id) => els[id] || (els[id] = { id, innerHTML: "", textContent: "", placeholder: "", value: "",
   scrollTop: 0, scrollHeight: 0, appendChild() {}, querySelector: () => null,
-  classList: { add() {}, remove() {}, toggle() {}, contains: () => false } });
+  classList: { add() {}, remove() {}, toggle(name, value) { els[id][name] = value; }, contains: () => false } });
 // What showPlanPanel / showClarify / showDecision leave behind: a card in the stream.
 const drawn = (kind) => () => {
   log.push("draw:" + kind);
@@ -116,13 +116,25 @@ __SCENARIO__
 """.replace("__ESCAPE__", ESCAPE)
 
 
-def _run(scenario: str) -> dict:
+def _run(scenario: str, *, working: bool = False) -> dict:
     node = shutil.which("node")
     if node is None:
         pytest.skip("node is not installed")
     source = APP_JS.read_text(encoding="utf-8")
     code = "\n".join(source[source.index(start):source.index(end)] for start, end in BLOCKS)
-    done = subprocess.run([node, "-e", HARNESS.replace("__SCENARIO__", scenario)], input=code,
+    harness = HARNESS
+    if working:
+        for start, end in [
+            ("let runTicker = null;", "function mountStream()"),
+            ("function repaintWorking()", "function streamThinking("),
+            ("function streamStatus(", "function streamCode("),
+            ("function updateComposerButton()", "// Cancel a chat's in-flight run"),
+        ]:
+            code += "\n" + source[source.index(start):source.index(end)]
+        harness = harness.replace("repaintWorking() {},", "")
+        harness = harness.replace("setInterval, clearInterval,", "setInterval: () => 1, clearInterval() {}, Date: { now: () => sandbox.now }, now: 1000, renderServerPathOffer() {},")
+        harness = harness.replace("submitPlan, submitDecision, chatOf, chats", "submitPlan, submitDecision, chatOf, chats, startAssistantStream, repaintWorking, streamStatus, streamToken, updateComposerButton")
+    done = subprocess.run([node, "-e", harness.replace("__SCENARIO__", scenario)], input=code,
                           capture_output=True, text=True, timeout=30)
     assert done.returncode == 0, done.stderr
     return json.loads(done.stdout)
@@ -342,3 +354,56 @@ def test_two_chats_each_keep_their_own_waiting_prompt():
     assert ">Plan to review</span>" in out["sidebar"] and ">Question for you</span>" in out["sidebar"]
     assert out["after"] == {"A": None, "B": "clarify"}
     assert out["inB"] == ["draw:clarify"]
+
+
+@pytest.mark.parametrize("kind", ["plan", "clarify", "decision"])
+def test_waiting_prompts_hide_working_keep_stop_and_restart_the_timer(kind):
+    out = _run("""
+  api.startAssistantStream(A());
+  A().running = true;
+  out.initialStart = A().run.startedAt;
+  const working = { style: {}, textContent: "" };
+  S.streamDom = { working, workingText: working };
+  api.streamStatus(A(), "Drafting plan");
+  sandbox.now = 61000;
+  const prompt = __KIND__;
+  api.handleWsMessage(prompt === "plan" ? plan() : {
+    type: prompt === "clarify" ? "plan_clarify" : "decision_prompt",
+    conversation_id: "A", run_id: "r1", questions: [], options: []
+  });
+  api.streamStatus(A(), "Stale backend activity");
+  out.waiting = { display: working.style.display, start: A().run.startedAt };
+  // The actual composer still exposes Stop while review is pending.
+  api.updateComposerButton();
+  out.stopHidden = els.chatStop.hidden;
+  sandbox.now = 301000;
+  if (prompt === "decision") await api.submitDecision("choice");
+  else await api.submitPlan(prompt === "clarify" ? "revise" : "approve", "answer");
+  if (prompt === "clarify") api.streamStatus(A(), "Working");
+  sandbox.now = 303000;
+  api.repaintWorking();
+  out.resumed = { display: working.style.display, text: working.textContent, start: A().run.startedAt };
+""".replace("__KIND__", json.dumps(kind)), working=True)
+    assert out["initialStart"] == 1000
+    assert out["waiting"] == {"display": "none", "start": None}
+    assert out["stopHidden"] is False
+    assert out["resumed"]["display"] == "flex"
+    assert out["resumed"]["start"] == 301000
+    assert "2s" in out["resumed"]["text"]
+    assert "Stale backend activity" not in out["resumed"]["text"]
+
+
+def test_a_turn_without_a_plan_times_from_when_the_question_was_sent():
+    out = _run("""
+  api.startAssistantStream(A());
+  const working = { style: {}, textContent: "" };
+  S.streamDom = { working, workingText: working };
+  sandbox.scheduleRepaint = () => {};
+  sandbox.now = 5000;
+  api.streamToken(A(), "Answer");
+  sandbox.now = 8000;
+  api.repaintWorking();
+  out.start = A().run.startedAt; out.text = working.textContent;
+""", working=True)
+    assert out["start"] == 1000
+    assert "7s" in out["text"]

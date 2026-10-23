@@ -145,12 +145,20 @@ def run_search(args: dict[str, Any], ctx: Any, *,
                                  max_per_paper=per_paper, allowed=allowed,
                                  terms=parse_terms((args.get("terms") or [])[:MAX_TERMS], "model", known),
                                  known_genes=known)
-    cites = manifest_citations(read_manifest(paths.manifest))
+    rows = read_manifest(paths.manifest)
+    cites = manifest_citations(rows)
+    # Use the same PMID fallbacks as the citation lookup, without another manifest read.
+    metadata = {pmid: row for row in rows for pmid in manifest_citations([row])}
     contexts = []
     for r in picked:
         c = chunks[r["idx"]]
         pmid = str(c.get("pmid"))
+        row = metadata.get(pmid, {})
+        fields = {key: str(row.get(key) or row.get(alias) or "").strip()
+                  for key, alias in (("title", "title"), ("authors", "authorString"),
+                                     ("year", "pubYear"), ("journal", "journalTitle"), ("doi", "doi"))}
         contexts.append({
+            **{key: value for key, value in fields.items() if value},
             "citation": cites.get(pmid) or f"PMID {pmid}", "pmid": pmid, "page": c.get("page"),
             "chunk": c.get("chunk"), "text": c.get("text", ""), "score": round(r["score"], 4),
             "cosine": round(r["cosine"], 4), "query": r["query"]})

@@ -322,3 +322,19 @@ def test_a_corpus_search_that_fails_leaves_a_pubmed_answer_and_says_why(tmp_path
     assert any("queue full" in t and "PubMed alone" in t for t in warns)
     answer = next(p for p in conn.pushed if p.get("type") == "chat_token")["token"]
     assert "[1] Lee et al. (2025) DDX41 paper 1." in answer
+
+
+def test_corpus_activity_logs_all_terms_without_the_question(tmp_path):
+    conn = _conn(tmp_path)
+    question = "This question is displayed elsewhere. " * 30
+    terms = [f"long search phrase {i:02d}" for i in range(20)] + ["dark adaptation"]
+    calls = []
+    tool = SimpleNamespace(executor=lambda args, ctx: calls.append(args) or {"status": "ok", "contexts": []})
+    run = SimpleNamespace(monitor=None)
+    gw_app._literature_corpus_logged(conn, run, (tool, None), question, terms)
+    line = next(p["token"] for p in conn.pushed if p.get("type") == "chat_thinking")
+    assert all(term in line for term in terms)
+    assert question not in line and "This question" not in line and "queries" not in line
+    logged = json.loads(line[line.index("(") + 1:line.rindex(")")])
+    assert logged == {"terms": terms, "top_k": lit.CORPUS_PASSAGES}
+    assert calls == [{"queries": [question], "terms": terms, "top_k": lit.CORPUS_PASSAGES}]
