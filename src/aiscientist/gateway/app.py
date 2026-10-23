@@ -8928,7 +8928,8 @@ def _literature_corpus_logged(conn: Connection, run: RunState, corpus: "tuple[An
     if run.monitor is not None:
         run.monitor.observe({"type": "tool_start", "tool": lit.CORPUS_TOOL})
     conn.push({"type": "run_status", "text": "📚 RetiGene corpus: searching the full text…"})
-    conn.push({"type": "chat_thinking", "token": f"→ {lit.CORPUS_TOOL}({json.dumps(args)[:200]})\n"})
+    log_args = {"terms": list(terms), "top_k": args["top_k"]}
+    conn.push({"type": "chat_thinking", "token": f"→ {lit.CORPUS_TOOL}({json.dumps(log_args, ensure_ascii=False)})\n"})
     try:
         out = tool.executor(args, ctx)
     except Exception as exc:  # noqa: BLE001 - the answer falls back to PubMed alone

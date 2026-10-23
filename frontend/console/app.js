@@ -1022,6 +1022,7 @@ function ownerVisible() { const c = activeChat(); return !!(c && c.run); }
 
 let runTicker = null;
 function startAssistantStream(c) {
+  // A plan, clarify or decision prompt clears startedAt (holdPlanPrompt); approving it starts it again.
   c.run = { text: "", thinking: "", feed: [], status: "running", statusLabel: "", startedAt: Date.now(), runId: null, streamId: null };
   if (chatVisible(c)) { state.streamDom = null; mountStream(); }
   // Heartbeat: keep the "Working…" timer ticking even when no events arrive for a while (long
@@ -1152,23 +1153,23 @@ function repaintStream() {
 function repaintWorking() {
   const dom = state.streamDom, c = activeChat(), run = c && c.run;
   if (!dom || !dom.working || !run) return;
-  if (run.status !== "running") { dom.working.style.display = "none"; return; }
+  if (run.status !== "running" || c.planPending) { dom.working.style.display = "none"; return; }
   const secs = Math.floor((Date.now() - (run.startedAt || Date.now())) / 1000);
   // Prefer the REAL backend activity (model_call / tool_start) over a generic label.
   const label = run.text ? "Writing…" : (run.statusLabel || "Working…");
   // After a long silent stretch, reassure that compute is running (not stuck).
   const hint = secs >= 30 && !run.text ? " · this can take a few minutes" : "";
   dom.working.style.display = "flex";
-  dom.workingText.textContent = `${label} · ${fmtElapsed(secs * 1000)}${hint}`;
+  dom.workingText.textContent = run.startedAt == null ? label : `${label} · ${fmtElapsed(secs * 1000)}${hint}`;
 }
 
 // ---- stream event ingest (DOM-independent; always updates the chat's record) -----------
-function streamToken(c, token) { if (c.run) { c.run.text += token; if (chatVisible(c)) scheduleRepaint(); } }
+function streamToken(c, token) { if (c.run) { if (!c.planPending && c.run.startedAt == null) c.run.startedAt = Date.now(); c.run.text += token; if (chatVisible(c)) scheduleRepaint(); } }
 function streamThinking(c, token) { if (c.run) { c.run.thinking += token; if (chatVisible(c)) scheduleRepaint(); } }
 function streamProgress(c, msg) { if (c.run) { c.run.feed.push({ kind: "line", text: msg.text || "", level: msg.level || "info" }); if (chatVisible(c)) scheduleRepaint(); } }
 // Transient "what's happening right now" label from the backend (model_call / tool_start).
 // Drives the live working line so it shows real activity, not a generic "Working…".
-function streamStatus(c, text) { if (c.run) { c.run.statusLabel = text || ""; if (chatVisible(c)) repaintWorking(); } }
+function streamStatus(c, text) { if (c.run) { if (!c.planPending && c.run.startedAt == null) c.run.startedAt = Date.now(); c.run.statusLabel = text || ""; if (chatVisible(c)) repaintWorking(); } }
 function streamCode(c, code) {
   if (!c.run) return;
   // The last successful run_code of a step wins: drop the previous trailing code block.
@@ -3600,6 +3601,9 @@ function holdPlanPrompt(c, kind, payload, msg) {
   c.plan = next;
   c.planPending = true;
   c.answered = null;
+  // Review time must not appear as compute time, including on replayed prompts.
+  if (c.run) c.run.startedAt = null;
+  if (chatVisible(c)) repaintWorking();
   if (kind === "plan") keepPlanDraft(c, next);
   saveRunOwners();
   // The prompt that is already on screen, sent again: its card stays as it is, with the caret
@@ -4663,6 +4667,7 @@ async function submitDecision(choice, c = activeChat()) {
   if (!state.connectionId || !c) return;
   finalizePlanCard(choice ? `✓ Chose: ${choice}` : "✓ Proceeding — agent decides", null, c);
   releasePlanPrompt(c);
+  if (c.run) { c.run.startedAt = Date.now(); c.run.statusLabel = ""; }
   if (chatVisible(c)) {
     $("chatInput").placeholder = DEFAULT_PLACEHOLDER;
     mountStream();
@@ -4819,6 +4824,7 @@ async function submitPlan(action, feedback, planYaml, c = activeChat()) {
   if (action === "edit") c.planDraftYaml = planYaml || "";
   else if (action !== "revise") dropPlanDraft(c);
   if (action === "approve") {
+    if (c.run) { c.run.startedAt = Date.now(); c.run.statusLabel = ""; }
     finalizePlanCard("▶ Approved — running…", savedPlan, c);
     // Re-anchor the live bubble below the just-approved plan so the run's activity
     // (reasoning / running code / report) streams in AFTER it, where the user is looking.
@@ -4833,6 +4839,7 @@ async function submitPlan(action, feedback, planYaml, c = activeChat()) {
   releasePlanPrompt(c);
   if (chatVisible(c)) renderPlanPanel();   // now without the prompt: the answered plan, read-only
   if (chatVisible(c)) $("chatInput").placeholder = DEFAULT_PLACEHOLDER;
+  if (chatVisible(c)) repaintWorking();
   updateComposerButton();
   try {
     await fetch("/api/lab/plan", {

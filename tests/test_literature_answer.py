@@ -9,6 +9,8 @@ from __future__ import annotations
 import csv
 import io
 
+import pytest
+
 from aiscientist.agents import literature_answer as lit
 
 
@@ -139,20 +141,30 @@ def test_corpus_passages_come_first_one_source_per_paper_and_a_pubmed_duplicate_
     first, both = got.papers[0], got.papers[1]
     assert first.passages == ["(p. 1) The rod b-wave recovered after 3 h of dark adaptation.",
                               "(p. 1) A second passage of the same paper."]
-    assert first.title == "Nakamura M et al. RDH5 paper 9001. Am J Ophthalmol (2002)."
+    assert (first.title, first.authors, first.year, first.journal, first.doi) == (
+        "RDH5 paper 9001", "Nakamura M et al.", "2002", "Am J Ophthalmol", "10.1/x")
+    assert lit.references_md([first], got.papers) == (
+        "**References**\n\n- [1] Nakamura M et al. RDH5 paper 9001. Am J Ophthalmol (2002). "
+        "PMID:9001 DOI:10.1/x https://pubmed.ncbi.nlm.nih.gov/9001/")
     assert first.url == "https://pubmed.ncbi.nlm.nih.gov/9001/"
     assert both.title == "Paper 2" and both.abstract == "Abstract text." and both.passages == ["(p. 4) Same paper as PubMed hit 2."]
     assert got.corpus == {"status": "ok", "terms": result["terms"], "passages": 3, "papers": 2}
     # the answer reads the passages and the abstracts; the saved method and tables say where each came from
     user = lit.answer_messages("Q?", got.papers)[1]["content"]
     assert "Papers found in the lab's corpus and PubMed" in user
-    assert "[1] Nakamura M et al. RDH5 paper 9001" in user and "- (p. 1) The rod b-wave recovered" in user
+    assert "[1] RDH5 paper 9001" in user and "- (p. 1) The rod b-wave recovered" in user
     assert "[2] Paper 2" in user and "Abstract: Abstract text." in user
     md = lit.method_md(got, "2026-10-21")
     assert "3 passage(s) from 2 paper(s)" in md and "Words used: RDH5 (116)" in md
     rows = list(csv.DictReader(io.StringIO(lit.papers_csv(got.papers, {1}))))
     assert [(r["source"], r["corpus_passages"], r["cited"]) for r in rows] == [
         ("corpus", "2", "yes"), ("corpus+pubmed", "1", "no"), ("pubmed", "0", "no")]
+    assert {k: rows[0][k] for k in ("title", "authors", "year", "journal", "doi")} == {
+        "title": "RDH5 paper 9001", "authors": "Nakamura M et al.", "year": "2002",
+        "journal": "Am J Ophthalmol", "doi": "10.1/x"}
+    assert {k: rows[1][k] for k in ("title", "authors", "year", "journal", "doi")} == {
+        "title": "Paper 2", "authors": "Author2 A, Other B", "year": "2024",
+        "journal": "J Eye", "doi": "10.1/p2"}  # PubMed metadata takes precedence.
     assert lit.passages_md(got.papers).startswith("# Corpus passages read\n\n## [1] Nakamura M")
 
 
@@ -171,3 +183,45 @@ def test_the_plan_step_says_when_the_corpus_is_searched_too():
     step = lit.plan_step("How does the rod ERG change?", corpus=True)
     assert "RetiGene corpus" in step and "`search_corpus`" in step and "PubMed" in step
     assert "no HPC3 job" not in step
+
+
+@pytest.mark.parametrize("citation,expected", [
+    ("Smith J et al. Vitamin A. A follow-up study. Eye (2003). PMID:9001 DOI:10.1/study",
+     ("Vitamin A. A follow-up study", "Smith J et al.", "2003", "Eye", "10.1/study")),
+    ("Smith J. Vitamin A. A follow-up study. Eye (2003). PMID:9001",
+     ("Vitamin A. A follow-up study", "Smith J", "2003", "Eye", "")),
+    ("Smith J et al. Vitamin A. A follow-up study. Eye. PMID:9001 DOI:10.1/study",
+     ("Vitamin A. A follow-up study", "Smith J et al.", "", "Eye", "10.1/study")),
+    ("Smith J. Vitamin A. A follow-up study. Eye. PMID:9001",
+     ("Vitamin A. A follow-up study", "Smith J", "", "Eye", "")),
+    ("Smith J et al. One title. PMID:9001", ("One title", "Smith J et al.", "", "", "")),
+])
+def test_legacy_corpus_citations_fill_csv_without_rewriting_references(citation, expected):
+    got = lit.add_corpus(lit.Collected([], []), {"status": "ok", "contexts": [
+        {"pmid": "9001", "text": "A passage.", "citation": citation}]})
+    row, = csv.DictReader(io.StringIO(lit.papers_csv(got.papers)))
+    assert tuple(row[k] for k in ("title", "authors", "year", "journal", "doi")) == expected
+    assert got.papers[0].line() == citation + " https://pubmed.ncbi.nlm.nih.gov/9001/"
+
+
+def test_structured_corpus_metadata_takes_precedence_over_the_citation():
+    context = _ctx(9001, 0, "A passage.")
+    fields = {"title": "A full title. With periods.", "authors": "First A, Second B", "year": "2003",
+              "journal": "J. Eye Res.", "doi": "10.1/manifest"}
+    context.update(fields)
+    got = lit.add_corpus(lit.Collected([], []), {"status": "ok", "contexts": [context]})
+    row, = csv.DictReader(io.StringIO(lit.papers_csv(got.papers)))
+    assert {k: row[k] for k in fields} == fields
+    assert got.papers[0].citation == context["citation"]
+    # Empty columns still fall back to the citation, rather than erasing known metadata.
+    context.update(authors="", year="", doi="")
+    got = lit.add_corpus(lit.Collected([], []), {"status": "ok", "contexts": [context]})
+    assert (got.papers[0].authors, got.papers[0].year, got.papers[0].doi) == ("Nakamura M et al.", "2002", "10.1/x")
+
+
+def test_manifest_title_disambiguates_periods_in_a_legacy_journal_name():
+    context = {"pmid": "9001", "text": "Passage.", "title": "Vitamin A. A follow-up study",
+               "citation": "Smith J et al. Vitamin A. A follow-up study. J. Med. Genet. (2003). PMID:9001"}
+    paper, = lit.add_corpus(lit.Collected([], []), {"status": "ok", "contexts": [context]}).papers
+    assert (paper.title, paper.authors, paper.journal, paper.year) == (
+        "Vitamin A. A follow-up study", "Smith J et al.", "J. Med. Genet", "2003")

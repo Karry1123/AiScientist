@@ -243,7 +243,41 @@ def collect_papers(search: "Callable[..., dict[str, Any]]", queries: list[str], 
     return Collected(papers, searched)
 
 
-_PMID_IN_CITATION = re.compile(r"\s*PMID:\s*\d+.*$")
+def _corpus_metadata(context: dict[str, Any], citation: str) -> dict[str, str]:
+    """Prefer structured manifest fields; recover missing columns from older corpus results.
+
+    Work from the ends: identifiers, optional year, then the final journal segment. Splitting
+    title/journal from the right preserves periods inside a title. Keep the original citation
+    separately: these fields are for the prompt/CSV, never for rebuilding the reference line.
+    """
+    fields = {key: str(context.get(key) or "").strip()
+              for key in ("title", "authors", "year", "journal", "doi")}
+    doi = re.search(r"\bDOI:\s*(\S+)", citation, re.IGNORECASE)
+    parsed = {"doi": doi.group(1).rstrip(".") if doi else "", "authors": "", "year": "", "journal": ""}
+    body = re.split(r"\s*(?:PMID|DOI):\s*", citation, maxsplit=1, flags=re.IGNORECASE)[0].strip().rstrip(".")
+    # A manifest may use only the title as its citation; it has no author/journal delimiters.
+    if body == fields["title"].rstrip("."):
+        return {key: value or parsed.get(key, "") for key, value in fields.items()}
+    lead = re.match(r"^(.*?)\s+et al\.\s+(.+)$", body)
+    if lead:
+        parsed["authors"], body = lead.group(1) + " et al.", lead.group(2)
+    else:
+        # Single authors have no 'et al.'; their final initial ends the author segment.
+        lead = re.match(r"^(.+?\s+[A-Z]{1,3})\.\s+(.+)$", body)
+        if lead:
+            parsed["authors"], body = lead.groups()
+    year = re.search(r"\s*\((\d{4})\)\.?$", body)
+    if year:
+        parsed["year"], body = year.group(1), body[:year.start()].rstrip()
+    known_title = fields["title"].rstrip(".")
+    if known_title and body.startswith(known_title + ". "):
+        parsed["title"] = fields["title"]
+        parsed["journal"] = body[len(known_title) + 2:].rstrip(".")
+    else:
+        title, sep, journal = body.rstrip(".").rpartition(". ")
+        parsed["title"] = title if sep else body.rstrip(".")
+        parsed["journal"] = journal if sep else ""
+    return {key: value or parsed.get(key, "") for key, value in fields.items()}
 
 
 def add_corpus(collected: Collected, result: "dict[str, Any] | None", *,
@@ -271,8 +305,9 @@ def add_corpus(collected: Collected, result: "dict[str, Any] | None", *,
         p = by_pmid.get(pmid)
         if p is None:
             cite = str(c.get("citation") or "").strip()
-            title = _PMID_IN_CITATION.sub("", cite).strip() or f"PMID {pmid}"
-            p = Paper(number=0, title=title, pmid=pmid, citation=cite or f"PMID {pmid}",
+            metadata = _corpus_metadata(c, cite)
+            metadata["title"] = metadata["title"] or f"PMID {pmid}"
+            p = Paper(number=0, **metadata, pmid=pmid, citation=cite or f"PMID {pmid}",
                       url=f"https://pubmed.ncbi.nlm.nih.gov/{pmid}/", sources=["corpus"])
             by_pmid[pmid] = p
             corpus.append(p)
