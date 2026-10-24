@@ -145,7 +145,7 @@ def test_corpus_passages_come_first_one_source_per_paper_and_a_pubmed_duplicate_
         "RDH5 paper 9001", "Nakamura M et al.", "2002", "Am J Ophthalmol", "10.1/x")
     assert lit.references_md([first], got.papers) == (
         "**References**\n\n- [1] Nakamura M et al. RDH5 paper 9001. Am J Ophthalmol (2002). "
-        "PMID:9001 DOI:10.1/x https://pubmed.ncbi.nlm.nih.gov/9001/")
+        "PMID:9001 DOI:10.1/x (PMID 9001, p. 1) https://pubmed.ncbi.nlm.nih.gov/9001/")
     assert first.url == "https://pubmed.ncbi.nlm.nih.gov/9001/"
     assert both.title == "Paper 2" and both.abstract == "Abstract text." and both.passages == ["(p. 4) Same paper as PubMed hit 2."]
     assert got.corpus == {"status": "ok", "terms": result["terms"], "passages": 3, "papers": 2}
@@ -201,7 +201,7 @@ def test_legacy_corpus_citations_fill_csv_without_rewriting_references(citation,
         {"pmid": "9001", "text": "A passage.", "citation": citation}]})
     row, = csv.DictReader(io.StringIO(lit.papers_csv(got.papers)))
     assert tuple(row[k] for k in ("title", "authors", "year", "journal", "doi")) == expected
-    assert got.papers[0].line() == citation + " https://pubmed.ncbi.nlm.nih.gov/9001/"
+    assert got.papers[0].line() == citation + " (PMID 9001, p. unavailable) https://pubmed.ncbi.nlm.nih.gov/9001/"
 
 
 def test_structured_corpus_metadata_takes_precedence_over_the_citation():
