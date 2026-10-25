@@ -383,7 +383,7 @@ def test_a_finished_scan_is_kept_and_the_next_request_needs_no_job(tmp_path, mon
     asyncio.run(gw_app._run_corpus_scan(conn, req))
     assert len(builds) == 1
     token = next(p for p in pushed if p.get("type") == "chat_token")["token"]
-    assert "kept because the corpus has not changed" in token and "PRPF31" in token
+    assert "kept because the RetiGene papers have not changed" in token and "PRPF31" in token
     arts = next(p for p in pushed if p.get("type") == "artifacts")
     assert {"genes.csv", "hits.csv"} <= {a["name"] for a in arts["items"]}
     assert [p.get("type") for p in pushed][-1] == "chat_done"
@@ -555,5 +555,6 @@ def test_gene_list_without_reachable_corpus_uses_quick_chat(tmp_path, monkeypatc
     monkeypatch.setattr(gw_app, "_run_gene_table", no_table)
     _dispatch(conn, "What are haploinsufficient genes?", route="chat")
     assert ran == ["What are haploinsufficient genes?"] and len(checks) == 1
-    notices = [p for p in pushed if "Pick Corpus scan" in p.get("text", "")]
+    notices = [p for p in pushed
+               if "Ask about the RetiGene papers by name for the complete table" in p.get("text", "")]
     assert bool(notices) == hpc_enabled

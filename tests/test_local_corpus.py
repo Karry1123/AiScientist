@@ -78,11 +78,12 @@ def test_sync_uses_checksum_incremental_transfer_and_includes_manifest(tmp_path,
     spec.loader.exec_module(module)
     calls = []
     monkeypatch.setattr(module.subprocess, "run", lambda argv, **kw: calls.append((argv, kw)))
-    module.sync("hpc3:/corpus", tmp_path, with_model=True, with_hgnc=True)
+    module.sync("me@access-hpc3.rcic.uci.edu:/corpus", tmp_path, with_model=True, with_hgnc=True)
     assert len(calls) == 4
+    dtn = "me@access-hpc3.rcic.uci.edu:/corpus"
     assert [call[0][-2] for call in calls] == [
-        "hpc3:/corpus/mechanism_cache/", "hpc3:/corpus/paperqa_manifest.csv",
-        "hpc3:/corpus/hf_cache/", "hpc3:/corpus/hgnc_complete_set.txt"]
+        f"{dtn}/mechanism_cache/", f"{dtn}/paperqa_manifest.csv",
+        f"{dtn}/hf_cache/", f"{dtn}/hgnc_complete_set.txt"]
     assert calls[1][0][-1] == str(tmp_path / "manifest.csv")
     assert all("-rltc" in argv and "--delay-updates" in argv and kw["check"] for argv, kw in calls)
     assert all("--delete" not in argv for argv, _ in calls)
@@ -105,3 +106,37 @@ def test_failed_model_load_is_cached_until_retry_window(index, monkeypatch):
     now[0] += lc._LOAD_RETRY_S + 1
     assert lc.make_local_tool() is None
     assert len(attempts) == 2
+
+
+def _sync_module():
+    path = Path(__file__).resolve().parents[1] / "scripts" / "sync_corpus_index.py"
+    spec = importlib.util.spec_from_file_location("sync_corpus_index", path)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+@pytest.mark.parametrize("source", ["hpc3:/corpus", "me@hpc3.rcic.uci.edu:/corpus",
+                                    "login-i15.rcic.uci.edu:/corpus", "HPC3:/corpus"])
+def test_sync_refuses_an_hpc3_login_node(tmp_path, monkeypatch, source):
+    # RCIC allows no data transfer on the login nodes: the copy goes through access-hpc3.
+    module = _sync_module()
+    monkeypatch.setattr(module.subprocess, "run", lambda *a, **k: pytest.fail("rsync started"))
+    with pytest.raises(ValueError, match="access-hpc3.rcic.uci.edu"):
+        module.sync(source, tmp_path)
+
+
+def test_a_local_source_path_is_not_a_host(tmp_path, monkeypatch):
+    module = _sync_module()
+    calls = []
+    monkeypatch.setattr(module.subprocess, "run", lambda argv, **kw: calls.append(argv))
+    module.sync(str(tmp_path / "hpc3:copy"), tmp_path / "out")
+    assert len(calls) == 2
+
+
+def test_vectors_for_another_index_are_not_searched_and_never_re_embedded(index, monkeypatch):
+    np = pytest.importorskip("numpy")
+    np.save(index / "mechanism_cache" / "chunk_vecs.npy", np.zeros((3, 2), dtype="float32"))
+    monkeypatch.setattr(lc, "_embedder",
+                        lambda root: lambda texts: pytest.fail(f"embedded {len(texts)} texts"))
+    assert lc.run_local_search({"queries": ["PRPF31"]}) is None    # the HPC3 fallback answers

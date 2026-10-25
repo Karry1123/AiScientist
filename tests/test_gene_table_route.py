@@ -33,8 +33,8 @@ def test_gene_table_run_filters_quotes_and_keeps_csv(tmp_path, monkeypatch):
     asyncio.run(gw._run_gene_table(conn, req))
     token = next(p["token"] for p in pushed if p["type"] == "chat_token")
     assert "| gene | evidence" in token and "PRPF31" in token and "RHO" not in token
-    assert "PMID 12345, p. 6" in token and "not the full scan" in token
-    assert "Pick Corpus scan" in token and calls[0][1] == {"role": "literature"}
+    assert "PMID 12345, p. 6" in token and "not from every paper" in token
+    assert "Ask about the RetiGene papers by name for the complete table" in token and calls[0][1] == {"role": "literature"}
     path = next(conn.workspace.glob("*/artifacts/literature/genes.csv"))
     with path.open(encoding="utf-8", newline="") as fh:
         rows = list(csv.DictReader(fh))
@@ -55,7 +55,7 @@ def test_missing_corpus_still_returns_empty_table_and_csv(tmp_path, monkeypatch)
     req = gw.LabRequest(connection_id=conn.id, question="List haploinsufficient genes", route="chat")
     asyncio.run(gw._run_gene_table(conn, req))
     token = next(p["token"] for p in pushed if p["type"] == "chat_token")
-    assert "| gene | evidence" in token and "papers do not answer this" in token
+    assert "| gene | evidence" in token and "do not answer this with verified gene evidence" in token
     assert next(conn.workspace.glob("*/artifacts/literature/genes.csv")).is_file()
     assert pushed[-1]["type"] == "chat_done"
     conn.loop.close()

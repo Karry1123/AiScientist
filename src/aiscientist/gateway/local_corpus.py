@@ -28,6 +28,18 @@ def has_local_index() -> bool:
     return all((cache / name).is_file() for name in ("chunks.jsonl", "chunk_vecs.npy"))
 
 
+def _vectors_match_chunks(cache: Path) -> bool:
+    """Whether ``chunk_vecs.npy`` has one row per line of ``chunks.jsonl``. When it does not (a copy
+    caught between two index builds), ``search_corpus`` would embed the whole corpus again, which on
+    the gateway's CPU takes hours inside one request: such a copy is not used."""
+    import numpy as np
+
+    rows = np.load(cache / "chunk_vecs.npy", mmap_mode="r").shape[0]
+    with (cache / "chunks.jsonl").open("rb") as fh:
+        lines = sum(1 for line in fh if line.strip())
+    return rows == lines
+
+
 def _embedder(root: Path) -> Any:
     name = os.environ.get("AISCIENTIST_PAPERQA_EMBEDDING", CORPUS_DEFAULT_EMBEDDING).removeprefix("st-")
     hf = root / "hf_cache" / "hub"
@@ -60,6 +72,9 @@ def run_local_search(args: dict[str, Any], ctx: Any = None) -> dict[str, Any] | 
         return None
     root = local_root()
     try:
+        if not _vectors_match_chunks(root / "mechanism_cache"):
+            _LOG.warning("Local corpus copy has vectors for a different index; using HPC3 fallback")
+            return None
         embed = _embedder(root)
         manifest = root / "manifest.csv"
         hgnc = root / "hgnc_complete_set.txt"
