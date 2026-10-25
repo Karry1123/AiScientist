@@ -4258,7 +4258,13 @@ class ResearchLab:
         # force a straight agenda (there is no one to answer a clarify).
         if (early := _cancelled_before_plan()) is not None:
             return early
-        kind, payload = self._pi_plan(question, emit, allow_clarify=plan_review is not None)
+        # In plan mode the reviewed agenda is presented below; streaming the draft as well
+        # repeats the same plan card when review leaves it unchanged.
+        def draft_event(ev: dict[str, Any]) -> None:
+            if plan_review is None or ev.get("type") != "pi_agenda":
+                emit(ev)
+
+        kind, payload = self._pi_plan(question, draft_event, allow_clarify=plan_review is not None)
         if kind == "failed":
             emit({"type": "plan_failed", "reason": payload})
             return LabResult(question, [], [], False, 0, str(payload))
@@ -7592,6 +7598,17 @@ class ResearchLab:
         # Passed only when there is something to pin, so a scientist that predates the argument
         # (a test double, an older harness) is called exactly as before.
         pin_kwargs: dict[str, Any] = {"pinned_args": pinned} if pinned else {}
+        if "planned_tools" in inspect.signature(self.scientist.run).parameters:
+            approved_step = plan_step if plan_step is not None else step
+            planned = set(_declared_tools(approved_step))
+            if self._approved_plan is not None:
+                found = self._approved_plan.step_for(approved_step)
+                if found is not None and found.tool:
+                    planned.add(found.tool)
+            # A step that only names run_code (or another generic tool) may need several calls of
+            # it: only a dedicated tool such as run_cellqc ends its step on its first success.
+            if len(planned) == 1 and not planned & _GENERIC_TOOLS:
+                pin_kwargs["planned_tools"] = sorted(planned)
         # The step runs inside its skill's scope: the run's manifest records the skill, and every
         # run_code in this step carries it (its declared access) without the model having to name
         # it. The skill's version is counted once for the step, by the code that ran its method, and

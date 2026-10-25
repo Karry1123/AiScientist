@@ -1,4 +1,4 @@
-"""The processed dataset a run hands on: one AnnData with everything the analysis added.
+"""The processed datasets a run hands on: one AnnData per species with what the analysis added.
 
 A run's checkpoints (``work/adata_qc.h5ad``, ``adata_clustered.h5ad``, ``adata_annotated.h5ad`` …)
 were deleted once the report existed, and nothing copied them anywhere, so a run delivered a report
@@ -110,6 +110,55 @@ def _plain(value: Any) -> Any:
 
 
 def export(workspace: "str | Path", name: str, meta: "dict[str, Any] | None" = None) -> "dict[str, Any]":
+    """Export each species' QC checkpoint separately, retaining the single-dataset interface."""
+    work = Path(workspace) / "work"
+    bases = [p for p in [work / BASE_CHECKPOINT, *sorted(work.glob("adata_qc.*.h5ad"))]
+             if p.is_file()]
+    if len(bases) < 2:
+        return _export_checkpoint(workspace, name, meta)
+    if not re.fullmatch(r"[A-Za-z0-9._-]+\.h5ad", name or ""):
+        return {"status": "error", "error": f"bad result file name {name!r}"}
+    try:
+        import anndata as ad
+    except ImportError as exc:
+        return {"status": "error", "error": f"cannot export the result dataset: {exc}"}
+    datasets = []
+    for base in bases:
+        checkpoint = ad.read_h5ad(base, backed="r")
+        try:
+            cellqc = checkpoint.uns.get("cellqc", {})
+            species = str(cellqc.get("species") or base.stem.removeprefix("adata_qc.") or "unknown")
+            species = re.sub(r"[^A-Za-z0-9_-]+", "_", species)
+            libraries = [str(lib) for lib in cellqc.get("libraries", [])]
+        finally:
+            checkpoint.file.close()
+        stem = re.sub(r"[^A-Za-z0-9._-]+", "_", "_".join(libraries)).strip("._-") or "dataset"
+        suffix = name[name.index(".processed."):] if ".processed." in name else ".h5ad"
+        species_name = f"{stem[:60]}.{species}{suffix}"
+        out = _export_checkpoint(workspace, species_name,
+                                 {**(meta or {}), "species": species, "libraries": libraries,
+                                  "what": f"dataset:{species}"}, base_path=base,
+                                 pointer_name=f"result_dataset.{species}.json",
+                                 cells_name=f"cells.{species}.csv")
+        if out.get("status") != "ok":
+            return out
+        datasets.append(out["result_dataset"])
+    pointer = {**datasets[0], "datasets": datasets}
+    import pandas as pd
+    tables = [pd.read_csv(Path(workspace) / "artifacts" / p["cells_table"])
+              .assign(species=p["species"]) for p in datasets]
+    pd.concat(tables, ignore_index=True).to_csv(
+        Path(workspace) / "artifacts" / "tables" / "cells.csv", index=False)
+    (Path(workspace) / "artifacts" / "data" / POINTER).write_text(
+        json.dumps(pointer, indent=2), encoding="utf-8")
+    return {"status": "ok", "result_dataset": pointer, "result_datasets": datasets,
+            "summary": "; ".join(f"{p['name']}: {p['n_cells']} cells x {p['n_genes']} genes"
+                                 for p in datasets)}
+
+
+def _export_checkpoint(workspace: "str | Path", name: str, meta: "dict[str, Any] | None" = None,
+                       *, base_path: "Path | None" = None, pointer_name: str = POINTER,
+                       cells_name: str = "cells.csv") -> "dict[str, Any]":
     """Build ``<workspace>/result/<name>`` from the run's checkpoints, plus ``artifacts/tables/
     cells.csv`` and ``artifacts/data/result_dataset.json``. Returns the tool-style result dict;
     ``status`` is ``skipped`` (with ``reason``) when there is nothing to export."""
@@ -130,10 +179,10 @@ def export(workspace: "str | Path", name: str, meta: "dict[str, Any] | None" = N
         return {"status": "skipped",
                 "reason": "the run wrote no analysis checkpoint (work/adata_*.h5ad) to export"}
 
-    base_path = work / BASE_CHECKPOINT if (work / BASE_CHECKPOINT).is_file() else found[-1]
+    base_path = base_path or (work / BASE_CHECKPOINT if (work / BASE_CHECKPOINT).is_file() else found[-1])
     adata = ad.read_h5ad(base_path)
     notes: list[str] = []
-    if base_path.name != BASE_CHECKPOINT:
+    if base_path.name != BASE_CHECKPOINT and not base_path.name.startswith("adata_qc."):
         notes.append(f"no {BASE_CHECKPOINT}; built on {base_path.name}")
     # A base that is an HVG subset with the full matrix in .raw (a clustered checkpoint) hands on
     # the full matrix; otherwise .raw only duplicates X and is dropped.
@@ -156,6 +205,8 @@ def export(workspace: "str | Path", name: str, meta: "dict[str, Any] | None" = N
     for path in found:                                    # newest first: the latest value wins
         if path == base_path:
             continue
+        if path.name == BASE_CHECKPOINT or path.name.startswith("adata_qc."):
+            continue  # another species is a separate dataset, never a later analysis checkpoint
         try:
             other = ad.read_h5ad(path, backed="r")
         except Exception as exc:  # noqa: BLE001 - one unreadable checkpoint must not lose the rest
@@ -226,7 +277,7 @@ def export(workspace: "str | Path", name: str, meta: "dict[str, Any] | None" = N
             emb = np.asarray(adata.obsm[key])
             cells[f"{prefix}_1"], cells[f"{prefix}_2"] = emb[:, 0], emb[:, 1]
     (art / "tables").mkdir(parents=True, exist_ok=True)
-    cells.to_csv(art / "tables" / "cells.csv", index=False)
+    cells.to_csv(art / "tables" / cells_name, index=False)
 
     pointer = {
         "name": name, "path": str(out), "size_bytes": size,
@@ -236,10 +287,10 @@ def export(workspace: "str | Path", name: str, meta: "dict[str, Any] | None" = N
         "counts_layer": str(adata.uns.get("counts_layer") or "integer counts kept by the QC step"), "obs_columns": [str(c) for c in adata.obs.columns],
         "obsm": sorted(adata.obsm.keys()), "checkpoints": used, "notes": notes,
         "created_at": provenance["created_at"], "saved_to": None,
-        "cells_table": "tables/cells.csv", **_plain(meta or {}),
+        "cells_table": f"tables/{cells_name}", **_plain(meta or {}),
     }
     (art / "data").mkdir(parents=True, exist_ok=True)
-    (art / "data" / POINTER).write_text(json.dumps(pointer, indent=2), encoding="utf-8")
+    (art / "data" / pointer_name).write_text(json.dumps(pointer, indent=2), encoding="utf-8")
     # The same record travels with the file when it is moved to the user's data.
     (out.parent / (out.name + ".json")).write_text(json.dumps(pointer, indent=2), encoding="utf-8")
     return {"status": "ok", "result_dataset": pointer,

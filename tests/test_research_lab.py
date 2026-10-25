@@ -121,6 +121,40 @@ def test_lab_converges_when_critic_accepts_all_steps():
     assert {e["type"] for e in events} >= {"pi_agenda", "critic", "synthesize", "lab_done"}
 
 
+def test_plan_mode_streams_the_reviewed_agenda_once():
+    complete = _make_complete(
+        agenda=["Run QC on the dataset"],
+        critic_responses=[{"verdict": "accept", "score": 0.9, "critique": "grounded"}],
+    )
+    scientist = ResearchHarness(catalog=default_catalog(), chat_fn=_scientist_calls("run_qc", {}))
+    lab = ResearchLab(_ctx(), LabConfig(), complete_fn=complete, scientist=scientist)
+    events = []
+    lab.run("QC the dataset", on_event=events.append,
+            plan_review=lambda kind, payload: {"action": "cancel"})
+    agendas = [e for e in events if e["type"] == "pi_agenda"]
+    assert len(agendas) == 1
+    assert agendas[0]["agenda"] == ["Run QC on the dataset"]
+
+
+def test_only_a_step_naming_one_dedicated_tool_ends_on_its_first_success():
+    seen = []
+
+    class Recording(ResearchHarness):
+        def run(self, *args, planned_tools=None, **kwargs):
+            seen.append(planned_tools)
+            return super().run(*args, planned_tools=planned_tools, **kwargs)
+
+    for step in ("Run `run_qc` on the dataset", "Plot the QC metrics with `run_code`"):
+        complete = _make_complete(
+            agenda=[step],
+            critic_responses=[{"verdict": "accept", "score": 0.9, "critique": "grounded"}],
+        )
+        scientist = Recording(catalog=default_catalog(), chat_fn=_scientist_calls("run_qc", {}))
+        ResearchLab(_ctx(), LabConfig(), complete_fn=complete, scientist=scientist).run("QC")
+    # run_code may take several calls in one step, so it never ends the step early.
+    assert seen == [["run_qc"], None]
+
+
 # --- convergence is LLM-judged (no fixed score threshold) --------------------
 
 def test_convergence_is_llm_judged_not_thresholded():

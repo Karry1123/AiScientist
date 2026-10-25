@@ -11462,6 +11462,14 @@ async def _export_result_dataset(conn: "Connection", run_id: str, decisions: dic
     if status == "ok":
         rd = out.get("result_dataset") or {}
         where = "on HPC3" if on_hpc else "on the server"
+        datasets = out.get("result_datasets") or rd.get("datasets") or [rd]
+        if len(datasets) > 1:
+            for dataset in datasets:
+                emit("success", "lab", f"Processed dataset ready: {dataset['name']} — "
+                     f"{dataset.get('n_cells')} cells × {dataset.get('n_genes')} genes. "
+                     f"Kept {where} {_keep_for(kept_days, until_disconnect)}; "
+                     "Runs → “Save to my data” keeps it for the next analysis.")
+            return rd
         emit("success", "lab",
              f"📦 Processed dataset ready: {name} — {rd.get('n_cells')} cells × {rd.get('n_genes')} "
              f"genes, {int(rd.get('size_bytes') or 0) / 1e6:.0f} MB, {_dataset_holds(rd)}. "
@@ -14397,8 +14405,7 @@ def _files_lines(art: Path, dataset_note: str) -> "list[str]":
     """The "## Files" section of a short or QC report: the processed dataset, the tables, CellQC's
     result directory and the verification statement."""
     files = ["## Files", ""]
-    rd = _result_dataset_pointer(art)
-    if rd:
+    for rd in _result_dataset_pointers(art):
         files.append(f"- `{rd['name']}` — the processed dataset ({dataset_note}).")
     for rel, what in (("tables/cells.csv", _cells_table_what(art)),
                       ("tables/cellqc_metrics.csv", "CellQC's per-library metrics"),
@@ -14450,7 +14457,8 @@ def _qc_chat_reply(art: Path, result: Any) -> str:
     warnings = [re.sub(r"\s*Report it\.?\s*$", "", str(w)).strip()
                 for w in (r.get("warnings") or []) if str(w).strip()]
     before, after = r.get("cells_before"), r.get("cells_after")
-    genes = (f"; {int(r['genes_after']):,} genes" if isinstance(r.get("genes_after"), (int, float))
+    genes = (f"; {int(r['genes_after']):,} genes" if len(r.get("checkpoints") or {}) < 2
+             and isinstance(r.get("genes_after"), (int, float))
              else "")
     if libs:
         names = ", ".join(str(lib.get("sample")) for lib in libs[:4]) + (" …" if len(libs) > 4 else "")
@@ -14516,9 +14524,15 @@ def _qc_chat_reply(art: Path, result: Any) -> str:
         lines.append("")
     if th and len(libs) != 1:   # one library's filter line already names each threshold
         lines.append("- Thresholds: " + ", ".join(f"`{k}` = {v}" for k, v in th.items()) + ".")
+    split_notice = any(w.startswith("The libraries are from different species") for w in warnings)
+    warnings = [w for w in warnings if not w.startswith("The libraries are from different species")]
+    notes = [str(note) for note in r.get("notes") or []]
+    if split_notice:
+        notes.append("The libraries are from different species; each species was QC'd separately "
+                     "with its own gene sets and has its own result dataset.")
+    lines += [f"- {note}" for note in dict.fromkeys(notes)]
     lines += [f"- ⚠️ {w}" for w in warnings]
-    rd = _result_dataset_pointer(art)
-    if rd:
+    for rd in _result_dataset_pointers(art):
         layer = str(rd.get("counts_layer") or "").split(":")[0].strip()
         where = (f"saved in your data (`{rd['saved_to']}`)" if rd.get("saved_to") else
                  ("kept on HPC3" if rd.get("location") == "hpc3" else "kept on the server")
@@ -14763,11 +14777,28 @@ def _one_vs_rest_caveat(art: Path) -> str:
 
 def _result_dataset_pointer(art: Path) -> "dict | None":
     """The processed dataset this run exported (``data/result_dataset.json``), or None."""
+    datasets = _result_dataset_pointers(art)
+    return datasets[0] if datasets else None
+
+
+def _result_dataset_pointers(art: Path) -> list[dict]:
+    """All species' datasets, with the current save state of each individual pointer."""
     try:
         rd = json.loads((art / "data" / "result_dataset.json").read_text(encoding="utf-8"))
     except (OSError, ValueError):
-        return None
-    return rd if isinstance(rd, dict) and rd.get("name") else None
+        return []
+    if not isinstance(rd, dict):
+        return []
+    datasets = rd.get("datasets") or [rd]
+    out = []
+    for rec in datasets:
+        if not isinstance(rec, dict) or not rec.get("name"):
+            continue
+        species = str(rec.get("species") or "")
+        if rd.get("datasets") and re.fullmatch(r"[A-Za-z0-9_-]+", species):
+            rec = _read_pointer(art / "data" / f"result_dataset.{species}.json") or rec
+        out.append(rec)
+    return out
 
 
 def _result_dataset_line(art: Path) -> str:
@@ -14775,9 +14806,10 @@ def _result_dataset_line(art: Path) -> str:
 
     Run f3b8268c4fd4's Methods said the delivered dataset was ``work/adata_annotated.h5ad``, a
     checkpoint deleted when the run was published; the real deliverable was named nowhere."""
-    rd = _result_dataset_pointer(art)
-    if rd is None:
-        return ""
+    return "\n\n".join(_one_result_dataset_line(rd) for rd in _result_dataset_pointers(art))
+
+
+def _one_result_dataset_line(rd: dict) -> str:
     shape = f"{int(rd.get('n_cells') or 0):,} cells x {int(rd.get('n_genes') or 0):,} genes"
     obs = [str(c) for c in (rd.get("obs_columns") or []) if str(c) in (
         "cell_type", "leiden", "louvain", "sampleid", "cluster_note", "doublet_score")]
@@ -14791,7 +14823,7 @@ def _result_dataset_line(art: Path) -> str:
             f"`layers['counts']` holds {rd.get('counts_layer') or 'the integer counts kept by QC'}"
             + (f"; per-cell columns include {', '.join(f'`{c}`' for c in obs)}" if obs else "")
             + (f"; embeddings {', '.join(f'`{k}`' for k in rd.get('obsm') or [])}" if rd.get("obsm") else "")
-            + f". {kept} One row per cell is in `tables/cells.csv`.")
+            + f". {kept} One row per cell is in `{rd.get('cells_table', 'tables/cells.csv')}`.")
 
 
 # A run_code script that writes nothing — prints a shape, lists columns — is a check, not "a step no
@@ -16185,6 +16217,8 @@ def _result_pointer_path(owner: str, run_id: str, what: str = "dataset") -> Path
     if what == "literature":
         return CONSOLE_RUNS_DIR / safe_name(owner) / run_id / _LITERATURE_RESULT_POINTER
     name = CELLQC_RESULT_POINTER if what == "cellqc" else RESULT_DATASET_POINTER
+    if re.fullmatch(r"dataset:[A-Za-z0-9_-]+", what):
+        name = f"result_dataset.{what.split(':', 1)[1]}.json"
     return CONSOLE_RUNS_DIR / safe_name(owner) / run_id / "artifacts" / "data" / name
 
 
@@ -16377,6 +16411,9 @@ def _save_run_result(owner: str, user_id: "int | None", run_id: str, what: str,
         return 404, {"error": "This run kept no literature tables." if what == "literature" else
                      "This run kept no CellQC result directory." if folder
                      else "This run has no processed dataset."}
+    if what == "dataset" and rec.get("datasets"):
+        return _save_run_result(owner, user_id, run_id,
+                                str(rec["datasets"][0].get("what") or "dataset:unknown"), conn)
     if rec.get("saved_to"):
         return 200, {"ok": True, "path": rec["saved_to"], "already": True}
     name, src = str(rec.get("name") or ""), str(rec.get("path") or "")
@@ -16534,6 +16571,14 @@ def _record_saved_result(owner: str, user_id: "int | None", run_id: str, folder:
                **({"location": location} if location else {}))
     try:
         pointer_path.write_text(json.dumps(rec, indent=2), encoding="utf-8")
+        if re.fullmatch(r"result_dataset\.[A-Za-z0-9_-]+\.json", pointer_path.name):
+            aggregate_path = pointer_path.with_name("result_dataset.json")
+            aggregate = _read_pointer(aggregate_path) or {}
+            datasets = [rec if item.get("name") == name else item
+                        for item in aggregate.get("datasets") or []]
+            if datasets:
+                aggregate_path.write_text(json.dumps({**datasets[0], "datasets": datasets}, indent=2),
+                                          encoding="utf-8")
     except OSError as exc:
         print(f"[result-dataset] could not update {pointer_path}: {exc}")
     return dataset_id
@@ -16596,8 +16641,11 @@ async def _autosave_results(conn: "Connection", run_id: str, emit: Callable[...,
     do, for every run (_fixed_run_options). Best-effort, like the export."""
     if not (_AUTH_ENABLED and conn.app_user_id):
         return          # no account, no "my data": the results stay beside the run
-    for what, label in (("dataset", "The processed dataset"), ("cellqc", "CellQC's result directory"),
-                        ("literature", "The literature tables")):
+    datasets = _result_dataset_pointers(conn.workspace / run_id / "artifacts")
+    choices = [(str(rd.get("what") or "dataset"), f"The processed dataset {rd['name']}")
+               for rd in datasets]
+    choices += [("cellqc", "CellQC's result directory"), ("literature", "The literature tables")]
+    for what, label in choices:
         if _read_pointer(_result_pointer_path(conn.owner, run_id, what)) is None:
             continue
         try:
@@ -16630,13 +16678,18 @@ async def list_result_datasets(request: Request) -> JSONResponse:
     home = CONSOLE_RUNS_DIR / safe_name(user.username)
     rows: dict[str, dict] = {}
     for p in home.glob(f"*/artifacts/data/{RESULT_DATASET_POINTER}"):
-        rec = _read_pointer(p)
-        if rec is not None:
+        datasets = _result_dataset_pointers(p.parent.parent)
+        if datasets:
+            rec = datasets[0]
             rows[p.parents[2].name] = {
                 "run_id": p.parents[2].name,
                 **{k: rec.get(k) for k in ("name", "size_bytes", "n_cells", "n_genes", "created_at",
                                            "kept_days", "until_disconnect", "location", "saved_to", "saved_at",
-                                           "saving", "save_error")}}
+                                           "saving", "save_error")},
+                "datasets": [{k: rec.get(k) for k in (
+                    "name", "species", "what", "size_bytes", "n_cells", "n_genes", "created_at",
+                    "kept_days", "until_disconnect", "location", "saved_to", "saved_at", "saving",
+                    "save_error")} for rec in datasets]}
     for p in home.glob(f"*/artifacts/data/{CELLQC_RESULT_POINTER}"):
         rec = _read_pointer(p)
         if rec is None or not rec.get("name"):
@@ -16684,7 +16737,8 @@ async def save_result_dataset(run_id: str, request: Request, what: str = "datase
     user = _optional_user(request)
     if user is None:
         return JSONResponse({"error": "Not authenticated"}, status_code=401)
-    if not run_id.isalnum() or what not in _RESULT_KINDS:
+    if not run_id.isalnum() or (what not in _RESULT_KINDS
+                               and not re.fullmatch(r"dataset:[A-Za-z0-9_-]+", what)):
         return JSONResponse({"error": "bad request"}, status_code=400)
     if what == "tables":
         status, body = await asyncio.to_thread(_save_curation_tables, user.username, user.id, run_id)

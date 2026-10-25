@@ -320,7 +320,8 @@ class ResearchHarness:
     def run(self, brief: str, ctx: HarnessContext, on_event: EventFn | None = None,
             should_cancel: Callable[[], bool] | None = None,
             untrusted_text: str | None = None, extra_steps: int = 0,
-            pinned_args: "dict[str, dict[str, Any]] | None" = None) -> HarnessResult:
+            pinned_args: "dict[str, dict[str, Any]] | None" = None,
+            planned_tools: "list[str] | None" = None) -> HarnessResult:
         emit: EventFn = on_event or (lambda _event: None)
         steps: list[dict[str, Any]] = []
         errors: list[dict[str, Any]] = []
@@ -385,6 +386,8 @@ class ResearchHarness:
         last_error_sig: str | None = None
         wasted_after_success = 0     # non-productive turns AFTER a tool already succeeded
         had_success = False
+        planned = set(planned_tools or [])
+        planned_tool = next(iter(planned)) if len(planned) == 1 else None
         succeeded_keys: set[str] = set()   # (tool,args) that already ran ok — repeats are redundant
         try:
             for step_index in range(1, budget + 1):
@@ -581,8 +584,13 @@ class ResearchHarness:
                         fed = {"approved_settings_applied": {e["param"]: e["approved"] for e in enforced},
                                **output}
                     self._feed_result(messages, native, call.get("id"), fed)
+                    if name == planned_tool and not failed_sig:
+                        stop_reason = "planned_tool_succeeded"
+                        final_answer = self._digest_answer(steps, stop_reason)
+                        emit({"type": "early_stop", "reason": stop_reason, "tool": name})
+                        break
 
-                if stop_reason in ("finished", "cancelled"):
+                if stop_reason in ("finished", "cancelled", "planned_tool_succeeded"):
                     break
                 # Cheap early-outs (before burning the whole max_steps budget on a stuck loop):
                 if repeated_errors >= self.config.max_repeated_errors:
@@ -628,7 +636,7 @@ class ResearchHarness:
         # deterministic account from what the tools actually returned instead. Measured across 9
         # models on the same 7-step plan: 50-83% of steps hit the budget and every one of those
         # returned empty text, while their tables/figures were already on disk.
-        synthesized = False
+        synthesized = stop_reason == "planned_tool_succeeded"
         if not (final_answer or "").strip() and steps:
             final_answer = self._digest_answer(steps, stop_reason or "max_steps")
             synthesized = True

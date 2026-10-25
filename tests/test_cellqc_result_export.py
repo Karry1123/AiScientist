@@ -310,6 +310,151 @@ def test_the_lab_request_carries_the_choice(gw):
     assert gw.LabRequest(connection_id="c", question="q", save_results=True).save_results is True
 
 
+def test_each_species_checkpoint_exports_its_own_libraries_and_genes(tmp_path):
+    ad = pytest.importorskip("anndata")
+    np = pytest.importorskip("numpy")
+    pd = pytest.importorskip("pandas")
+    from aiscientist.tools._lib.result_dataset import export
+
+    work = tmp_path / "work"
+    work.mkdir()
+    for species, libraries, shape, filename in (
+        ("mouse", ["Sample1_WT", "Sample2_Ddx41"], (5, 7), "adata_qc.h5ad"),
+        ("human", ["Sample3"], (3, 9), "adata_qc.human.h5ad"),
+    ):
+        data = ad.AnnData(np.ones(shape, dtype=np.float32))
+        data.obs_names = [f"{species}_{i}" for i in range(shape[0])]
+        data.layers["counts"] = data.X.copy()
+        data.uns["cellqc"] = {"species": species, "libraries": libraries}
+        data.write_h5ad(work / filename)
+    result = export(tmp_path, "all.processed.20261025-1200.run7.h5ad", {"run_id": "run7"})
+    assert result["status"] == "ok"
+    mouse, human = result["result_datasets"]
+    assert mouse["name"] == "Sample1_WT_Sample2_Ddx41.mouse.processed.20261025-1200.run7.h5ad"
+    assert human["name"] == "Sample3.human.processed.20261025-1200.run7.h5ad"
+    assert ad.read_h5ad(mouse["path"]).shape == (5, 7)
+    assert ad.read_h5ad(human["path"]).shape == (3, 9)
+    pointer = json.loads((tmp_path / "artifacts/data/result_dataset.json").read_text())
+    assert pointer["datasets"] == [mouse, human]
+    assert all(not any("no cells in common" in note for note in d["notes"]) for d in [mouse, human])
+    assert len(pd.read_csv(tmp_path / "artifacts/tables/cells.csv")) == 8
+
+
+def test_species_export_offline_with_the_checkpoint_io_replaced(tmp_path, monkeypatch):
+    """Exercise the export and pointers without requiring the optional HDF5/AnnData stack."""
+    import pickle
+    import sys
+    import pandas as pd
+
+    class Matrix:
+        def __init__(self, values):
+            self.X = values
+            self.obs = pd.DataFrame(index=[str(i) for i in range(values.shape[0])])
+            self.layers, self.obsm, self.uns = {}, {}, {}
+            self.raw = None
+
+        @property
+        def obs_names(self):
+            return self.obs.index
+
+        @obs_names.setter
+        def obs_names(self, values):
+            self.obs.index = values
+
+        @property
+        def shape(self):
+            return self.X.shape
+
+        @property
+        def n_obs(self):
+            return self.shape[0]
+
+        @property
+        def n_vars(self):
+            return self.shape[1]
+
+        def write_h5ad(self, path, **kwargs):
+            with Path(path).open("wb") as stream:
+                pickle.dump({k: v for k, v in vars(self).items() if k != "file"}, stream)
+
+    def read_h5ad(path, **kwargs):
+        with Path(path).open("rb") as stream:
+            fields = pickle.load(stream)
+        matrix = Matrix(fields["X"])
+        vars(matrix).update(fields)
+        matrix.file = types.SimpleNamespace(close=lambda: None)
+        return matrix
+
+    module = types.ModuleType("anndata")
+    module.AnnData, module.read_h5ad = Matrix, read_h5ad
+    monkeypatch.setitem(sys.modules, "anndata", module)
+    test_each_species_checkpoint_exports_its_own_libraries_and_genes(tmp_path)
+
+
+def _seed_species_datasets(root: Path) -> tuple[Path, list[dict]]:
+    run = root / "yijus12" / "run7"
+    data = run / "artifacts" / "data"
+    data.mkdir(parents=True)
+    (run / "result").mkdir()
+    datasets = []
+    for species, library, cells, genes in (("mouse", "Sample1_Sample2", 31303, 33696),
+                                           ("human", "Sample3", 10223, 38606)):
+        name = f"{library}.{species}.processed.20261025-1200.run7.h5ad"
+        path = run / "result" / name
+        path.write_bytes(b"h5ad bytes")
+        rec = {"name": name, "path": str(path), "what": f"dataset:{species}", "species": species,
+               "size_bytes": 10, "location": "gateway", "saved_to": None,
+               "n_cells": cells, "n_genes": genes, "cells_table": f"tables/cells.{species}.csv"}
+        (data / f"result_dataset.{species}.json").write_text(json.dumps(rec))
+        datasets.append(rec)
+    (data / "result_dataset.json").write_text(json.dumps({**datasets[0], "datasets": datasets}))
+    return run / "artifacts", datasets
+
+
+def test_both_species_are_listed_saved_independently_and_named_in_reply(tmp_path, gw, monkeypatch):
+    art, datasets = _seed_species_datasets(tmp_path)
+    recorded = []
+    monkeypatch.setattr(gw.auth_routes, "dataset_path_recorded", lambda uid, path: False)
+    monkeypatch.setattr(gw.auth_routes, "record_dataset", lambda *a, **kw: recorded.append(a) or len(recorded))
+    client = _client(gw)
+    row, = client.get("/api/result-datasets").json()["result_datasets"]
+    assert [d["what"] for d in row["datasets"]] == ["dataset:mouse", "dataset:human"]
+    result = types.SimpleNamespace(rounds=[{"scientist_result": {"steps": [{"tool": "run_cellqc",
+        "result": {"status": "ok", "cells_before": 48112, "cells_after": 41526,
+                   "genes_after": 33696, "checkpoints": {"mouse": {}, "human": {}},
+                   "notes": ["Sample1 was bound twice: QC'd once.",
+                             "The libraries are from different species; each species was QC'd separately."],
+                   "warnings": ["A real warning."]}}]}}])
+    reply = gw._qc_chat_reply(art, result)
+    headline = next(line for line in reply.splitlines() if "cells kept" in line)
+    assert "genes" not in headline
+    assert "⚠️ The libraries" not in reply and "⚠️ A real warning" in reply
+    assert "bound twice: QC'd once" in reply and "work/adata_qc" not in reply
+    for dataset in datasets:
+        assert dataset["name"] in reply
+        saved = client.post(f"/api/result-datasets/run7/save?what={dataset['what']}")
+        assert saved.status_code == 200
+        assert Path(saved.json()["path"]).is_file()
+    assert [r[1] for r in recorded] == [d["name"] for d in datasets]
+    assert client.post("/api/result-datasets/run7/save?what=dataset:human").json()["already"]
+    row, = client.get("/api/result-datasets").json()["result_datasets"]
+    assert all(d["saved_to"] for d in row["datasets"])
+    assert all(d["saved_to"] for d in json.loads((art / "data/result_dataset.json").read_text())["datasets"])
+    assert all(d["name"] in gw._result_dataset_line(art) for d in datasets)
+    assert all(d["name"] in "\n".join(gw._files_lines(art, "QC'd")) for d in datasets)
+    assert client.post("/api/result-datasets/run7/save?what=dataset:../human").status_code == 400
+
+
+def test_autosave_keeps_every_species(tmp_path, gw, monkeypatch):
+    art, datasets = _seed_species_datasets(tmp_path)
+    monkeypatch.setattr(gw.auth_routes, "dataset_path_recorded", lambda uid, path: False)
+    monkeypatch.setattr(gw.auth_routes, "record_dataset", lambda *a, **kw: 1)
+    said = []
+    asyncio.run(gw._autosave_results(_run_conn(tmp_path), "run7", lambda *args: said.append(args)))
+    assert len(said) == 2 and all(args[0] == "success" for args in said)
+    assert all(d["saved_to"] for d in gw._result_dataset_pointers(art))
+
+
 # --- reading a remote file while it is sent on ---------------------------------------------------------
 
 class _Handle:

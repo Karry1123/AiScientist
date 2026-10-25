@@ -416,5 +416,5 @@ def test_a_step_stopped_done_early_before_its_named_tool_ran_is_nudged_once():
     assert any(e["type"] == "early_stop" and e["reason"] == "done_early" for e in events)
     nudges = [e for e in events if e["type"] == "tool_nudge"]
     assert len(nudges) == 1 and nudges[0]["tools"] == ["run_enrichment"]
-    assert res.stop_reason == "finished"
+    assert res.stop_reason == "planned_tool_succeeded"
     assert any(st.get("tool") == "run_enrichment" for st in res.steps)

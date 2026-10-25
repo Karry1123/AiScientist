@@ -416,7 +416,9 @@ def test_a_skill_step_is_counted_once_by_the_code_that_ran_its_method(tmp_path, 
             return {"status": "error", "error": "KeyError: 'Isg15'"} if first_score else {"status": "ok"}
 
     revise = json.dumps({"verdict": "revise", "score": 0.3, "critique": "The scoring call failed."})
-    lab, record, _ws = _lab(tmp_path, plan_replies=[_agenda(SCORE_STEP, COMPARE_STEP)],
+    # This exercises multi-call skill accounting, rather than a single named tool's stop.
+    comparison = COMPARE_STEP.replace(" with `run_code`", "")
+    lab, record, _ws = _lab(tmp_path, plan_replies=[_agenda(SCORE_STEP, comparison)],
                             match_reply=json.dumps([{"step": 1, "skill": SIGNATURE}]),
                             codes=("print('inspect')", SIG_CODE), verdicts=(revise,),
                             run_code_tool=rl.make_run_code_tool(Sandbox()))

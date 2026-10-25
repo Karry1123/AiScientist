@@ -67,12 +67,52 @@ def test_a_cohort_folder_keeps_its_subfolders_names_and_a_repeated_name_is_numbe
     cohort = describe_cellranger_layout(
         [f"S1/{n}" for n in _LIBRARY] + [f"S2/outs/{n}" for n in _LIBRARY], "/up/cohort")
     alone = describe_cellranger_layout(_LIBRARY, "/up/x/original")
-    merged = merge_cellranger_layouts([("cohort", cohort), ("S1", alone), ("WT sample #2/", alone)])
+    other = describe_cellranger_layout(_LIBRARY, "/up/y/original")
+    merged = merge_cellranger_layouts([("cohort", cohort), ("S1", alone), ("WT sample #2/", other)])
     assert [lib["sample"] for lib in merged["libraries"]] == ["S1", "S2", "S1_2", "WT_sample_2"]
     # One folder and no dataset name: the directory's names, as before.
     assert merge_cellranger_layouts([("", alone)])["libraries"][0]["sample"] == "original"
     assert merge_cellranger_layouts([("a", None)]) is None
     assert "attached folders" not in cellranger_layout_hint(merge_cellranger_layouts([("S1", alone)]))
+
+
+def test_parent_and_child_bindings_qc_each_real_library_once(tmp_path):
+    parent = tmp_path / "CellQC_testdata"
+    paths = [f"{sample}/{n}" for sample in ("Sample1_WT", "Sample2_Ddx41", "Sample3")
+             for n in _LIBRARY]
+    cohort = describe_cellranger_layout(paths, parent.as_posix())
+    child = describe_cellranger_layout(_LIBRARY, (parent / "Sample1_WT").as_posix())
+    for parts in ([("CellQC_testdata", cohort), ("Sample1_WT", child)],
+                  [("Sample1_WT", child), ("CellQC_testdata", cohort)]):
+        merged = merge_cellranger_layouts(parts)
+        assert merged["n_libraries"] == 3
+        assert sorted(lib["sample"] for lib in merged["libraries"]) == [
+            "Sample1_WT", "Sample2_Ddx41", "Sample3"]
+        assert len(merged["notes"]) == 1
+        assert "Sample1_WT was bound twice" in merged["notes"][0]
+        assert "QC'd once" in cellranger_layout_hint(merged)
+
+
+def test_library_deduplication_resolves_directory_aliases(tmp_path):
+    root = tmp_path / "sample"
+    root.mkdir()
+    a = describe_cellranger_layout(_LIBRARY, root.as_posix())
+    b = describe_cellranger_layout(_LIBRARY, (root / ".." / "sample").as_posix())
+    merged = merge_cellranger_layouts([("first", a), ("alias", b)])
+    assert merged["n_libraries"] == 1
+    assert "QC'd once" in merged["notes"][0]
+
+
+def test_multispecies_plan_hint_keeps_surviving_barcodes_in_separate_objects():
+    layout = describe_cellranger_layout(
+        [f"{s}/{n}" for s in ("mouse", "human") for n in _LIBRARY], "/cohort")
+    for lib in layout["libraries"]:
+        genome = "GRCm39" if lib["sample"] == "mouse" else "GRCh38"
+        lib["matrix"] = {"genomes": {genome: 3}, "dtype": "int32", "n_barcodes": 4,
+                         "n_features": 3, "format": "10x_h5"}
+    hint = cellranger_layout_hint(layout)
+    assert "separate objects, never into one object across species" in hint
+    assert "State this split in the plan" in hint
 
 
 # --- the run start: what the planner is told --------------------------------------------------------
