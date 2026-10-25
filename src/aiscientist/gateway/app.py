@@ -5380,6 +5380,11 @@ def _session_roster(conn: "Connection", catalog: list, literature_executor: Any,
 
     roster = session_catalog(catalog, literature_executor=literature_executor,
                              served_model=conn.alloc is not None)
+    from .local_corpus import has_local_index
+    if has_local_index():
+        corpus = _literature_corpus_tool(conn)
+        if corpus is not None:
+            roster = [t for t in roster if t.name != "search_corpus"] + [corpus[0]]
     if len(roster) < len(catalog) and os.environ.get("AISCIENTIST_PAPERQA_ON_HPC"):
         no_gpu = conn.executor is not None and not conn.mock and conn.alloc is None
         names = {t.name for t in roster}
@@ -5393,6 +5398,12 @@ def _session_roster(conn: "Connection", catalog: list, literature_executor: Any,
             emit("info", "lab", f"`deep_literature` (the indexed corpus) is not available in this run: "
                                 f"{why}. Literature steps use `literature_search` (Europe PMC).")
     return roster
+
+
+async def _prepare_session_roster(conn: "Connection", catalog: list, literature_executor: Any,
+                                  emit: Callable[[str, str, str], None]) -> list:
+    """Prepare the local embedding model away from the run's event loop."""
+    return await asyncio.to_thread(_session_roster, conn, catalog, literature_executor, emit)
 
 
 def _active_conn_for_user(user) -> Connection | None:
@@ -7742,9 +7753,12 @@ async def _dispatch_lab_run(conn: Connection, req: LabRequest) -> None:
             if stored is not None:
                 await _run_corpus_scan(conn, req, stored=stored)
                 return
+            if await asyncio.to_thread(_literature_corpus_available, conn):
+                await _run_gene_table(conn, req)
+                return
             if os.environ.get("AISCIENTIST_PAPERQA_ON_HPC"):
                 conn.push({"type": "lab_progress", "level": "info", "text": (
-                    "ℹ No corpus scan of this corpus is kept yet, so this answer comes from a corpus "
+                    "No corpus scan of this corpus is kept yet, so this answer comes from a corpus "
                     "search (the passages nearest to the question), not from every paper. Pick Corpus "
                     "scan for the complete table: a few hours on a GPU of its own, once per corpus.")})
         await _run_quick_chat(conn, req)
@@ -8171,6 +8185,7 @@ async def _run_corpus_scan(conn: Connection, req: LabRequest,
             result, corpus_scan.gene_rows(art / corpus_scan.OUT_SUBDIR), model=model,
             kept_since=(str(stored.meta.get("stored_at") or "")[:10] if stored is not None else ""))})
         await asyncio.to_thread(_write_result_metadata, conn, run_id, art, req, {}, "done", [], [model])
+        await asyncio.to_thread(_stamp_literature_result, conn, run_id, art)
         items = [
             {"name": p.name, "kind": _file_kind(p.name), "summary": _file_kind(p.name),
              "url": f"/api/file/{conn.owner}/{run_id}/{p.relative_to(art).as_posix()}"}
@@ -8679,6 +8694,83 @@ def _quickchat_context_fns(conn: Connection, model: str, base_url: str | None, a
     return count_tokens, summarize
 
 
+async def _run_gene_table(conn: Connection, req: LabRequest) -> None:
+    """A passage-grounded table when no complete scan has been kept."""
+    import csv
+    from ..agents import corpus_answer
+
+    run = conn.active_run or conn.begin_run(req.conversation_id)
+    run.kind = "literature"
+    run_id = run.run_id or uuid4().hex[:12]
+    conn.bind_run_id(run, run_id)
+    run.running = True
+    run.chat_stop.clear()
+    run.hard_stop.clear()
+    _watch_run(conn, run, req)
+    conn.push({"type": "chat_start"})
+    art = conn.workspace / run_id / "artifacts"
+    notice = ("From a corpus search of returned passages, not the full scan. "
+              "Pick Corpus scan for the complete table: a few hours on a GPU of its own, once per corpus.")
+    conn.push({"type": "lab_progress", "level": "info", "text": notice})
+    status, summary = "cancelled", "Stopped by the user"
+    try:
+        if _AUTH_ENABLED and conn.app_user_id:
+            try:
+                auth_routes.record_run_start(conn.app_user_id, run_id, req.question, False,
+                                             conversation_id=run.conversation_id)
+            except Exception as exc:  # noqa: BLE001 - history is best-effort
+                print(f"[auth] record_run_start failed: {exc}")
+        corpus = await asyncio.to_thread(_literature_corpus_tool, conn)
+        out = (await asyncio.to_thread(_literature_corpus_logged, conn, run, corpus, req.question, [])
+               if corpus is not None else {"status": "error", "error": "Corpus retrieval is unavailable."})
+        contexts = out.get("contexts", []) if out.get("status") == "ok" else []
+        rows = []
+        if contexts and not run.chat_stop.is_set():
+            llm = await asyncio.to_thread(_lab_llm, conn)
+            raw = await asyncio.to_thread(llm.complete_fn,
+                                          corpus_answer.gene_table_messages(req.question, contexts),
+                                          role="literature")
+            rows = corpus_answer.verify_gene_table(str(raw or ""), contexts)
+        if run.chat_stop.is_set():
+            conn.push({"type": "chat_stopped"})
+            return
+        folder = art / "literature"
+        folder.mkdir(parents=True, exist_ok=True)
+        with (folder / "genes.csv").open("w", encoding="utf-8", newline="") as fh:
+            writer = csv.DictWriter(fh, fieldnames=["gene", "evidence", "citation"])
+            writer.writeheader()
+            writer.writerows({key: row[key] for key in writer.fieldnames} for row in rows)
+        def cell(value: str) -> str:
+            return str(value).replace("|", "\\|").replace("\n", " ").replace("\r", " ")
+        answer = notice + "\n\n| gene | evidence (short verbatim quote) | citation |\n|---|---|---|\n"
+        answer += "\n".join("| " + " | ".join(cell(row[k]) for k in ("gene", "evidence", "citation"))
+                            + " |" for row in rows)
+        if not rows:
+            answer += "\n\nThe papers do not answer this with verified gene evidence in the returned passages."
+            if out.get("error"):
+                answer += " " + str(out["error"])
+        (art / "report").mkdir(parents=True, exist_ok=True)
+        (art / "report" / "summary.md").write_text(answer, encoding="utf-8")
+        conn.push({"type": "chat_token", "token": answer})
+        await asyncio.to_thread(_write_result_metadata, conn, run_id, art, req, {}, "done", [], [])
+        await asyncio.to_thread(_stamp_literature_result, conn, run_id, art)
+        items = [{"name": p.name, "kind": _file_kind(p.name), "summary": _file_kind(p.name),
+                  "url": f"/api/file/{conn.owner}/{run_id}/{p.relative_to(art).as_posix()}"}
+                 for p in sorted(art.rglob("*")) if p.is_file()]
+        conn.push({"type": "artifacts", "items": items, "bundle_url": f"/api/bundle/{conn.owner}/{run_id}"})
+        status, summary = "done", f"{len(rows)} genes (corpus search)"
+        conn.push({"type": "chat_done"})
+    except Exception as exc:  # noqa: BLE001 - report the failed run to the chat
+        status, summary = ("cancelled", "Stopped by the user") if run.chat_stop.is_set() else ("failed", str(exc))
+        conn.push({"type": "chat_error", "message": public_error(exc)})
+    finally:
+        try:
+            _finish_run_record(conn, run_id, status, str(art) if status != "cancelled" else None, summary)
+        finally:
+            run.running = False
+            conn.end_run(run)
+
+
 async def _run_quick_chat(conn: Connection, req: LabRequest) -> None:
     """The fast path: stream an answer-first ReAct turn straight into the chat bubble.
 
@@ -8735,6 +8827,11 @@ async def _run_quick_chat(conn: Connection, req: LabRequest) -> None:
 
         tools = build_quickchat_catalog(
             literature_executor=_build_literature_executor(conn), served_model=conn.alloc is not None)
+        from .local_corpus import has_local_index
+        if has_local_index():
+            corpus = await asyncio.to_thread(_literature_corpus_tool, conn)
+            if corpus is not None:
+                tools = [t for t in tools if t.name != "search_corpus"] + [corpus[0]]
         # The case note reaches map_phenotype_to_hpo the same way it does on the research path
         # (via ctx.decisions), so attaching a note and asking a question in chat still works.
         decisions: dict[str, Any] = {}
@@ -8887,19 +8984,41 @@ def _literature_plan_review(conn: Connection, emit: Callable[..., None], step: s
 
 
 def _literature_corpus_available(conn: Connection) -> bool:
-    """Whether this session can search the lab's corpus: the literature line is set up for HPC3 and
-    the session has a live HPC3 connection (what ``_build_literature_executor`` needs). Cheap: the
-    plan card says it before anything is built."""
+    """Whether an offline local index/model or the HPC3 literature line is available.
+
+    Model preparation may block; callers on the event loop use a worker thread.
+    """
+    from .local_corpus import make_local_tool
+    if make_local_tool() is not None:
+        return True
     return bool(os.environ.get("AISCIENTIST_PAPERQA_ON_HPC") and os.environ.get("AISCIENTIST_PAPERQA_IMAGE")
                 and conn.executor is not None and not conn.mock)
 
 
 def _literature_corpus_tool(conn: Connection) -> "tuple[Any, Any] | None":
-    """The ``search_corpus`` tool, routed to HPC3 as in the chat (``build_quickchat_catalog``), and
-    the context to call it with; None when the corpus cannot be reached."""
+    """Local ``search_corpus`` with HPC3 fallback, and its context; None if neither is ready."""
     from ..agents.registry import build_quickchat_catalog
     from ..agents.research_harness import HarnessContext
     from ..agents import literature_answer as lit
+    from .local_corpus import make_local_tool
+    local = make_local_tool()
+    if local is not None:
+        local_run = local.executor
+
+        def retrieve(args: dict[str, Any], ctx: Any) -> dict[str, Any]:
+            out = local_run(args, ctx)
+            if out is not None:
+                return out
+            executor = _build_literature_executor(conn)
+            if executor is not None:
+                return executor.run_tool(lit.CORPUS_TOOL, args, ctx)
+            return {"status": "error", "error": "Local corpus retrieval failed and HPC3 is unavailable."}
+
+        from dataclasses import replace
+        local = replace(local, executor=retrieve)
+        ctx = HarnessContext(decisions={}, workspace=conn.workspace, model=conn.selected_model,
+                             tunnel_port=conn.tunnel_port, read_roots=_tool_read_roots(conn))
+        return local, ctx
     try:
         executor = _build_literature_executor(conn)
     except Exception as exc:  # noqa: BLE001 - no corpus: PubMed alone
@@ -9019,7 +9138,7 @@ async def _run_literature(conn: Connection, req: LabRequest, route: Any = None) 
     art = conn.workspace / run_id / "artifacts"
     question = str(req.question or "").strip()
     recorded = False
-    with_corpus = _literature_corpus_available(conn)
+    with_corpus = await asyncio.to_thread(_literature_corpus_available, conn)
     try:
         say("📚 This reads as a question the published literature answers, so the plan is one "
             + ("literature search in the lab's RetiGene corpus and PubMed. " if with_corpus else
@@ -9123,6 +9242,7 @@ async def _run_literature(conn: Connection, req: LabRequest, route: Any = None) 
             return None
         conn.push({"type": "chat_token", "token": answer})
         await asyncio.to_thread(_save_literature_answer, art, question, answer, collected, cited)
+        await asyncio.to_thread(_stamp_literature_result, conn, run_id, art)
         await asyncio.to_thread(_write_result_metadata, conn, run_id, art, req, {}, "done", [], [llm.model])
         items = [
             {"name": p.name, "kind": _file_kind(p.name), "summary": _file_kind(p.name),
@@ -12018,7 +12138,7 @@ async def _run_lab(conn: Connection, req: LabRequest, *,
         from .estimates import estimate_plan, instrument_catalog, run_usage, save_estimate
 
         scientist = ResearchHarness(
-            catalog=instrument_catalog(_session_roster(
+            catalog=instrument_catalog(await _prepare_session_roster(
                 conn,
                 build_scientist_catalog(code_executor=code_executor, scgpt_runner=scgpt_runner,
                                         analysis_executor=analysis_executor,
@@ -15629,14 +15749,17 @@ _CELLQC_NAME_RE = re.compile(r"[A-Za-z0-9._-]+\.cellqc\.[0-9]{8}-[0-9]{4}\.[A-Za
 # folder can be "Sample3 (1)", so everything but a separator, a control character or a leading dot
 # is a name; it is only ever joined to the directory for SFTP, never given to a shell.
 _CELLQC_FILE_RE = re.compile(r"(?!\.)[^/\\\x00-\x1f]{1,255}")
-_RESULT_KINDS = ("dataset", "cellqc")
+_RESULT_KINDS = ("dataset", "cellqc", "literature")
+_LITERATURE_RESULT_POINTER = "literature_result.json"
+_LITERATURE_NAME_RE = re.compile(r"literature\.[0-9]{8}-[0-9]{4}\.[A-Za-z0-9]+")
 # Already compressed: deflating them again costs CPU for the whole download and saves nothing.
 _ZIP_STORED_SUFFIXES = (".h5ad", ".h5", ".gz", ".pdf", ".png", ".zip")
 
 
 def _result_pointer_path(owner: str, run_id: str, what: str = "dataset") -> Path:
     from ..tools.api import CELLQC_RESULT_POINTER, RESULT_DATASET_POINTER
-    name = CELLQC_RESULT_POINTER if what == "cellqc" else RESULT_DATASET_POINTER
+    name = (_LITERATURE_RESULT_POINTER if what == "literature" else
+            CELLQC_RESULT_POINTER if what == "cellqc" else RESULT_DATASET_POINTER)
     return CONSOLE_RUNS_DIR / safe_name(owner) / run_id / "artifacts" / "data" / name
 
 
@@ -15646,6 +15769,34 @@ def _read_pointer(path: Path) -> "dict | None":
     except (OSError, ValueError):
         return None
     return rec if isinstance(rec, dict) else None
+
+
+def _stamp_literature_result(conn: "Connection", run_id: str, art: Path) -> "dict | None":
+    """Keep a saveable copy of literature tables; the run's downloads remain in artifacts."""
+    from . import corpus_scan
+    pointer = _result_pointer_path(conn.owner, run_id, "literature")
+    existing = _read_pointer(pointer)
+    if existing is not None:
+        return existing
+    sources = [art / "literature" / "papers.csv", art / "literature" / "genes.csv",
+               art / corpus_scan.OUT_SUBDIR / "genes.csv"]
+    sources = [p for p in sources if p.is_file()]
+    if not sources:
+        return None
+    root = CONSOLE_RUNS_DIR / safe_name(conn.owner) / run_id / "result" / "literature"
+    root.mkdir(parents=True, exist_ok=True)
+    for source in sources:
+        shutil.copy2(source, root / source.name)
+    now = datetime.now(timezone.utc)
+    files = [{"name": p.name, "size": p.stat().st_size} for p in sorted(root.glob("*.csv"))]
+    rec = {"name": f"literature.{now:%Y%m%d-%H%M}.{run_id}", "path": str(root),
+           "kind": "literature", "owner": conn.owner, "run_id": run_id, "location": "gateway",
+           "created_at": now.isoformat(timespec="seconds"), "files": files,
+           "size_bytes": sum(f["size"] for f in files),
+           "kept_days": conn.settings.checkpoint_ttl_days, "until_disconnect": False}
+    pointer.parent.mkdir(parents=True, exist_ok=True)
+    pointer.write_text(json.dumps(rec, indent=2), encoding="utf-8")
+    return rec
 
 
 def _stamp_cellqc_result(conn: "Connection", run_id: str, decisions: dict, on_hpc: bool,
@@ -15764,7 +15915,11 @@ def _saved_result_files(owner: str, run_id: str, rec: dict, folder: bool) -> "tu
         fname = str(f.get("name") or "")
         if not _CELLQC_FILE_RE.fullmatch(fname):
             continue
-        copy = copies / fname
+        copy = (CONSOLE_RUNS_DIR / safe_name(owner) / run_id / "artifacts" / "literature" / fname
+                if rec.get("kind") == "literature" else copies / fname)
+        if rec.get("kind") == "literature" and not copy.is_file():
+            from . import corpus_scan
+            copy = CONSOLE_RUNS_DIR / safe_name(owner) / run_id / "artifacts" / corpus_scan.OUT_SUBDIR / fname
         sha = sha256_file(copy) if copy.is_file() and copy.stat().st_size == int(f.get("size") or -1) else None
         files.append({"path": fname, "size": int(f.get("size") or 0), "sha256": sha,
                       "verified": "computed" if sha else ""})
@@ -15779,7 +15934,8 @@ def md_result_uuid(run_id: str) -> str:
 def _save_run_result(owner: str, user_id: "int | None", run_id: str, what: str,
                      conn: "Connection | None") -> "tuple[int, dict]":
     """Make what a run handed on one of the owner's datasets: the processed dataset
-    (``what="dataset"``, an .h5ad) or CellQC's result directory (``"cellqc"``, a folder). Returns
+    (``what="dataset"``, an .h5ad), CellQC's result directory (``"cellqc"``), or literature
+    tables (``"literature"``), both folders. Returns
     ``(HTTP status, body)``. Talks to HPC3: call it in a thread.
 
     With a data root (issue 6) it goes into the owner's dataset folder on this host
@@ -15787,19 +15943,23 @@ def _save_run_result(owner: str, user_id: "int | None", run_id: str, what: str,
     copied back in the background (202, ``saving``), checked by size, and listed when it is here;
     the HPC3 copy goes with the run's other process files. Without one, it is moved to the owner's
     personal HPC3 folder (``AiScientist_results``) or, for a local run, their ``uploads/processed``."""
-    folder = what == "cellqc"
+    folder = what in ("cellqc", "literature")
     pointer_path = _result_pointer_path(owner, run_id, what)
     rec = _read_pointer(pointer_path)
     if rec is None:
-        return 404, {"error": "This run kept no CellQC result directory." if folder
+        return 404, {"error": "This run kept no literature tables." if what == "literature" else
+                     "This run kept no CellQC result directory." if folder
                      else "This run has no processed dataset."}
     if rec.get("saved_to"):
         return 200, {"ok": True, "path": rec["saved_to"], "already": True}
     name, src = str(rec.get("name") or ""), str(rec.get("path") or "")
     if rec.get("saving"):
         return 202, {"ok": True, "saving": True, "name": name}
-    if not (_CELLQC_NAME_RE if folder else _RESULT_NAME_RE).fullmatch(name):
+    pattern = _LITERATURE_NAME_RE if what == "literature" else _CELLQC_NAME_RE if folder else _RESULT_NAME_RE
+    if not pattern.fullmatch(name):
         return 400, {"error": "unexpected result name"}
+    if what == "literature" and rec.get("location") != "gateway":
+        return 400, {"error": "unexpected literature location"}
     owner_dir = (CONSOLE_RUNS_DIR / safe_name(owner)).resolve()
     kept = dataset_storage.configured()
     if rec.get("location") == "hpc3":
@@ -15827,7 +15987,7 @@ def _save_run_result(owner: str, user_id: "int | None", run_id: str, what: str,
     else:
         src_p = Path(src).resolve()
         if folder:
-            found = src_p == (owner_dir / run_id / "result" / "cellqc").resolve() and src_p.is_dir()
+            found = src_p == (owner_dir / run_id / "result" / what).resolve() and src_p.is_dir()
         else:
             found = src_p.parent == (owner_dir / run_id / "result").resolve() and src_p.is_file()
         if not found:
@@ -15945,7 +16105,8 @@ async def _autosave_results(conn: "Connection", run_id: str, emit: Callable[...,
     do, for every run (_fixed_run_options). Best-effort, like the export."""
     if not (_AUTH_ENABLED and conn.app_user_id):
         return          # no account, no "my data": the results stay beside the run
-    for what, label in (("dataset", "The processed dataset"), ("cellqc", "CellQC's result directory")):
+    for what, label in (("dataset", "The processed dataset"), ("cellqc", "CellQC's result directory"),
+                        ("literature", "The literature tables")):
         if _read_pointer(_result_pointer_path(conn.owner, run_id, what)) is None:
             continue
         try:
@@ -15968,7 +16129,7 @@ async def _autosave_results(conn: "Connection", run_id: str, emit: Callable[...,
 @app.get("/api/result-datasets")
 async def list_result_datasets(request: Request) -> JSONResponse:
     """What the caller's runs handed on, newest first, with where each is now: the processed dataset
-    (the row's own fields) and, under ``cellqc``, CellQC's result directory."""
+    (the row's own fields), ``cellqc`` result directories and ``literature`` table folders."""
     if not _AUTH_ENABLED:
         return JSONResponse({"result_datasets": []})
     user = _optional_user(request)
@@ -15997,6 +16158,16 @@ async def list_result_datasets(request: Request) -> JSONResponse:
                          "n_files": len(rec.get("files") or []),
                          "n_matrices": len(rec.get("matrices") or []),
                          "download_url": f"/api/cellqc-result/{safe_name(user.username)}/{run_id}"}
+    for p in home.glob(f"*/artifacts/data/{_LITERATURE_RESULT_POINTER}"):
+        rec = _read_pointer(p)
+        if rec is None or not rec.get("name"):
+            continue
+        run_id = p.parents[2].name
+        row = rows.setdefault(run_id, {"run_id": run_id, "created_at": rec.get("created_at")})
+        row["literature"] = {**{k: rec.get(k) for k in ("name", "size_bytes", "created_at", "kept_days",
+                                                       "until_disconnect", "location", "saved_to",
+                                                       "saved_at", "saving", "save_error")},
+                             "n_files": len(rec.get("files") or [])}
     ordered = sorted(rows.values(), key=lambda r: r.get("created_at") or "", reverse=True)
     return JSONResponse({"result_datasets": ordered})
 
@@ -16005,8 +16176,8 @@ async def list_result_datasets(request: Request) -> JSONResponse:
 async def save_result_dataset(run_id: str, request: Request, what: str = "dataset") -> JSONResponse:
     """Make what a run handed on one of the caller's datasets — named with its input, what it is, the
     time and the run — so the next analysis can start from it without anyone downloading it.
-    ``what``: ``dataset`` (the processed .h5ad) or ``cellqc`` (CellQC's result directory, as a
-    folder). 202 with ``saving`` while one kept on HPC3 is being copied back (see
+    ``what``: ``dataset`` (the processed .h5ad), ``cellqc`` (CellQC's result directory), or
+    ``literature`` (the literature CSV tables). 202 with ``saving`` while one kept on HPC3 is being copied back (see
     :func:`_save_run_result`)."""
     if not _AUTH_ENABLED:
         return JSONResponse({"error": "Saving a dataset requires accounts."}, status_code=400)

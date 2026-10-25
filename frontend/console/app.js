@@ -7566,7 +7566,7 @@ async function loadRuns() {
 // HPC3): deleting the run deletes it too.
 function keptBesideRun(r) {
   const here = (x) => x && x.name && !x.saved_to && !x.saving && x.location !== "hpc3";
-  return !!r && (here(r) || here(r.cellqc));
+  return !!r && (here(r) || here(r.cellqc) || here(r.literature));
 }
 function runHasOutputs(x) { return x.status === "done" || x.status === "incomplete"; }
 function runTitle(x) { return (x.question || "").slice(0, 90) || `Run ${x.run_id}`; }
@@ -7652,6 +7652,11 @@ function resultHandoffHtml(runId, r) {
     html += `<div class="run-dataset"><span class="muted small" title="${escapeHtml(q.name || "")}">🧪 CellQC result/ · ${q.n_files} files${matrices} · ${mb(q.size_bytes)}</span>` +
       `<a class="ghost small" href="${escapeHtml(q.download_url)}" download title="CellQC's complete result folder as one zip: reports, tables, slides and the per-library .h5ad, obs and var">${icon("download")} CellQC results (.zip)</a>` +
       kept(q, "Save folder to my data", "cellqc") + `</div>`;
+  }
+  const literature = r.literature;
+  if (literature) {
+    html += `<div class="run-dataset"><span class="muted small">Literature tables · ${literature.n_files} files · ${mb(literature.size_bytes)}</span>` +
+      kept(literature, "Save tables to my data", "literature") + `</div>`;
   }
   return html;
 }

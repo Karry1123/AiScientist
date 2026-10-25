@@ -59,7 +59,8 @@ ANSWER_SYSTEM = (
     "- Open with a direct answer in one or two sentences, then explain in a few short paragraphs "
     "(at most about 350 words in all).\n"
     "- After every statement drawn from a paper, cite it by its number in square brackets, e.g. "
-    "[2] or [1, 4]. Cite only the numbers given; never invent a paper, an author or a number.\n"
+    "[2] or [1, 4]. Each factual sentence needs its own citation, including the opening answer. "
+    "Cite only the numbers given; never invent a paper, an author or a number.\n"
     "- Do not state findings the texts do not contain. Say plainly what they do not answer, "
     "and when the papers found do not address the question, say so instead of answering from "
     "memory.\n"
@@ -88,6 +89,7 @@ class Paper:
     queries: list[str] = field(default_factory=list)
     passages: list[str] = field(default_factory=list)   # full-text passages from the lab's corpus
     sources: list[str] = field(default_factory=list)    # "corpus", "pubmed"
+    pages: list[str] = field(default_factory=list)      # retrieved corpus pages, in rank order
 
     def key(self) -> str:
         return (self.doi.lower() or self.pmid or self.title.lower()).strip()
@@ -95,6 +97,9 @@ class Paper:
     def line(self) -> str:
         """The reference line: the citation, then a link to the paper."""
         text = self.citation or f"{self.title} ({self.year})"
+        if "corpus" in self.sources:
+            pages = ", ".join(self.pages) if self.pages else "unavailable"
+            text += f" (PMID {self.pmid}, p. {pages})"
         return f"{text} {self.url}".strip() if self.url else text
 
 
@@ -312,6 +317,8 @@ def add_corpus(collected: Collected, result: "dict[str, Any] | None", *,
             by_pmid[pmid] = p
             corpus.append(p)
         page = c.get("page")
+        if page not in (None, "") and str(page) not in p.pages:
+            p.pages.append(str(page))
         p.passages.append((f"(p. {page}) " if page not in (None, "") else "") + text)
         n_passages += 1
     info.update(passages=n_passages, papers=len(corpus))
@@ -369,6 +376,27 @@ def _numbers(group: str) -> list[int]:
     return out
 
 
+_ABSTENTION = re.compile(
+    r"\b(?:(?:papers?|abstracts?|passages?|texts?|studies)\s+(?:(?:found|retrieved)\s+)?(?:do(?:es)?\s+not|did\s+not|don['\u2019]t|doesn['\u2019]t|didn['\u2019]t)"
+    r"|no\s+(?:retrieved\s+)?papers?\b|not\s+(?:addressed|answered|reported|studied|covered|established)"
+    r"|unclear|unknown|insufficient\s+evidence|cannot\s+(?:answer|determine|conclude))\b", re.I)
+
+
+def _uncited_findings(paragraph: str) -> bool:
+    """Flag plausible prose claims, leaving clear abstentions and layout text alone."""
+    text = paragraph.strip()
+    if _CITE.search(text) or len(text.split()) <= 4:
+        return False
+    if (re.fullmatch(r"#{1,6}\s+[^\n]+", text)
+            or re.fullmatch(r"(?:\*\*|__)[^\n]+(?:\*\*|__):?", text)
+            or (len(text.split()) <= 12 and re.fullmatch(r"[^.?!\n]+:", text))):
+        return False
+    sentences = re.split(r"(?<=[.!?])\s+", text)
+    return not all(_ABSTENTION.search(sentence)
+                   and not re.search(r"\b(?:but|however|although|yet)\b", sentence, re.I)
+                   for sentence in sentences)
+
+
 def finish_answer(text: str, papers: list[Paper]) -> "tuple[str, list[Paper]]":
     """The answer with its citations checked, and the papers it cites. A bracketed number that is
     not a paper is removed; the reference list is written here, from the papers cited."""
@@ -382,10 +410,15 @@ def finish_answer(text: str, papers: list[Paper]) -> "tuple[str, list[Paper]]":
                 cited.append(n)
         return f"[{', '.join(str(n) for n in dict.fromkeys(nums))}]" if nums else ""
 
-    body = _CITE.sub(fix, str(text or "")).strip()
     # A reference list the model wrote anyway is dropped: the one below is the checked one.
-    body = re.split(r"\n#{0,3}\s*\**(?:References|Reference list|Sources)\**:?\s*\n", body, maxsplit=1)[0].rstrip()
+    body = re.split(r"\n#{0,3}\s*\**(?:References|Reference list|Sources)\**:?\s*\n",
+                    str(text or ""), maxsplit=1)[0].rstrip()
+    body = _CITE.sub(fix, body).strip()
     body = re.sub(r"[ \t]+([.,;:])", r"\1", body)
+    paragraphs = [p for p in re.split(r"\n\s*\n", body) if p.strip()]
+    if any(_uncited_findings(p) for p in paragraphs):
+        body += ("\n\n**Citation warning:** One or more answer paragraphs may state paper findings without a valid citation. "
+                 "Treat any paper claims in those paragraphs as unverified.")
     used = [known[n] for n in sorted(cited)]
     return body, used
 

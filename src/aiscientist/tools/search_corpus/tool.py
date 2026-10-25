@@ -14,7 +14,7 @@ from __future__ import annotations
 from typing import Any, Callable
 
 from .._lib.corpus import (
-    TextIndex, Term, chunk_vectors, corpus_paths, hybrid_rank, known_gene_symbols, l2, load_chunks,
+    CorpusPaths, TextIndex, Term, chunk_vectors, corpus_paths, hybrid_rank, known_gene_symbols, l2, load_chunks,
     manifest_citations, parse_terms, query_terms, read_manifest, sentence_transformer_embed, term_report)
 from ..sdk import HarnessTool
 
@@ -114,7 +114,8 @@ def rank_passages(queries: list[str], chunks: list[dict[str, Any]], vecs: Any, q
 
 
 def run_search(args: dict[str, Any], ctx: Any, *,
-               embed_fn: Callable[[list[str]], Any] | None = None) -> dict[str, Any]:
+               embed_fn: Callable[[list[str]], Any] | None = None,
+               paths: CorpusPaths | None = None) -> dict[str, Any]:
     raw = args.get("queries")
     if isinstance(raw, str):
         raw = [raw]
@@ -125,7 +126,7 @@ def run_search(args: dict[str, Any], ctx: Any, *,
     per_paper = _int(args.get("max_per_paper"), DEFAULT_MAX_PER_PAPER, 1, MAX_TOP_K)
     allowed = {str(p).strip() for p in (args.get("pmids") or []) if str(p).strip()} or None
 
-    paths = corpus_paths(ctx)
+    paths = paths if paths is not None else corpus_paths(ctx)
     chunk_path = paths.cache / "chunks.jsonl" if paths else None
     if paths is None or not chunk_path.is_file():
         return {"status": "dependency_missing", "dependency": "corpus-cache",
