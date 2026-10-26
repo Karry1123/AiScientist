@@ -257,6 +257,10 @@ def _library_summary(row: dict[str, str], decider: str, comparer: str) -> dict[s
         "n_mt_genes": _int(row.get("filter_n_mt_genes")),
         "mt_matched_by": row.get("filter_mt_matched_by") or "",
         "median_pct_mt": _num(row.get("filter_median_pct_counts_mt")),
+        "median_counts_before": _num(row.get("cellranger_median_umi_counts_per_cell")),
+        "median_features_before": _num(row.get("cellranger_median_genes_per_cell")),
+        "barcoderank_knee_total": _num(row.get("barcoderank_knee_total")),
+        "barcoderank_inflection_total": _num(row.get("barcoderank_inflection_total")),
         "ambient_soupx_contamination_mean": _num(row.get("ambient_soupx_contamination_mean")),
         # The compared method never touches the counts (its counts_removed_frac is NA): its own
         # contamination estimate is what sits next to the applied one.
@@ -323,6 +327,29 @@ def _validate(libs: list[dict[str, Any]], status_rows: list[dict[str, str]],
             # The warnings are copied into the user's report as they are: facts, no instructions.
             warnings.append(f"{lib['sample']}: the two doublet callers agree poorly (kappa {k:.2f}), "
                             "so the choice of decider drives which cells are removed.")
+    for lib in libs:
+        before = lib["cells_cellranger"] or 0
+        medians = {"min_counts": lib.get("median_counts_before"),
+                   "min_features": lib.get("median_features_before"),
+                   "max_pct_mt": lib.get("median_pct_mt")}
+        for threshold, median_before in medians.items():
+            removed = lib["removed_only_by"].get(threshold) or 0
+            if before and removed / before > 0.1:
+                value = args.get(threshold)
+                median_text = f"{median_before:g}" if median_before is not None else "unavailable"
+                units = "%" if threshold == "max_pct_mt" else ""
+                source = "" if threshold == "max_pct_mt" else " (Cell Ranger)"
+                warnings.append(
+                    f"{lib['sample']}: {threshold}={value}{units} alone removed "
+                    f"{removed:,} of {before:,} cells ({removed / before:.1%}); "
+                    f"median before filtering{source}: {median_text}{units}. "
+                    "Check that threshold against this tissue before using the result.")
+        knee = lib.get("barcoderank_knee_total")
+        inflection = lib.get("barcoderank_inflection_total")
+        if knee is not None and inflection is not None and knee < inflection:
+            warnings.append(f"{lib['sample']}: barcode-rank knee ({knee:g} UMIs) is below "
+                            f"the inflection ({inflection:g} UMIs); the knee diagnostic is "
+                            "inconsistent. Cell Ranger's called cells were used.")
     return warnings
 
 
@@ -593,7 +620,8 @@ def run_cellqc(args: dict[str, Any], ctx: Any) -> dict[str, Any]:
                             f"are used; check cellqc/{species + '/' if several else ''}cellqc.log.")
         done["summaries"] = [{**_library_summary(r, decider, comparer), "species": species}
                              for r in done["metric_rows"]]
-        warnings.extend(_validate(done["summaries"], done["status_rows"], done["manifest_rows"], args))
+        warnings.extend(_validate(done["summaries"], done["status_rows"], done["manifest_rows"],
+                                  {**args, **{k: _threshold(k, args, settings) for k in _THRESHOLDS}}))
         runs.append(done)
     if not runs:
         return {"status": "error", "step": "qc",
@@ -628,17 +656,13 @@ def run_cellqc(args: dict[str, Any], ctx: Any) -> dict[str, Any]:
                                         if "highly_variable" in adata.var else 0}
         if first is None:
             first = checkpoints[done["species"]]
+    notes: list[str] = list(layout.get("notes") or [])
     if several:
-        names = {sp: c["checkpoint"] for sp, c in checkpoints.items()}
-        warnings.append(
+        notes.append(
             "The libraries are from different species ("
             + "; ".join(f"{d['species']}: {', '.join(lib['sample'] for lib in d['libs'])}" for d in runs)
-            + "). CellQC applies one mitochondrial, ribosomal and hemoglobin gene set per run, so each "
-            "species was QC'd in its own CellQC run with its own gene sets. Later steps read the "
-            f"{runs[0]['species']} libraries' checkpoint ({names[runs[0]['species']]}); "
-            + "; ".join(f"the {sp} libraries' QC'd data is work/{n}" for sp, n in names.items()
-                        if n != "adata_qc.h5ad")
-            + ". All their CellQC files are in result/.")
+            + "). Each species was QC'd separately with its own gene sets and merged into "
+            "its own result dataset.")
 
     # CellQC's own result/ directory, complete: see _publish_result for what goes where. Several
     # species' runs are put in ONE flat directory (the download and "Save to my data" read it so).
@@ -692,6 +716,7 @@ def run_cellqc(args: dict[str, Any], ctx: Any) -> dict[str, Any]:
         "doublets": {"decider": decider, "callers": ["doubletfinder", "scdblfinder"],
                      "removed_upstream": True},
         "warnings": warnings,
+        "notes": notes,
         "obs_sample_key": "sampleid",
         "layers": ["counts"],
         "counts_layer": counts_layer,

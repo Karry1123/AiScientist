@@ -708,3 +708,34 @@ def test_a_tool_result_with_bytes_or_numpy_reaches_the_model_instead_of_ending_t
         "keys": {"b", "a"}})
     fed = json.loads(messages[0]["content"])
     assert fed == {"status": "ok", "attr": "library", "n": 3, "arr": [1.5, 2.5], "keys": ["a", "b"]}
+
+
+def test_single_planned_tool_stops_after_success_with_lookups_allowed():
+    executed = []
+    def executor(name):
+        def run(args, ctx):
+            executed.append(name)
+            return {"status": "ok", "cells_after": 80}
+        return run
+    catalog = [HarnessTool(name, name, {"type": "object", "properties": {}}, executor(name))
+               for name in ("list_dir", "run_cellqc", "run_code")]
+    responses = [_tool_call("list_dir", {}), _tool_call("run_cellqc", {})]
+    # Even an extra tool queued in the same model response must not run.
+    responses[-1]["tool_calls"].extend(_tool_call("run_code", {})["tool_calls"])
+    seen = []
+    harness = ResearchHarness(catalog=catalog, chat_fn=_scripted(responses, record=seen))
+    result = harness.run("QC only", _ctx(), planned_tools=["run_cellqc"])
+    assert executed == ["list_dir", "run_cellqc"]
+    assert len(seen) == 2
+    assert result.status == "ok" and result.stop_reason == "planned_tool_succeeded"
+    assert result.answer_synthesized and "80" in result.final_answer
+
+
+def test_planned_tool_failure_can_retry_before_stopping():
+    outputs = iter([{"status": "error", "error": "try again"}, {"status": "ok"}])
+    tool = HarnessTool("run_cellqc", "QC", {"type": "object", "properties": {}},
+                       lambda args, ctx: next(outputs))
+    harness = ResearchHarness(catalog=[tool], chat_fn=_scripted([
+        _tool_call("run_cellqc", {}), _tool_call("run_cellqc", {})]))
+    result = harness.run("QC", _ctx(), planned_tools=["run_cellqc"])
+    assert len(result.steps) == 2 and result.stop_reason == "planned_tool_succeeded"

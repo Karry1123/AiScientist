@@ -121,6 +121,49 @@ def test_lab_converges_when_critic_accepts_all_steps():
     assert {e["type"] for e in events} >= {"pi_agenda", "critic", "synthesize", "lab_done"}
 
 
+def test_plan_mode_streams_the_reviewed_agenda_once():
+    complete = _make_complete(
+        agenda=["Run QC on the dataset"],
+        critic_responses=[{"verdict": "accept", "score": 0.9, "critique": "grounded"}],
+    )
+    scientist = ResearchHarness(catalog=default_catalog(), chat_fn=_scientist_calls("run_qc", {}))
+    lab = ResearchLab(_ctx(), LabConfig(), complete_fn=complete, scientist=scientist)
+    events = []
+    lab.run("QC the dataset", on_event=events.append,
+            plan_review=lambda kind, payload: {"action": "cancel"})
+    agendas = [e for e in events if e["type"] == "pi_agenda"]
+    assert len(agendas) == 1
+    assert agendas[0]["agenda"] == ["Run QC on the dataset"]
+
+
+def test_only_a_tool_that_ends_its_step_is_passed_as_the_planned_tool(monkeypatch):
+    # The catalog is pinned so the steps' backticked names are read the same with or without the
+    # analysis extras installed (without them the catalog cannot be built).
+    import aiscientist.agents.research_lab as rl
+    monkeypatch.setattr(rl, "_known_tool_names",
+                        lambda: frozenset({"run_cellqc", "run_de", "run_code", "run_qc"}))
+    first_call = {}
+
+    class Recording(ResearchHarness):
+        def run(self, *args, planned_tools=None, **kwargs):
+            calls.append(planned_tools)
+            return super().run(*args, planned_tools=planned_tools, **kwargs)
+
+    steps = ("Run `run_cellqc` on the bound folders", "Test WT against KO with `run_de`",
+             "Plot the QC metrics with `run_code`")
+    for step in steps:
+        calls = []
+        complete = _make_complete(
+            agenda=[step],
+            critic_responses=[{"verdict": "accept", "score": 0.9, "critique": "grounded"}],
+        )
+        scientist = Recording(catalog=default_catalog(), chat_fn=_scientist_calls("run_qc", {}))
+        ResearchLab(_ctx(), LabConfig(), complete_fn=complete, scientist=scientist).run("QC")
+        first_call[step] = calls[0]
+    # run_cellqc's manifest says one call is its step; run_de and run_code may need more calls.
+    assert list(first_call.values()) == [["run_cellqc"], None, None]
+
+
 # --- convergence is LLM-judged (no fixed score threshold) --------------------
 
 def test_convergence_is_llm_judged_not_thresholded():

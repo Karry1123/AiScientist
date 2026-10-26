@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import csv
 import json
+import os
 import re
 from pathlib import Path
 import io
@@ -113,12 +114,20 @@ def merge_cellranger_layouts(parts: "Iterable[tuple[str, dict[str, Any] | None]]
     roots: list[str] = []
     datasets: list[str] = []
     seen: set[str] = set()
+    supplied: dict[str, str] = {}
+    notes: list[str] = []
     for name, layout in parts:
         if not layout:
             continue
         roots.append(layout["root"])
         datasets.append(name)
         for lib in layout["libraries"]:
+            resolved = os.path.realpath(lib["dir"])
+            if resolved in supplied:
+                notes.append(f"{lib['sample']} was bound twice through {supplied[resolved]} and "
+                             f"{name or layout['root']}: QC'd once.")
+                continue
+            supplied[resolved] = name or layout["root"]
             own = lib["rel"] in (".", "outs")
             base = sample_label(name) if (name and own) else lib["sample"]
             label, k = base, 1
@@ -133,6 +142,7 @@ def merge_cellranger_layouts(parts: "Iterable[tuple[str, dict[str, Any] | None]]
         "root": roots[0],
         "roots": roots,
         "datasets": datasets,
+        "notes": notes,
         "n_libraries": len(libraries),
         "libraries": libraries,
         "all_have_bam": all(lib["bam"] for lib in libraries),
@@ -459,7 +469,9 @@ def _provenance(libs: "list[dict[str, Any]]") -> str:
         text += ("The libraries are from DIFFERENT SPECIES ("
                  + "; ".join(f"{sp}: {', '.join(names)}" for sp, names in by_species.items())
                  + "). `run_cellqc` QCs each species in its own CellQC run, with its own gene sets, "
-                 f"in the same step. Later steps read the {first} libraries' checkpoint only (the "
+                 "in the same step. The surviving barcodes are merged within each species into "
+                 "separate objects, never into one object across species. State this split in "
+                 f"the plan. Later steps read the {first} libraries' checkpoint only (the "
                  "others' QC'd data is kept beside it): plan them for one species, with that "
                  "species' gene symbols, unless the user asks for a cross-species comparison. ")
     text += tissue_hint([g for lib in read for g in ((lib["matrix"].get("counts") or {})
@@ -493,4 +505,5 @@ def cellranger_layout_hint(layout: "dict[str, Any] | None") -> str:
         "second opinion, and the nuclear fraction from the BAM), which also writes the normalized "
         "checkpoint every later tool reads. Do NOT plan `run_scanpy_qc` for this input: it reads one "
         "filtered matrix only and cannot correct ambient RNA. Do NOT plan `run_doublet_detection` "
-        "after `run_cellqc`: doublets are already called and removed. " + _provenance(libs))
+        "after `run_cellqc`: doublets are already called and removed. "
+        + " ".join(layout.get("notes") or []) + " " + _provenance(libs))

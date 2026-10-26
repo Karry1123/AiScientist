@@ -569,7 +569,7 @@ def test_a_mixed_species_cohort_is_qcd_one_species_per_cellqc_run(tmp_path, deli
     assert out["n_libraries"] == 2 and {lib["species"] for lib in out["libraries"]} == {"mouse", "human"}
     assert out["cells_after"] == sum(lib["cells_after_doublets"] for lib in out["libraries"])
     assert out["assumptions"]["species"][0] == "mouse+human"
-    assert any("different species (mouse: S1; human: S2)" in w for w in out["warnings"])
+    assert any("different species (mouse: S1; human: S2)" in w for w in out["notes"])
     # ONE flat result directory: each library's files, the reports per species, the tables joined.
     names = {p.name for p in (ws / "artifacts" / "result").iterdir()}
     assert {"report_mouse.html", "report_human.html", "S1_obs.txt.gz", "S2_obs.txt.gz",
@@ -730,3 +730,38 @@ def test_a_call_without_its_skill_is_refused_not_run_with_guessed_settings():
     from aiscientist.tools.run_cellqc.tool import _settings
     with pytest.raises(ValueError, match="not attached"):
         _settings({})
+
+
+@pytest.mark.parametrize("threshold,column,median_column,value,median", [
+    ("max_pct_mt", "mito", "filter_median_pct_counts_mt", 10, 6.09),
+    ("min_counts", "mincount", "cellranger_median_umi_counts_per_cell", 1000, 2400),
+    ("min_features", "minfeature", "cellranger_median_genes_per_cell", 200, 500),
+])
+@pytest.mark.parametrize("removed,expected", [(2277, True), (1355, False), (400, False)])
+def test_threshold_alone_warns_above_ten_percent(threshold, column, median_column,
+                                                value, median, removed, expected):
+    from aiscientist.tools.run_cellqc.tool import _library_summary, _validate
+    row = {"sampleid": "Sample3", "filter_ncell_before": "13559",
+           f"filter_fail_{column}_only": str(removed), median_column: str(median)}
+    lib = _library_summary(row, "doubletfinder", "")
+    warnings = _validate([lib], [], [], {threshold: value})
+    warning = next((w for w in warnings if "alone removed" in w), "")
+    assert bool(warning) is expected
+    if expected:
+        assert f"{threshold}={value}" in warning
+        assert "2,277 of 13,559 cells (16.8%)" in warning
+        assert "median before filtering" in warning and f"{median:g}" in warning
+
+
+@pytest.mark.parametrize("knee,inflection,expected", [(117, 683, True), (1615, 1046, False),
+                                                       (683, 683, False), ("NA", 683, False)])
+def test_barcode_rank_warns_only_for_knee_below_inflection(knee, inflection, expected):
+    from aiscientist.tools.run_cellqc.tool import _library_summary, _validate
+    lib = _library_summary({"sampleid": "S2", "barcoderank_knee_total": str(knee),
+                            "barcoderank_inflection_total": str(inflection)}, "doubletfinder", "")
+    warnings = _validate([lib], [], [], {})
+    warning = next((w for w in warnings if "barcode-rank knee" in w), "")
+    assert bool(warning) is expected
+    if expected:
+        assert "117 UMIs" in warning and "683 UMIs" in warning
+        assert "Cell Ranger's called cells were used" in warning

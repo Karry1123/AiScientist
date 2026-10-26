@@ -32,7 +32,6 @@ const state = {
   datasets: [],                // uploaded files/folders this session: {name, path, kind}, newest first
   serverRoots: [],             // server folders a dataset can be bound from by path (empty = off)
   serverOfferDismissed: new Set(),   // pasted server paths the user said "Not now" to
-  serverBoundTyped: new Set(),       // pasted server paths already bound (as typed, before resolving)
   uploads: [],                 // upload cards of the Datasets tab: {id,kind,name,size,sent,status,error,note,file,ctrl,jobId,serverFolder,chat,…}
   lastRunId: null,             // last completed run on this conn (used to recognise our own run after a refresh)
   leftAutoCollapsed: false,    // collapse the connect panel once, on first ready
@@ -87,6 +86,7 @@ function newChatRecord(sid) {
     bound: [],             // the BIND-SET (feature ②): the server paths of every data file attached
                            // for the next run (a VCF + a BED panel + a 2nd VCF). Ordered by attach;
                            // the server re-ranks to pick the primary. Posted as `datasets`.
+    serverBoundTyped: new Set(), // paths already bound in this chat, as typed before resolving
     roles: {},             // path -> role the user set on a bound file ("reference" = comparison
                            // data such as a cell-type atlas; never picked as the primary).
     primary: null,         // the PRIMARY of the bind-set (highest-ranked), posted as `dataset_path`
@@ -113,11 +113,13 @@ function chatTitle(sid) {
 
 // The dialog code and the plan card read these off `state`: they are the ACTIVE chat's fields.
 function emptyChatField(field) {
+  if (field === "serverBoundTyped") return new Set();
   return { bound: [], roles: {}, revised: [], problems: [], agenda: [] }[field] ??
     (field === "running" || field === "planPending" || field === "planEditorOpen" ? false
       : field === "planDraftYaml" || field === "planDraftBase" ? "" : null);
 }
 for (const [key, field] of Object.entries({ boundPaths: "bound", boundRoles: "roles", datasetPath: "primary",
+  serverBoundTyped: "serverBoundTyped",
   caseNote: "caseNote", running: "running", planPending: "planPending", planPrompt: "plan",
   planDraftYaml: "planDraftYaml", planDraftBase: "planDraftBase", planEditorOpen: "planEditorOpen" })) {
   Object.defineProperty(state, key, {
@@ -6163,9 +6165,13 @@ async function bindServerPath(path) {
     const info = await post("/api/server-data/check");
     setUploadProgress(line, "");
     // Large copies are confirmed first: the size and what will be skipped are in the message.
-    if (info.confirm && !confirm(info.message + "\n\nBind it?")) return false;
+    if (info.confirm && !confirm(info.message + "\n\nBind it?")) {
+      toast("Bind cancelled.");
+      return false;
+    }
     const d = await post("/api/server-data/bind");
-    state.serverBoundTyped.add(path);
+    const c = chatOf(sid);
+    if (c) c.serverBoundTyped.add(path);
     addDataset({ name: d.name + (isFolderKind(d.kind) ? "/" : ""), path: d.path, kind: d.kind,
       gist: d.info && d.info.message }, sid);
     toast(d.info && d.info.message ? d.info.message : `Bound ${d.name}`);
@@ -7821,11 +7827,12 @@ function resultHandoffHtml(runId, r) {
     : x.saving ? `<span class="muted small">Copying from HPC3 to your data on the server…</span>`
     : `<span class="muted small">kept ${x.location === "hpc3" ? "on HPC3" : "on the server"} ${x.until_disconnect ? `until you disconnect (at most ${escapeHtml(String(x.kept_days ?? ""))} days)` : `for ${escapeHtml(String(x.kept_days ?? ""))} days`}</span>` +
       (x.save_error ? `<span class="bad small" title="${escapeHtml(x.save_error)}">The last save failed</span>` : "") +
-      `<button class="ghost small" data-save-result="${escapeHtml(runId)}" data-what="${what}" data-label="${escapeHtml(label)}">${escapeHtml(label)}</button>`);
+      `<button class="ghost small" data-save-result="${escapeHtml(runId)}" data-what="${escapeHtml(what)}" data-label="${escapeHtml(label)}">${escapeHtml(label)}</button>`);
   let html = "";
-  if (r.name) {
-    html += `<div class="run-dataset"><span class="muted small">📦 ${escapeHtml(r.name)} · ${r.n_cells} cells × ${r.n_genes} genes · ${mb(r.size_bytes)}</span>` +
-      kept(r, "Save to my data", "dataset") + `</div>`;
+  const datasets = Array.isArray(r.datasets) ? r.datasets : (r.name ? [r] : []);
+  for (const dataset of datasets) {
+    html += `<div class="run-dataset"><span class="muted small">📦 ${escapeHtml(dataset.name)} · ${dataset.n_cells} cells × ${dataset.n_genes} genes · ${mb(dataset.size_bytes)}</span>` +
+      kept(dataset, "Save to my data", dataset.what || "dataset") + `</div>`;
   }
   const q = r.cellqc;
   if (q) {

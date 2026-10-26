@@ -31,6 +31,7 @@ const api = vm.runInNewContext(src + "\n;({ chatOf, activeChat, chatVisible, cha
 const st = sandbox.state;
 const out = {};
 st.boundPaths.push("/data/a.h5ad");
+st.serverBoundTyped.add("/server/a");
 st.boundRoles["/data/a.h5ad"] = "reference";
 st.caseNote = { name: "note.txt", text: "night blindness" };
 st.planDoc = { yaml: "plan: 1\n" };
@@ -38,7 +39,9 @@ out.a = { bound: [...st.boundPaths], note: st.caseNote && st.caseNote.name, plan
 st.activeId = "B";                                   // a new chat: nothing carried over
 out.b = { bound: [...st.boundPaths], roles: { ...st.boundRoles }, note: st.caseNote, planDoc: st.planDoc,
           problems: st.planProblems, running: st.running, pending: st.planPending };
+out.bBoundTyped = [...st.serverBoundTyped];
 st.activeId = "A";
+out.aBoundTyped = [...st.serverBoundTyped];
 out.backOnA = { bound: [...st.boundPaths], note: st.caseNote && st.caseNote.name };
 out.titles = [api.chatTitle("A"), api.chatTitle("B")];
 const a = api.chatOf("A"), b = api.chatOf("B");
@@ -91,3 +94,9 @@ def test_the_chats_with_a_run_in_flight_survive_a_reload():
 def test_a_saved_answer_is_recognised_when_replayed():
     out = _run()
     assert out["unseen"] is False and out["seen"] is True
+
+
+def test_typed_server_paths_belong_to_their_chat():
+    out = _run()
+    assert out["bBoundTyped"] == []
+    assert out["aBoundTyped"] == ["/server/a"]

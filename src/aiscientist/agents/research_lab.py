@@ -3643,6 +3643,16 @@ def _tool_runs_on(tool: str) -> str:
     return found.runs_on if found is not None else ""
 
 
+def _tool_ends_step(tool: str) -> bool:
+    """Whether a tool's manifest says one successful call is its whole step (``ends_step``)."""
+    try:
+        from ..tools import catalog as tool_catalog
+        found = tool_catalog.manifest(tool)
+    except Exception:  # noqa: BLE001 - without the manifest the step runs as any other step
+        return False
+    return bool(found is not None and found.ends_step)
+
+
 _PLAN_FINDING_WORDS = {
     "unknown_tool": "step {step} names `{tool}`, which is not a tool this deployment has",
     "unknown_setting": "step {step}: `{tool}` has no setting `{param}` (it takes: {detail})",
@@ -4272,7 +4282,13 @@ class ResearchLab:
         # force a straight agenda (there is no one to answer a clarify).
         if (early := _cancelled_before_plan()) is not None:
             return early
-        kind, payload = self._pi_plan(question, emit, allow_clarify=plan_review is not None)
+        # In plan mode the reviewed agenda is presented below; streaming the draft as well
+        # repeats the same plan card when review leaves it unchanged.
+        def draft_event(ev: dict[str, Any]) -> None:
+            if plan_review is None or ev.get("type") != "pi_agenda":
+                emit(ev)
+
+        kind, payload = self._pi_plan(question, draft_event, allow_clarify=plan_review is not None)
         if kind == "failed":
             emit({"type": "plan_failed", "reason": payload})
             return LabResult(question, [], [], False, 0, str(payload))
@@ -7636,6 +7652,18 @@ class ResearchLab:
         # Passed only when there is something to pin, so a scientist that predates the argument
         # (a test double, an older harness) is called exactly as before.
         pin_kwargs: dict[str, Any] = {"pinned_args": pinned} if pinned else {}
+        if "planned_tools" in inspect.signature(self.scientist.run).parameters:
+            approved_step = plan_step if plan_step is not None else step
+            planned = set(_declared_tools(approved_step))
+            if self._approved_plan is not None:
+                found = self._approved_plan.step_for(approved_step)
+                if found is not None and found.tool:
+                    planned.add(found.tool)
+            # Only a tool whose manifest says one successful call is its whole step (run_cellqc)
+            # ends the step on that call. Any other step keeps its own answer, which the Critic
+            # and the report read, and may call its tool again or follow it with run_code.
+            if len(planned) == 1 and _tool_ends_step(next(iter(planned))):
+                pin_kwargs["planned_tools"] = sorted(planned)
         # The step runs inside its skill's scope: the run's manifest records the skill, and every
         # run_code in this step carries it (its declared access) without the model having to name
         # it. The skill's version is counted once for the step, by the code that ran its method, and
