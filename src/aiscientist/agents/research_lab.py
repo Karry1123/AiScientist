@@ -3851,6 +3851,11 @@ def _budget_bonus(previous: "HarnessResult | None", attempts: int) -> int:
         return 0
     return RETRY_TURN_BONUS * attempts
 
+
+class _RunCancelled(BaseException):
+    """Unwind cancellation past best-effort model/tool fallbacks."""
+
+
 class ResearchLab:
     """PI → Scientist → Critic loop. Roles are injectable for offline tests."""
 
@@ -4066,7 +4071,20 @@ class ResearchLab:
         Mid-run ``checkpoint`` snapshots deliberately go without it — it is a property of the
         finished run, and the meeting that produced it may not have happened yet.
         """
-        result = self._run_inner(*args, **kwargs)
+        self._should_cancel = kwargs.get("should_cancel") or (args[3] if len(args) > 3 else None)
+        self._planning = True
+        try:
+            self._check_cancelled()
+            result = self._run_inner(*args, **kwargs)
+        except _RunCancelled:
+            question = args[0] if args else kwargs["question"]
+            emit = kwargs.get("on_event") or (args[1] if len(args) > 1 else None)
+            if emit is not None:
+                emit({"type": "run_cancelled", "completed_steps": 0, "agenda": 0})
+            result = LabResult(question, [], [], False, 0,
+                               "Stopped by the user during planning.")
+        finally:
+            self._planning = False
         if isinstance(result, LabResult) and not result.design_background:
             with self._design_lock:
                 result.design_background = list(self._design_citations)
@@ -4107,6 +4125,7 @@ class ResearchLab:
         # planning, reuse the prior agenda + accepted rounds, and re-execute from the changed step
         # onward. The kept steps' analysis checkpoints (work/adata_*.h5ad) are reused off disk.
         if resume is not None:
+            self._planning = False
             if resume.guidance is not None:
                 self._guidance = resume.guidance
             if resume.self_sourced and not self._self_sourced:
@@ -4213,11 +4232,6 @@ class ResearchLab:
         # route; the frontend mode toggle sets "team"/"single" explicitly. In team mode the
         # PI forms a team and the team DESIGNS the approach in a meeting (each expert keeps an
         # independent context) — its synthesis augments the planning guidance below.
-        # Stop coverage for the PRE-execution phases. should_cancel was only consulted inside the
-        # execution loops, so a Stop clicked during mode routing, team formation, a multi-round
-        # design meeting (minutes of tool-using expert turns), or the PI's drafting was silently
-        # ignored until execution began. Stored on self so _team_meeting can break between rounds.
-        self._should_cancel = should_cancel
         # Per-RUN, not per-object: a ResearchLab instance can serve more than one run, and a
         # spent budget carried into the next one would silently stop asking from the first
         # failure — the opposite of the guarantee.
@@ -4525,6 +4539,9 @@ class ResearchLab:
             # numbers bind the tools to, and what the finished run is read back against.
             self._present_plan_document(question, list(agenda), emit)
             self._approve_plan_document(emit, reviewed=False)
+
+        self._check_cancelled()
+        self._planning = False
 
         # One execution phase over one agenda. Shared by the single-cycle path (below) and by each
         # cycle of a campaign, so a cycle is executed by exactly the same machinery as a whole run.
@@ -5871,12 +5888,24 @@ class ResearchLab:
             return _on
 
         def _one(item: "tuple[str, list[dict[str, Any]]]") -> str:
+            self._check_cancelled()
             member, messages = item
             brief = messages[0]["content"] + "\n\n" + messages[1]["content"]
             try:
                 harness = ResearchHarness(catalog=list(tools), config=cfg,
                                           chat_fn=getattr(self.scientist, "_chat_fn", None))
-                res = harness.run(brief, self.ctx, on_event=_relay(member))
+                chat = harness._resolve_chat(self.ctx)
+
+                def _chat(messages, tools):
+                    self._check_cancelled()
+                    reply = chat(messages, tools)
+                    self._check_cancelled()
+                    return reply
+
+                harness._chat_fn = _chat
+                res = harness.run(brief, self.ctx, on_event=_relay(member),
+                                  should_cancel=getattr(self, "_should_cancel", None))
+                self._check_cancelled()
                 self._record_design_citations(member, res.steps)
                 answer = (res.final_answer or "").strip()
                 # An expert owes the room an OPINION. When the harness ran out of tool turns
@@ -5908,6 +5937,20 @@ class ResearchLab:
     def _team_meeting(self, question: str, topic: str, experts: tuple[Specialist, ...],
                       kind: str, emit: EventFn,
                       rounds_ctx: "list[LabRound] | None" = None) -> str:
+        previous = getattr(self, "_meeting_active", False)
+        self._meeting_active = True
+        try:
+            self._check_cancelled()
+            return self._team_meeting_inner(question, topic, experts, kind, emit, rounds_ctx)
+        except _RunCancelled:
+            emit({"type": "team_meeting_cancelled", "kind": kind})
+            return ""
+        finally:
+            self._meeting_active = previous
+
+    def _team_meeting_inner(self, question: str, topic: str, experts: tuple[Specialist, ...],
+                            kind: str, emit: EventFn,
+                            rounds_ctx: "list[LabRound] | None" = None) -> str:
         """One Virtual-Lab team meeting (collaborative, score-driven, up to ``meeting_rounds``).
 
         Round 1: each expert gives an INDEPENDENT take, issued CONCURRENTLY so vLLM batches them
@@ -5950,6 +5993,7 @@ class ResearchLab:
             ] for i, e in enumerate(experts)]
             texts = self._expert_turns(msg_lists, emit,               # CONCURRENT → batched on the GPU
                                        [e.name for e in experts])
+            self._check_cancelled()
             contributions = [(e.name, (t or "").strip()) for e, t in zip(experts, texts)]
             for name, text in contributions:
                 emit({"type": "expert_contribution", "kind": kind, "round": rnd + 1, "member": name, "text": text})
@@ -8369,6 +8413,11 @@ class ResearchLab:
         with ContextThreadPoolExecutor(max_workers=workers) as ex:
             return list(ex.map(self._complete, message_lists))   # ex.map preserves input order
 
+    def _check_cancelled(self) -> None:
+        cancel = getattr(self, "_should_cancel", None)
+        if cancel is not None and cancel():
+            raise _RunCancelled()
+
     def _complete(self, messages: list[dict[str, Any]], *, role: str = "reason") -> str:
         # Budget FIRST, then dispatch — the injected ``complete_fn`` (production wires one in
         # via the gateway's ``_lab_llm``) must receive the SAME trimmed prompt, otherwise the
@@ -8381,13 +8430,20 @@ class ResearchLab:
         # ``_call_with_role``). ``max_tokens`` computed above is a window-fitting number for the
         # cluster's own server; an endpoint that bills per token needs a spending ceiling instead,
         # which only the gateway knows how to set — so the role, not the number, is what crosses.
+        cancellable = getattr(self, "_planning", False) or getattr(self, "_meeting_active", False)
+        if cancellable:
+            self._check_cancelled()
         budgeted, max_tokens = self._budget_single_shot(messages)
         if self._complete_fn is not None:
-            return _call_with_role(self._complete_fn, budgeted, role)
-        from ..gateway import vllm_client  # deferred: keep agents decoupled from the gateway
-        return vllm_client.complete(
-            self.ctx.tunnel_port, self.ctx.model, budgeted, max_tokens=max_tokens
-        )
+            result = _call_with_role(self._complete_fn, budgeted, role)
+        else:
+            from ..gateway import vllm_client  # deferred: keep agents decoupled from the gateway
+            result = vllm_client.complete(
+                self.ctx.tunnel_port, self.ctx.model, budgeted, max_tokens=max_tokens
+            )
+        if cancellable:
+            self._check_cancelled()
+        return result
 
     def _budget_single_shot(
         self, messages: list[dict[str, Any]]
