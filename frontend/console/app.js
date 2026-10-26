@@ -6688,7 +6688,12 @@ async function loadSystem() {
     const specialists = (d.specialists || []).map((s) =>
       `<div class="card"><div class="card-main"><strong>${escapeHtml(s.name)}</strong>` +
       `<span class="sys-desc">${escapeHtml(s.persona)}</span></div></div>`).join("");
+    const rel = d.release || {};
+    const relRow = (label, r) => `<span class="cap ${r && r.tag ? "on" : "off"}">${escapeHtml(label)}: ` +
+      `${escapeHtml((r && r.tag) || "unknown")}${r && r.sha ? " (" + escapeHtml(String(r.sha).slice(0, 7)) + ")" : ""}` +
+      `${r && r.installed === false ? " (not installed)" : ""}</span>`;
     el.innerHTML =
+      `<h3>Running versions</h3><div class="cap-row">${relRow("app", rel.app)}${relRow("skills", rel.skills)}</div>` +
       `<h3>Capabilities (this server)</h3><div class="cap-row">${caps}</div>` +
       `<p class="sys-note">What the web server has itself. A tool that runs on HPC3 brings its software in ` +
       `its job's container, so it is not checked here: each tool below says where it runs.</p>` +

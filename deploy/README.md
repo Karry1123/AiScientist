@@ -236,3 +236,20 @@ behind nginx on a bare host. The lab server uses neither, and no test exercises 
       `/api/auth/config` reports `"email_mode": "smtp"`.
 - [ ] The admin password is strong, and no account was created with a default password.
 - [ ] `run_code` runs on HPC3 (`AISCIENTIST_RUN_CODE_ON_HPC=1`).
+
+## Versioned releases (alternative to the rsync deploy)
+
+Pushing a `vX.Y.Z` tag runs `.github/workflows/release.yml`, which attaches `aiscientist-<tag>.tar.gz`
+and `SHA256SUMS` to a GitHub Release. On the server:
+
+```bash
+AISCIENTIST_HOST=128.200.71.197 deploy/deploy_release.sh v0.4.0   # download, verify checksum, install, switch app/current, restart, check /health
+deploy/deploy_release.sh --rollback                                # back to app/previous
+deploy/deploy_release.sh --list
+```
+
+Each release lives in `app/releases/<tag>/` with its own venv; `.env`, `runs/` and
+`skills/releases/` are shared links into `/data/aiscientist/shared/`. A failed `/health` check after
+a switch rolls back by itself. `deploy/systemd/aiscientist.service` runs from `app/current`. The
+running app tag and the pinned skills tag appear on the console's System page (`/api/system` →
+`release`). Needs GNU coreutils. The skills release is still installed by hand (see above).
