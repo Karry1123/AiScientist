@@ -67,3 +67,10 @@ def test_a_job_brings_its_own_gpu_or_calls_the_sessions_model_not_both(tmp_path)
     assert m.own_gpu is True and m.served_model is False
     with pytest.raises(ManifestError, match="own_gpu and served_model"):
         load_manifest(_folder(tmp_path / "b", "own_gpu: true\nserved_model: true\n"))
+
+
+def test_only_a_tool_that_says_so_ends_its_step_on_one_call(tmp_path):
+    assert load_manifest(_folder(tmp_path, "ends_step: true\n")).ends_step is True
+    assert load_manifest(_folder(tmp_path / "b")).ends_step is False
+    from aiscientist.tools.catalog import manifest
+    assert manifest("run_cellqc").ends_step and not manifest("run_de").ends_step

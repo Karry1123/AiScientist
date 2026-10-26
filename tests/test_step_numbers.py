@@ -282,8 +282,7 @@ def test_replay_8847_the_wrong_numbers_never_become_an_accepted_finding(tmp_path
     production. The first answer is 8847's; the retry, briefed with the auto-guard critique,
     restates the counts. Only the corrected answer may be accepted, and only it reaches the
     report writer."""
-    # An open-ended step still permits a model closing answer, which this guard validates.
-    step = "**Per-cell-type effect ranking** — Rank effects stratified by majorclass"
+    step = "**Per-cell-type effect ranking** — run `run_de` stratified by majorclass"
     prompts: list = []
 
     def complete(messages):

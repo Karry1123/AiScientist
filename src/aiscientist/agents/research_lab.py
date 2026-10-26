@@ -3643,6 +3643,16 @@ def _tool_runs_on(tool: str) -> str:
     return found.runs_on if found is not None else ""
 
 
+def _tool_ends_step(tool: str) -> bool:
+    """Whether a tool's manifest says one successful call is its whole step (``ends_step``)."""
+    try:
+        from ..tools import catalog as tool_catalog
+        found = tool_catalog.manifest(tool)
+    except Exception:  # noqa: BLE001 - without the manifest the step runs as any other step
+        return False
+    return bool(found is not None and found.ends_step)
+
+
 _PLAN_FINDING_WORDS = {
     "unknown_tool": "step {step} names `{tool}`, which is not a tool this deployment has",
     "unknown_setting": "step {step}: `{tool}` has no setting `{param}` (it takes: {detail})",
@@ -7605,9 +7615,10 @@ class ResearchLab:
                 found = self._approved_plan.step_for(approved_step)
                 if found is not None and found.tool:
                     planned.add(found.tool)
-            # A step that only names run_code (or another generic tool) may need several calls of
-            # it: only a dedicated tool such as run_cellqc ends its step on its first success.
-            if len(planned) == 1 and not planned & _GENERIC_TOOLS:
+            # Only a tool whose manifest says one successful call is its whole step (run_cellqc)
+            # ends the step on that call. Any other step keeps its own answer, which the Critic
+            # and the report read, and may call its tool again or follow it with run_code.
+            if len(planned) == 1 and _tool_ends_step(next(iter(planned))):
                 pin_kwargs["planned_tools"] = sorted(planned)
         # The step runs inside its skill's scope: the run's manifest records the skill, and every
         # run_code in this step carries it (its declared access) without the model having to name
