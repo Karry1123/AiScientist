@@ -76,6 +76,7 @@ function newChatRecord(sid) {
     planEditorOpen: false, // the plan editor is open on the waiting card
     planWords: "",         // a change to the plan typed in the side panel's box and not sent yet
     planShown: "",        // which version of the waiting plan has opened the side panel already
+    bindConfirm: null,     // a local Bind choice, kept apart from an agent request in this chat
     confirm: null,         // a confirmation the agent waits on (confirm_request): {run, kind, summary,
                            // detail, reversible, deadline, answer}. Its card is drawn FROM it
                            // (drawConfirmPrompt), like the plan's, and it is cleared by confirm_done.
@@ -914,7 +915,7 @@ const CONFIRM_OUTCOMES = {
 };
 
 function confirmPromptVisible(c = activeChat()) {
-  return !!c && !!c.confirm && chatVisible(c);
+  return !!c && !!(c.confirm || c.bindConfirm) && chatVisible(c);
 }
 
 // When the request counts as no: the time left (a request sent again after a reconnect) or its
@@ -952,38 +953,66 @@ function confirmCardHtml(p, note = "") {
     ? `<div class="confirm-status">${escapeHtml(note)}</div>`
     : p.answer
       ? `<div class="confirm-status">${p.answer === "approve" ? "Approving…" : "Declining…"}</div>`
-      : `<div class="plan-actions-row"><button type="button" class="primary" data-confirm="approve">Approve</button>` +
-        `<button type="button" class="ghost" data-confirm="decline">Decline</button></div>`;
-  return `<h2>${escapeHtml(CONFIRM_TITLES[p.kind] || "🔐 The agent needs your OK")}</h2>` +
+      : `<div class="plan-actions-row"><button type="button" class="primary" data-confirm="approve">${escapeHtml(p.approveLabel || "Approve")}</button>` +
+        `<button type="button" class="ghost" data-confirm="decline">${escapeHtml(p.declineLabel || "Decline")}</button></div>`;
+  return `<h2>${escapeHtml(p.title || CONFIRM_TITLES[p.kind] || "🔐 The agent needs your OK")}</h2>` +
     `<div class="clarify-question">${escapeHtml(p.summary)}</div>` +
     (p.detail ? `<pre class="confirm-detail">${escapeHtml(p.detail)}</pre>` : "") +
-    (note ? "" : `<div class="confirm-meta">${escapeHtml(meta)}</div>`) + foot;
+    (note || p.kind === "bind" ? "" : `<div class="confirm-meta">${escapeHtml(meta)}</div>`) + foot;
 }
 
 function removeConfirmCard() {
   if (state.confirmCardEl) { state.confirmCardEl.remove(); state.confirmCardEl = null; }
 }
 
-function wireConfirmCard(c) {
-  const el = state.confirmCardEl;
+function wireConfirmCard(c, el = state.confirmCardEl, onAnswer = (approved) => answerConfirm(c, approved)) {
   if (!el) return;
   el.querySelectorAll("[data-confirm]").forEach((b) =>
-    b.addEventListener("click", () => answerConfirm(c, b.dataset.confirm === "approve")));
+    b.addEventListener("click", () => onAnswer(b.dataset.confirm === "approve")));
 }
 
-function drawConfirmPrompt(c = activeChat()) {
-  if (!c || !chatVisible(c) || !c.confirm) return;
-  removeConfirmCard();
+// Both agent requests and local Bind requests use the same card and button wiring.
+function mountConfirmCard(p, onAnswer) {
   const stream = $("chatStream");
   const hint = stream.querySelector(".empty-hint"); if (hint) hint.remove();
   const el = document.createElement("div");
   el.className = "msg assistant plan-card confirm-card";
   el.dataset.prompt = "confirm";
-  el.innerHTML = confirmCardHtml(c.confirm);
+  el.innerHTML = confirmCardHtml(p);
   stream.appendChild(el);
-  state.confirmCardEl = el;
-  wireConfirmCard(c);
+  wireConfirmCard(null, el, onAnswer);
   stream.scrollTop = stream.scrollHeight;
+  return el;
+}
+
+function drawConfirmPrompt(c = activeChat()) {
+  if (!c || !chatVisible(c)) return;
+  if (state.bindConfirmCardEl) { state.bindConfirmCardEl.remove(); state.bindConfirmCardEl = null; }
+  if (c.bindConfirm) {
+    state.bindConfirmCardEl = mountConfirmCard(c.bindConfirm, c.bindConfirm.resolve);
+  }
+  if (!c.confirm) return;
+  removeConfirmCard();
+  state.confirmCardEl = mountConfirmCard(c.confirm, (approved) => answerConfirm(c, approved));
+}
+
+function confirmServerBind(c, message) {
+  if (!c || c.bindConfirm) return Promise.resolve(false);
+  return new Promise((resolve) => {
+    const p = { kind: "bind", title: "Bind server data?", detail: message,
+      summary: "Bind this copy as data for this run?", approveLabel: "Bind", declineLabel: "Cancel",
+      resolve: (approved) => {
+        if (c.bindConfirm !== p) return;
+        c.bindConfirm = null;
+        if (chatVisible(c) && state.bindConfirmCardEl) {
+          state.bindConfirmCardEl.remove(); state.bindConfirmCardEl = null;
+        }
+        resolve(approved);
+      } };
+    c.bindConfirm = p;
+    if (chatVisible(c)) drawConfirmPrompt(c);
+    else toast("Open the original chat to confirm binding server data.");
+  });
 }
 
 // The request is no longer waiting: its card keeps a line saying what became of it.
@@ -6165,7 +6194,7 @@ async function bindServerPath(path) {
     const info = await post("/api/server-data/check");
     setUploadProgress(line, "");
     // Large copies are confirmed first: the size and what will be skipped are in the message.
-    if (info.confirm && !confirm(info.message + "\n\nBind it?")) {
+    if (info.confirm && !await confirmServerBind(chatOf(sid), info.message)) {
       toast("Bind cancelled.");
       return false;
     }

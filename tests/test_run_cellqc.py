@@ -732,14 +732,14 @@ def test_a_call_without_its_skill_is_refused_not_run_with_guessed_settings():
         _settings({})
 
 
-@pytest.mark.parametrize("threshold,column,median_column,value,median", [
-    ("max_pct_mt", "mito", "filter_median_pct_counts_mt", 10, 6.09),
-    ("min_counts", "mincount", "cellranger_median_umi_counts_per_cell", 1000, 2400),
-    ("min_features", "minfeature", "cellranger_median_genes_per_cell", 200, 500),
+@pytest.mark.parametrize("threshold,column,median_column,value,median,median_text", [
+    ("max_pct_mt", "mito", "filter_median_pct_counts_mt", 10, 6.0886, "6.09%"),
+    ("min_counts", "mincount", "cellranger_median_umi_counts_per_cell", 1000, 2400, "2,400."),
+    ("min_features", "minfeature", "cellranger_median_genes_per_cell", 200, 500, "500."),
 ])
 @pytest.mark.parametrize("removed,expected", [(2277, True), (1355, False), (400, False)])
 def test_threshold_alone_warns_above_ten_percent(threshold, column, median_column,
-                                                value, median, removed, expected):
+                                                value, median, median_text, removed, expected):
     from aiscientist.tools.run_cellqc.tool import _library_summary, _validate
     row = {"sampleid": "Sample3", "filter_ncell_before": "13559",
            f"filter_fail_{column}_only": str(removed), median_column: str(median)}
@@ -750,7 +750,7 @@ def test_threshold_alone_warns_above_ten_percent(threshold, column, median_colum
     if expected:
         assert f"{threshold}={value}" in warning
         assert "2,277 of 13,559 cells (16.8%)" in warning
-        assert "median before filtering" in warning and f"{median:g}" in warning
+        assert "median before filtering" in warning and f": {median_text}" in warning
 
 
 @pytest.mark.parametrize("knee,inflection,expected", [(117, 683, True), (1615, 1046, False),
@@ -765,3 +765,24 @@ def test_barcode_rank_warns_only_for_knee_below_inflection(knee, inflection, exp
     if expected:
         assert "117 UMIs" in warning and "683 UMIs" in warning
         assert "Cell Ranger's called cells were used" in warning
+
+
+def test_one_metric_named_two_ways_by_cell_ranger_is_one_column_when_species_are_joined(tmp_path):
+    # The mouse libraries' Cell Ranger 9 writes cellranger_valid_umis, the human library's older
+    # Cell Ranger cellranger_valid_umi_sequences: the joined table carries the metric in one column.
+    import csv
+    from aiscientist.tools.run_cellqc.tool import _combine_results
+    runs = []
+    for species, sample, column in (("mouse", "S1", "cellranger_valid_umis"),
+                                    ("human", "S2", "cellranger_valid_umi_sequences")):
+        res = tmp_path / species / "result"
+        res.mkdir(parents=True)
+        (res / "metrics.csv").write_text(f"sampleid,{column},frac_retained\n{sample},99.9%,0.9\n")
+        runs.append({"species": species, "result_dir": res, "included": [sample],
+                     "libs": [{"sample": sample}]})
+    out = _combine_results(runs, tmp_path / "joined")
+    with (out / "metrics.csv").open(newline="", encoding="utf-8") as fh:
+        reader = csv.DictReader(fh)
+        rows = list(reader)
+    assert reader.fieldnames == ["sampleid", "cellranger_valid_umis", "frac_retained", "species"]
+    assert [(r["sampleid"], r["cellranger_valid_umis"]) for r in rows] == [("S1", "99.9%"), ("S2", "99.9%")]
