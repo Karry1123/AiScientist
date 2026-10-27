@@ -336,8 +336,10 @@ def _validate(libs: list[dict[str, Any]], status_rows: list[dict[str, str]],
             removed = lib["removed_only_by"].get(threshold) or 0
             if before and removed / before > 0.1:
                 value = args.get(threshold)
-                median_text = f"{median_before:g}" if median_before is not None else "unavailable"
                 units = "%" if threshold == "max_pct_mt" else ""
+                # A percent to two decimals (CellQC writes 6.0886), a count as a whole number.
+                median_text = ("unavailable" if median_before is None
+                               else f"{median_before:.2f}" if units else f"{median_before:,.0f}")
                 source = "" if threshold == "max_pct_mt" else " (Cell Ranger)"
                 warnings.append(
                     f"{lib['sample']}: {threshold}={value}{units} alone removed "
@@ -839,6 +841,12 @@ def _run_cellqc_once(cellqc: str, libs: list[dict[str, Any]], staged: dict[str, 
 # copy per species, named after it; a library's own files carry its sample id already.
 _COMBINED_TABLES = {"metrics.csv": ",", "manifest.tsv": "\t", "qc_status.csv": ","}
 
+# Cell Ranger names one metric differently across versions (9.0 "Valid UMIs", earlier "Valid UMI
+# Sequences"), and CellQC copies the name it reads. Joined, two species' runs would split one metric
+# over two half-empty columns (runs a3e283ebadba and 3f2262b60e33), so the older name is filed under
+# the newer.
+_METRIC_ALIASES = {"cellranger_valid_umi_sequences": "cellranger_valid_umis"}
+
 
 def _combine_results(runs: list[dict[str, Any]], dest: Path) -> Path:
     """Several species' CellQC ``result/`` directories as one flat directory in ``dest``."""
@@ -850,7 +858,8 @@ def _combine_results(runs: list[dict[str, Any]], dest: Path) -> Path:
         for src in sorted(p for p in done["result_dir"].iterdir() if p.is_file()
                           and not p.name.startswith(".")):
             if src.name in _COMBINED_TABLES:
-                tables[src.name] += [{**row, "species": done["species"]}
+                tables[src.name] += [{**{_METRIC_ALIASES.get(k, k): v for k, v in row.items()},
+                                      "species": done["species"]}
                                      for row in _read_csv(src, _COMBINED_TABLES[src.name])]
             elif any(src.name.startswith(f"{s}.") or src.name.startswith(f"{s}_") for s in samples):
                 _link_or_copy(src, dest / src.name)
