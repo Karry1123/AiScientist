@@ -25,6 +25,7 @@ the platform needs and whose body is the documentation people read::
                                  #   the tool runs with (see SKILL_ARG)
     ends_step: false             # true = one successful call is the whole plan step: the step
                                  #   ends on its result (run_cellqc, whose reply is built from it)
+    planner_defaults: []        # parameters whose schema defaults the planner should see
     ---
     # run_de
     ...documentation...
@@ -200,6 +201,7 @@ class ToolManifest:
     time_limit: str = ""
     skill: str = ""               # a registry skill whose image, resources and settings this tool runs with
     ends_step: bool = False       # one successful call is the whole step: the step ends on its result
+    planner_defaults: tuple[str, ...] = ()
     doc: str = field(default="", repr=False, compare=False)
 
     @property
@@ -237,7 +239,8 @@ def load_manifest(folder: Path) -> ToolManifest:
     if fields["category"] not in CATEGORIES:
         raise ManifestError(f"{path}: category {fields['category']!r} is not one of {CATEGORIES}")
     known = set(_REQUIRED) | {"entry", "needs", "chat", "research", "served_model", "own_gpu", "line",
-                              "owner", "image", "cpus", "mem_gb", "time_limit", "skill", "ends_step"}
+                              "owner", "image", "cpus", "mem_gb", "time_limit", "skill", "ends_step",
+                              "planner_defaults"}
     unknown = set(fields) - known
     if unknown:
         raise ManifestError(f"{path}: unknown field(s) {sorted(unknown)}")
@@ -261,6 +264,9 @@ def load_manifest(folder: Path) -> ToolManifest:
     if fields.get("own_gpu") and fields.get("served_model"):
         raise ManifestError(f"{path}: own_gpu and served_model exclude each other (its own model, or the session's)")
     needs = fields.get("needs") or []
+    planner_defaults = fields.get("planner_defaults") or []
+    if not isinstance(planner_defaults, list) or not all(isinstance(n, str) for n in planner_defaults):
+        raise ManifestError(f"{path}: planner_defaults must be a list of parameter names")
     return ToolManifest(
         name=fields["name"], summary=str(fields["summary"]), category=fields["category"],
         runs_on=fields["runs_on"], order=int(fields["order"]), folder=folder,
@@ -272,7 +278,8 @@ def load_manifest(folder: Path) -> ToolManifest:
         line=str(fields.get("line") or ""),
         owner=str(fields.get("owner") or ""), image=image,
         cpus=int(fields.get("cpus") or 0), mem_gb=int(fields.get("mem_gb") or 0),
-        time_limit=time_limit, skill=skill, ends_step=bool(fields.get("ends_step", False)), doc=body)
+        time_limit=time_limit, skill=skill, ends_step=bool(fields.get("ends_step", False)),
+        planner_defaults=tuple(planner_defaults), doc=body)
 
 
 @lru_cache(maxsize=1)

@@ -14524,6 +14524,12 @@ def _qc_chat_reply(art: Path, result: Any) -> str:
         lines.append("")
     if th and len(libs) != 1:   # one library's filter line already names each threshold
         lines.append("- Thresholds: " + ", ".join(f"`{k}` = {v}" for k, v in th.items()) + ".")
+    if th:
+        from ..tools.api import DECLARED_PARAMS
+        declared = DECLARED_PARAMS.get(tool, {})
+        for key, value in th.items():
+            if key in declared and value != declared[key][0]:
+                lines.append(f"- `{key}` = {value} differs from the default {declared[key][0]}.")
     split_notice = any(w.startswith("The libraries are from different species") for w in warnings)
     warnings = [w for w in warnings if not w.startswith("The libraries are from different species")]
     notes = [str(note) for note in r.get("notes") or []]

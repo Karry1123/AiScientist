@@ -166,6 +166,49 @@ def test_only_a_tool_that_ends_its_step_is_passed_as_the_planned_tool(monkeypatc
 
 # --- convergence is LLM-judged (no fixed score threshold) --------------------
 
+def test_cellqc_planner_sees_declared_threshold_defaults(monkeypatch):
+    from aiscientist.tools._lib.scrna import PARAMS
+    from aiscientist.tools.run_cellqc.tool import make_tool
+
+    seen = {}
+    lab = ResearchLab(_ctx(), LabConfig(auto_select_skill=False),
+                      complete_fn=_record_pi_user(seen),
+                      scientist=ResearchHarness(catalog=[make_tool()]))
+    lab._pi_plan("Run CellQC", lambda _event: None)
+    for name, value in (("min_counts", 500), ("min_features", 300), ("max_pct_mt", 10.0)):
+        assert f"{name} (" in seen["pi_user"]
+        assert f"default {value}" in seen["pi_user"]
+    # A changed declaration must reach the planner without editing its prompt or manifest.
+    monkeypatch.setitem(PARAMS["run_cellqc"], "min_features", (350, "Minimum detected genes"))
+    lab.scientist.catalog = [make_tool()]
+    lab._pi_plan("Run CellQC", lambda _event: None)
+    assert "min_features (integer, default 350)" in seen["pi_user"]
+
+
+@pytest.mark.parametrize("libraries", [[], [{"sample": "sample"}],
+                                       [{"sample": "one"}, {"sample": "two"}]])
+def test_qc_reply_names_every_threshold_changed_from_default(tmp_path, libraries):
+    from types import SimpleNamespace
+    from aiscientist.gateway.app import _qc_chat_reply
+
+    def reply(thresholds):
+        result = {"status": "ok", "cells_before": 100, "cells_after": 80,
+                  "thresholds": thresholds, "libraries": libraries}
+        return _qc_chat_reply(tmp_path, SimpleNamespace(rounds=[{
+            "scientist_result": {"steps": [{"tool": "run_cellqc", "ok": True,
+                                            "result": result}]}}]))
+
+    text = reply({"min_counts": 500, "min_features": 200, "max_pct_mt": 10})
+    assert "`min_features` = 200 differs from the default 300" in text
+    assert text.count("differs from the default") == 1
+    text = reply({"min_counts": 400, "min_features": 200, "max_pct_mt": 5})
+    for name, actual, default in (("min_counts", 400, 500), ("min_features", 200, 300),
+                                  ("max_pct_mt", 5, 10)):
+        assert f"`{name}` = {actual} differs from the default {default}" in text
+    assert "differs from the default" not in reply({"min_counts": 500, "min_features": 300,
+                                                   "max_pct_mt": 10})
+
+
 def test_convergence_is_llm_judged_not_thresholded():
     # The Critic accepts with a LOW score (0.4). With the old 0.8 gate this would NOT
     # advance; now convergence is the LLM's call, so the step is accepted.

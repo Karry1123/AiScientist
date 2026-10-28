@@ -3653,6 +3653,16 @@ def _tool_ends_step(tool: str) -> bool:
     return bool(found is not None and found.ends_step)
 
 
+def _planner_tool_description(tool: HarnessTool) -> str:
+    """The tool's description plus the schema defaults its manifest asks the planner to see."""
+    from ..tools.catalog import manifest
+    found = manifest(tool.name)
+    props = (tool.parameters or {}).get("properties", {})
+    defaults = [_describe_param(n, props[n]) for n in (found.planner_defaults if found else ())
+                if n in props and "default" in props[n]]
+    return tool.description + (" Declared defaults: " + "; ".join(defaults) if defaults else "")
+
+
 _PLAN_FINDING_WORDS = {
     "unknown_tool": "step {step} names `{tool}`, which is not a tool this deployment has",
     "unknown_setting": "step {step}: `{tool}` has no setting `{param}` (it takes: {detail})",
@@ -6917,7 +6927,8 @@ class ResearchLab:
                 return "agenda", patched
 
         tools_desc = "\n".join(
-            f"- {t.name}: {t.description}" for t in self.scientist.catalog if t.name != "finish"
+            f"- {t.name}: {_planner_tool_description(t)}"
+            for t in self.scientist.catalog if t.name != "finish"
         )
         # A pre-selected research path STEERS the PI here (it does not bypass it): the PI
         # still drafts the agenda — adapting the guidance to this dataset — and plan mode
