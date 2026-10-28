@@ -3409,10 +3409,12 @@ class CriticVerdict:
     verdict: str   # "accept" | "revise"
     score: float
     critique: str
+    reviewed: bool = True
 
     @classmethod
     def from_dict(cls, d: dict[str, Any]) -> "CriticVerdict":
-        return cls(str(d.get("verdict", "revise")), float(d.get("score", 0.0)), str(d.get("critique", "")))
+        return cls(str(d.get("verdict", "revise")), float(d.get("score", 0.0)),
+                   str(d.get("critique", "")), bool(d.get("reviewed", True)))
 
 
 @dataclass(frozen=True)
@@ -7858,21 +7860,44 @@ class ResearchLab:
                 "skill did not fit this data, has not done what was approved: ask it to revise with "
                 "the skill. A step that only reads, compares or plots what an earlier step made with "
                 "the skill does not have to run the skill again.")
-        raw = self._complete([
+        messages = [
             {"role": "system", "content": _CRITIC_SYSTEM},
             {"role": "user", "content": json.dumps(payload)},
-        ], role="critic")
-        parsed = _parse_verdict(raw) or {}
-        verdict = str(parsed.get("verdict", "revise")).strip().lower()
-        if verdict not in ("accept", "revise", "reject"):
-            verdict = "revise"
+        ]
+        for attempt in range(2):
+            raw = self._complete(messages, role="critic")
+            parsed = _parse_verdict(raw or "") or {}
+            verdict = str(parsed.get("verdict") or "").strip().lower()
+            critique = str(parsed.get("critique") or "").strip()
+            if verdict == "accept" or (verdict in ("revise", "reject") and critique):
+                break
+            if attempt == 0:
+                emit({"type": "critic_retry", "step": step,
+                      "reason": "missing verdict or revision critique"})
+                messages += [
+                    {"role": "assistant", "content": raw or ""},
+                    {"role": "user", "content": "Your review had no usable verdict or revision "
+                     "critique. Review the SAME result again. Reply with the required JSON; a "
+                     "revise verdict must explain what needs fixing."},
+                ]
+        else:
+            # Advance with the existing result; a failed reviewer has supplied no reason to rerun.
+            # The floors below still hold: an empty step or contradicted counts are never kept.
+            if any(step_succeeded(s) for s in result.steps) and not count_problems:
+                v = CriticVerdict("accept", 0.0,
+                                  "Step not reviewed: the Critic returned no usable review twice; "
+                                  "the existing result was kept without rerunning the step.", False)
+                emit({"type": "step_not_reviewed", "step": step, "reason": v.critique})
+                emit({"type": "critic", "step": step, "verdict": v.verdict, "score": v.score,
+                      "critique": v.critique, "reviewed": False})
+                return v
+            verdict, critique = "accept", ""   # the floors below turn this into a grounded revise
         if verdict == "reject":
             verdict = "revise"
         try:
             score = float(parsed.get("score", 0.0))
         except (TypeError, ValueError):
             score = 0.0
-        critique = str(parsed.get("critique", "")).strip()
 
         # Deterministic floor: a run that produced NOTHING usable can never be accepted
         # (no rubber-stamping an empty/failed step). But a run that DID produce a real

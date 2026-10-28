@@ -209,6 +209,60 @@ def test_qc_reply_names_every_threshold_changed_from_default(tmp_path, libraries
                                                    "max_pct_mt": 10})
 
 
+@pytest.mark.parametrize("bad_reply", ["", "not JSON", "{}", '{"verdict": "unknown"}',
+                                     '{"verdict": "revise", "score": 0, "critique": "  "}',
+                                     '{"verdict": "REVISE", "critique": null}'])
+@pytest.mark.parametrize("retry_succeeds", [True, False])
+@pytest.mark.parametrize("planner", ["linear", "dag"])
+def test_unusable_critic_review_retries_only_the_review(bad_reply, retry_succeeds, planner):
+    from aiscientist.agents.research_lab import CriticVerdict, LabRound
+
+    reviews = []
+    base = _make_complete(["Run QC"], [])
+
+    def complete(messages):
+        if "rigorous scientific Critic" in messages[0]["content"]:
+            reviews.append(messages)
+            if retry_succeeds and len(reviews) == 2:
+                return json.dumps({"verdict": "accept", "score": 0.9, "critique": "grounded"})
+            return bad_reply
+        return base(messages)
+
+    events = []
+    scientist = ResearchHarness(catalog=default_catalog(), chat_fn=_scientist_calls("run_qc", {}))
+    lab = ResearchLab(_ctx(), LabConfig(planner=planner, auto_select_skill=False),
+                      complete_fn=complete, scientist=scientist)
+    result = lab.run("QC the dataset", on_event=events.append)
+    assert len(reviews) == 2
+    assert len(result.rounds) == 1
+    assert result.rounds[0].scientist_result["steps"][0]["tool"] == "run_qc"
+    assert result.rounds[0].scientist_result["steps"][0]["ok"]
+    assert result.accepted_steps == 1
+    assert result.rounds[0].verdict.reviewed is retry_succeeds
+    assert len([e for e in events if e["type"] == "critic_retry"]) == 1
+    assert len([e for e in events if e["type"] == "step_not_reviewed"]) == (0 if retry_succeeds else 1)
+    restored = LabRound.from_dict(result.rounds[0].to_dict())
+    assert restored.verdict.reviewed is retry_succeeds
+    assert CriticVerdict.from_dict({"verdict": "accept"}).reviewed
+    if not retry_succeeds:
+        assert "not reviewed" in restored.verdict.critique
+
+
+def test_two_unusable_critic_replies_do_not_keep_a_step_that_produced_nothing():
+    from aiscientist.agents.research_harness import HarnessResult
+
+    calls = []
+    lab = ResearchLab(_ctx(), LabConfig(auto_select_skill=False),
+                      complete_fn=lambda m: (calls.append(m), "")[1])
+    events = []
+    v = lab._critic("q", "Run QC", HarnessResult(
+        "ok", None, "done", [{"tool": "run_qc", "ok": False, "error": "boom"}], ["boom"]),
+        events.append)
+    assert len(calls) == 2
+    assert v.verdict == "revise" and v.reviewed and "auto-guard" in v.critique
+    assert not [e for e in events if e["type"] == "step_not_reviewed"]
+
+
 def test_convergence_is_llm_judged_not_thresholded():
     # The Critic accepts with a LOW score (0.4). With the old 0.8 gate this would NOT
     # advance; now convergence is the LLM's call, so the step is accepted.
