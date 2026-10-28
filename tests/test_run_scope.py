@@ -50,6 +50,33 @@ def test_a_question_about_biology_is_not_a_limit(question):
     assert not read_scope(question, _TOOLS).limited
 
 
+@pytest.mark.parametrize("question", [
+    "Do cellqc quality controll and give me a result.",
+    "Do cellqc quality control and give me a result.",
+    "Please run CellQC and return the result dataset.",
+    "Run run_cellqc and show me its results!",
+])
+def test_a_named_method_and_its_result_are_limited_to_that_tool(question):
+    def never(_messages):
+        raise AssertionError("the whole request is read by the rules")
+
+    scope = read_scope(question, _TOOLS, never)
+    assert scope.keep == ("run_cellqc",) and scope.source == "rules"
+    assert not scope.allows("run_code") and not scope.allows_literature()
+    assert not read_scope(question, {"run_de": "DE"}, never).limited
+
+
+@pytest.mark.parametrize("question", [
+    "Do cellqc quality controll and give me a result. Then cluster the cells.",
+    "Do cellqc quality controll and give me a result and compare KO with WT.",
+    "Do cellqc quality controll and give me a result, then run differential expression.",
+    "Run CellQC and analyse the data and give me a result.",
+    "Run CellQC and give me a result and a written report.",
+])
+def test_asking_for_more_than_a_methods_result_does_not_limit_the_run(question):
+    assert not read_scope(question, _TOOLS).limited
+
+
 def test_an_exclusion_keeps_the_rest_and_keep_wins_over_exclude():
     s = read_scope("What changes between DDX41 and WT retina? Do not run enrichment.", _TOOLS)
     assert s.exclude == ("run_enrichment", "run_gsea_prerank") and not s.keep

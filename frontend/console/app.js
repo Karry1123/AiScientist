@@ -6193,17 +6193,26 @@ async function bindServerPath(path) {
     setUploadProgress(line, `Checking ${path} on the server…`, sid);
     const info = await post("/api/server-data/check");
     setUploadProgress(line, "");
+    const c = chatOf(sid);
+    const clean = (p) => String(p || "").replace(/\/+$/, "");
+    const binding = clean(info.path || path), overlaps = [];
+    for (const bound of new Set((c && c.bound || []).map(clean))) {
+      if (!bound || bound === binding) continue;
+      const direction = binding.startsWith(bound + "/") ? "Inside"
+        : bound.startsWith(binding + "/") ? "Contains" : "";
+      if (direction) overlaps.push(`${direction} ${bound.split("/").pop()}/, already bound in this chat: its libraries are QC'd once.`);
+    }
+    const message = (base) => [base, ...overlaps].filter(Boolean).join("\n");
     // Large copies are confirmed first: the size and what will be skipped are in the message.
-    if (info.confirm && !await confirmServerBind(chatOf(sid), info.message)) {
+    if (info.confirm && !await confirmServerBind(c, message(info.message))) {
       toast("Bind cancelled.");
       return false;
     }
     const d = await post("/api/server-data/bind");
-    const c = chatOf(sid);
     if (c) c.serverBoundTyped.add(path);
     addDataset({ name: d.name + (isFolderKind(d.kind) ? "/" : ""), path: d.path, kind: d.kind,
-      gist: d.info && d.info.message }, sid);
-    toast(d.info && d.info.message ? d.info.message : `Bound ${d.name}`);
+      gist: message(d.info && d.info.message) }, sid);
+    toast(message(d.info && d.info.message ? d.info.message : `Bound ${d.name}`));
     renderServerPathOffer();
     return true;
   } catch (err) {

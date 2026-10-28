@@ -8,6 +8,7 @@ line: scrna
 owner: analysis
 skill: qc-snrna-with-cellqc-standalone   # image, cpus, mem_gb, time_limit and CellQC settings come from it
 ends_step: true   # the QC reply is built from this call's result: nothing else runs in its step
+planner_defaults: [min_counts, min_features, max_pct_mt]
 ---
 # run_cellqc
 

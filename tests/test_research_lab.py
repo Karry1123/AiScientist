@@ -166,6 +166,103 @@ def test_only_a_tool_that_ends_its_step_is_passed_as_the_planned_tool(monkeypatc
 
 # --- convergence is LLM-judged (no fixed score threshold) --------------------
 
+def test_cellqc_planner_sees_declared_threshold_defaults(monkeypatch):
+    from aiscientist.tools._lib.scrna import PARAMS
+    from aiscientist.tools.run_cellqc.tool import make_tool
+
+    seen = {}
+    lab = ResearchLab(_ctx(), LabConfig(auto_select_skill=False),
+                      complete_fn=_record_pi_user(seen),
+                      scientist=ResearchHarness(catalog=[make_tool()]))
+    lab._pi_plan("Run CellQC", lambda _event: None)
+    for name, value in (("min_counts", 500), ("min_features", 300), ("max_pct_mt", 10.0)):
+        assert f"{name} (" in seen["pi_user"]
+        assert f"default {value}" in seen["pi_user"]
+    # A changed declaration must reach the planner without editing its prompt or manifest.
+    monkeypatch.setitem(PARAMS["run_cellqc"], "min_features", (350, "Minimum detected genes"))
+    lab.scientist.catalog = [make_tool()]
+    lab._pi_plan("Run CellQC", lambda _event: None)
+    assert "min_features (integer, default 350)" in seen["pi_user"]
+
+
+@pytest.mark.parametrize("libraries", [[], [{"sample": "sample"}],
+                                       [{"sample": "one"}, {"sample": "two"}]])
+def test_qc_reply_names_every_threshold_changed_from_default(tmp_path, libraries):
+    from types import SimpleNamespace
+    from aiscientist.gateway.app import _qc_chat_reply
+
+    def reply(thresholds):
+        result = {"status": "ok", "cells_before": 100, "cells_after": 80,
+                  "thresholds": thresholds, "libraries": libraries}
+        return _qc_chat_reply(tmp_path, SimpleNamespace(rounds=[{
+            "scientist_result": {"steps": [{"tool": "run_cellqc", "ok": True,
+                                            "result": result}]}}]))
+
+    text = reply({"min_counts": 500, "min_features": 200, "max_pct_mt": 10})
+    assert "`min_features` = 200 differs from the default 300" in text
+    assert text.count("differs from the default") == 1
+    text = reply({"min_counts": 400, "min_features": 200, "max_pct_mt": 5})
+    for name, actual, default in (("min_counts", 400, 500), ("min_features", 200, 300),
+                                  ("max_pct_mt", 5, 10)):
+        assert f"`{name}` = {actual} differs from the default {default}" in text
+    assert "differs from the default" not in reply({"min_counts": 500, "min_features": 300,
+                                                   "max_pct_mt": 10})
+
+
+@pytest.mark.parametrize("bad_reply", ["", "not JSON", "{}", '{"verdict": "unknown"}',
+                                     '{"verdict": "revise", "score": 0, "critique": "  "}',
+                                     '{"verdict": "REVISE", "critique": null}'])
+@pytest.mark.parametrize("retry_succeeds", [True, False])
+@pytest.mark.parametrize("planner", ["linear", "dag"])
+def test_unusable_critic_review_retries_only_the_review(bad_reply, retry_succeeds, planner):
+    from aiscientist.agents.research_lab import CriticVerdict, LabRound
+
+    reviews = []
+    base = _make_complete(["Run QC"], [])
+
+    def complete(messages):
+        if "rigorous scientific Critic" in messages[0]["content"]:
+            reviews.append(messages)
+            if retry_succeeds and len(reviews) == 2:
+                return json.dumps({"verdict": "accept", "score": 0.9, "critique": "grounded"})
+            return bad_reply
+        return base(messages)
+
+    events = []
+    scientist = ResearchHarness(catalog=default_catalog(), chat_fn=_scientist_calls("run_qc", {}))
+    lab = ResearchLab(_ctx(), LabConfig(planner=planner, auto_select_skill=False),
+                      complete_fn=complete, scientist=scientist)
+    result = lab.run("QC the dataset", on_event=events.append)
+    assert len(reviews) == 2
+    assert len(result.rounds) == 1
+    assert result.rounds[0].scientist_result["steps"][0]["tool"] == "run_qc"
+    assert result.rounds[0].scientist_result["steps"][0]["ok"]
+    assert result.accepted_steps == 1
+    assert result.rounds[0].verdict.reviewed is retry_succeeds
+    assert len([e for e in events if e["type"] == "critic_retry"]) == 1
+    assert len([e for e in events if e["type"] == "step_not_reviewed"]) == (0 if retry_succeeds else 1)
+    restored = LabRound.from_dict(result.rounds[0].to_dict())
+    assert restored.verdict.reviewed is retry_succeeds
+    assert CriticVerdict.from_dict({"verdict": "accept"}).reviewed
+    if not retry_succeeds:
+        assert "not reviewed" in restored.verdict.critique
+
+
+def test_two_unusable_critic_replies_do_not_keep_a_step_that_produced_nothing():
+    from aiscientist.agents.research_harness import HarnessResult
+
+    calls = []
+    lab = ResearchLab(_ctx(), LabConfig(auto_select_skill=False),
+                      complete_fn=lambda m: (calls.append(m), "")[1])
+    events = []
+    v = lab._critic("q", "Run QC", HarnessResult(
+        "ok", None, "done", [{"tool": "run_qc", "ok": False, "error": "boom"}], ["boom"]),
+        events.append)
+    assert len(calls) == 2
+    assert v.verdict == "revise" and v.reviewed and "auto-guard" in v.critique
+    assert not [e for e in events if e["type"] == "step_not_reviewed"]
+
+
 def test_convergence_is_llm_judged_not_thresholded():
     # The Critic accepts with a LOW score (0.4). With the old 0.8 gate this would NOT
     # advance; now convergence is the LLM's call, so the step is accepted.

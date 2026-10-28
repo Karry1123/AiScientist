@@ -148,6 +148,10 @@ _EXCEPT = re.compile(r"\b(?:except|other than|apart from)\b|除了", re.IGNORECA
 # Looser limiting words: worth asking the model about when the rules above found nothing.
 _LIMIT_CUE = re.compile(r"\b(?:only|just|no|not|don'?t|skip|without|except|nothing else)\b|"
                         r"只|仅|不做|不要|不用|不需要|无需|别|跳过|除了", re.IGNORECASE)
+_METHOD_RESULT = re.compile(
+    r"\s*(?:please\s+)?(?:do|run|perform)\s+(?:run[_ ]cellqc|cell[- ]?qc)"
+    r"(?:\s+quality\s+controll?)?\s*[,;]?\s*(?:and\s+)?(?:give|show|return)\s+"
+    r"(?:me\s+)?(?:(?:a|the|its)\s+)?results?(?:\s+dataset)?\s*[.!]?\s*", re.IGNORECASE)
 _BRIEF_REPORT = re.compile(
     r"\b(?:brief|short|concise|minimal|compact|one[- ]page)\b[^.;\n]{0,24}\b(?:report|summary|write-?up)\b|"
     r"\b(?:report|summary|write-?up)\b[^.;\n]{0,30}\b(?:brief|short|concise|minimal)\b|"
@@ -314,6 +318,9 @@ def read_scope(question: str, tools: "dict[str, str]",
     names = frozenset(n for n in tools if n != "finish")
     brief = bool(_BRIEF_REPORT.search(question or ""))
     keep, exclude = _by_rules(question, names)
+    # Naming CellQC and asking for its result is the whole request, not an invitation to analyse it.
+    if not (keep or exclude) and "run_cellqc" in names and _METHOD_RESULT.fullmatch(question or ""):
+        keep = ["run_cellqc"]
     if keep or exclude:
         return RunScope(tuple(keep), tuple(exclude), brief, "rules")
     if complete is None or not _LIMIT_CUE.search(question or ""):
