@@ -209,6 +209,41 @@ def test_qc_reply_names_every_threshold_changed_from_default(tmp_path, libraries
                                                    "max_pct_mt": 10})
 
 
+@pytest.mark.parametrize("as_dict", [False, True])
+@pytest.mark.parametrize("verdicts, chosen", [
+    (("revise", "accept"), 1), (("revise", "revise"), 1),
+    (("accept", "revise"), 0), ((None, None), 1),
+])
+def test_qc_reply_uses_the_accepted_round_else_the_latest(tmp_path, as_dict, verdicts, chosen):
+    from types import SimpleNamespace
+    from aiscientist.agents.research_lab import CriticVerdict, LabRound
+    from aiscientist.gateway.app import _qc_chat_reply, _qc_step_result
+
+    samples = ["Sample1_WT", "Sample2_Ddx41", "Sample3_GSM5676874"]
+    results = [
+        {"status": "ok", "cells_before": 34553, "cells_after": 31303,
+         "libraries": [{"sample": name} for name in samples[:2]]},
+        {"status": "ok", "cells_before": 44553, "cells_after": 40303,
+         "libraries": [{"sample": name} for name in samples]},
+    ]
+    rounds = []
+    for i, (qc, verdict) in enumerate(zip(results, verdicts)):
+        rnd = LabRound(i + 1, 0, "Run QC", "QC", {
+            "steps": [{"tool": "run_cellqc", "ok": True, "result": qc}]},
+            CriticVerdict(verdict, 0.9, "reviewed") if verdict else None)
+        if as_dict:
+            rnd = {"scientist_result": rnd.scientist_result,
+                   "verdict": {"verdict": verdict} if verdict else None}
+        rounds.append(rnd)
+    result = SimpleNamespace(rounds=rounds)
+    assert _qc_step_result(result) == ("run_cellqc", results[chosen])
+    text = _qc_chat_reply(tmp_path, result)
+    assert ("40,303 of 44,553" if chosen else "31,303 of 34,553") in text
+    assert (samples[2] in text) == bool(chosen)
+    for name in samples[:3 if chosen else 2]:
+        assert f"| {name} |" in text
+
+
 @pytest.mark.parametrize("bad_reply", ["", "not JSON", "{}", '{"verdict": "unknown"}',
                                      '{"verdict": "revise", "score": 0, "critique": "  "}',
                                      '{"verdict": "REVISE", "critique": null}'])

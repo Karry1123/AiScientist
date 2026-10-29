@@ -473,6 +473,28 @@ def call_settings(text: str, tool: str) -> "dict[str, Any]":
     return out
 
 
+def _states_name(text: str, name: str) -> bool:
+    return bool(name.strip()) and bool(re.search(
+        rf"(?<!\w){re.escape(name.strip())}(?!\w)", text, re.IGNORECASE))
+
+
+def _named_list_items(text: str, key: str, spec: "Mapping[str, Any]",
+                      values: list[Any]) -> set[str]:
+    items = spec.get("items") or {}
+    known = items.get("enum", []) if isinstance(items, Mapping) else []
+    named = {v.lower() for v in known if isinstance(v, str) and _states_name(text, v)}
+    if key == "samples":
+        # With no catalog of sample names, infer only numbered identifier families, e.g.
+        # Sample3_GSM5676874 also requires Sample1_WT and Sample2_Ddx41 named in this step.
+        for value in values:
+            match = re.fullmatch(r"([A-Za-z]+[_-]?)\d+(?:[_-][A-Za-z0-9]+)*", str(value))
+            if match:
+                named.update(v.lower() for v in re.findall(
+                    rf"\b{re.escape(match.group(1))}\d+(?:[_-][A-Za-z0-9]+)*\b",
+                    text, re.IGNORECASE))
+    return named
+
+
 def bind_settings(text: str, properties: "Mapping[str, Any]",
                   proposed: "Mapping[str, Any]") -> "tuple[dict[str, Any], list[dict[str, Any]]]":
     """``(settings, dropped)`` — the proposed arguments this step's own text supports.
@@ -512,6 +534,19 @@ def bind_settings(text: str, properties: "Mapping[str, Any]",
         if not stated:
             dropped.append({"param": key, "value": value, "why": "not_in_text"})
             continue
+        # A step that names two of a closed set's real choices (mouse and human) covers both: one
+        # pinned value would narrow it. Sentinels like "none" and "auto" are ordinary prose words.
+        if allowed and sum(isinstance(choice, str) and choice != spec.get("default")
+                           and choice not in ("none", "auto") and _states_name(text, choice)
+                           for choice in allowed) >= 2:
+            dropped.append({"param": key, "value": value, "why": "multiple_choices_in_text"})
+            continue
+        if isinstance(value, list):
+            named = _named_list_items(text, key, spec, value)
+            selected = {str(v).strip().lower() for v in value}
+            if selected < named:
+                dropped.append({"param": key, "value": value, "why": "incomplete_list"})
+                continue
         settings[key] = value
     return settings, dropped
 
