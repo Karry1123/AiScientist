@@ -1,0 +1,84 @@
+"""Saved review versions are the source for the card and the approved report."""
+
+import json
+
+import pytest
+
+from aiscientist.agents.plan_doc import parse_plan_yaml
+from aiscientist.gateway import saved_plans
+
+
+PLAN = """plan: 1
+request: Check cells
+steps:
+  - id: s1
+    title: QC
+    does: Filter cells
+    tool: run_scanpy_qc
+    settings:
+      max_pct_mt: 20
+"""
+
+
+def test_each_version_exists_before_its_card_and_records_its_source(tmp_path):
+    assert saved_plans.load(tmp_path) is None
+    for version, source in enumerate(("draft", "reply", "edit", "question"), 1):
+        record = saved_plans.save(tmp_path, PLAN, source=source,
+                                  prompt={"estimate": {"minutes": 5}})
+        path = tmp_path / "plan" / f"v{version:02d}.yaml"
+        assert path.read_text(encoding="utf-8") == record["yaml"]
+        assert record["source"] == source and record["state"] == "shown"
+        pointer = json.loads((tmp_path / "plan" / "current.json").read_text())
+        assert pointer == {"version": version, "filename": path.name}
+        card = saved_plans.build_prompt(tmp_path)
+        assert card["plan"]["yaml"] == path.read_text(encoding="utf-8")
+        assert card["estimate"] == {"minutes": 5}
+    assert len(list((tmp_path / "plan").glob("v*.yaml"))) == 4
+
+
+@pytest.mark.parametrize("source", ["reply", "edit"])
+def test_reply_or_edit_begins_with_current_disk_contents(tmp_path, source):
+    saved_plans.save(tmp_path, PLAN, source="draft")
+    path = tmp_path / "plan" / "v01.yaml"
+    path.write_text(path.read_text(encoding="utf-8").replace("max_pct_mt: 20", "max_pct_mt: 25"),
+                    encoding="utf-8")
+    current = saved_plans.load(tmp_path)
+    assert parse_plan_yaml(current["yaml"]).steps[0].settings["max_pct_mt"] == 25
+    edited = current["yaml"].replace("Filter cells", "Filter and inspect cells")
+    saved_plans.save(tmp_path, edited, source=source)
+    card = saved_plans.build_prompt(tmp_path)
+    assert card["plan"]["steps"][0]["settings"]["max_pct_mt"] == 25
+    assert "Filter and inspect" in card["agenda"][0]
+
+
+def test_approval_writes_the_exact_approved_version_and_hides_waiting_card(tmp_path):
+    shown = saved_plans.save(tmp_path, PLAN, source="draft")
+    assert not (tmp_path / "report" / "plan.yaml").exists()
+    approved = saved_plans.save(tmp_path, saved_plans.load(tmp_path)["yaml"],
+                                source="reply", state="approved")
+    assert (tmp_path / "report" / "plan.yaml").read_text(encoding="utf-8") == approved["yaml"]
+    assert (tmp_path / "plan" / "v01.yaml").read_text(encoding="utf-8") == shown["yaml"]
+    assert saved_plans.build_prompt(tmp_path) is None
+
+
+def test_cancel_retains_versions_and_does_not_write_approved_report(tmp_path):
+    saved_plans.save(tmp_path, PLAN, source="draft")
+    saved_plans.save(tmp_path, saved_plans.load(tmp_path)["yaml"], source="reply", state="cancelled")
+    assert saved_plans.load(tmp_path)["state"] == "cancelled"
+    assert saved_plans.build_prompt(tmp_path) is None
+    assert len(list((tmp_path / "plan").glob("v*.yaml"))) == 2
+    assert not (tmp_path / "report" / "plan.yaml").exists()
+
+
+def test_clarification_survives_without_a_live_plan_document(tmp_path):
+    saved_plans.save(tmp_path, "", source="question", kind="clarify", payload=["Which cells?"])
+    assert saved_plans.build_prompt(tmp_path) == {
+        "type": "plan_clarify", "questions": ["Which cells?"]}
+
+
+def test_pointer_cannot_escape_the_plan_folder(tmp_path):
+    folder = tmp_path / "plan"
+    folder.mkdir()
+    (folder / "current.json").write_text('{"filename": "../outside.yaml"}')
+    with pytest.raises(ValueError, match="pointer"):
+        saved_plans.load(tmp_path)

@@ -680,7 +680,8 @@ def record_run_finish(run_id: str, status: str, artifacts_path: str | None = Non
             run.status = status
             run.artifacts_path = artifacts_path
             run.summary = (summary or "")[:4000]
-            run.finished_at = _dt2.datetime.now(_dt2.timezone.utc)
+            run.finished_at = (None if status in {"running", "awaiting_plan"}
+                               else _dt2.datetime.now(_dt2.timezone.utc))
             s.commit()
 
 
@@ -700,6 +701,9 @@ def mark_interrupted_runs() -> int:
 
     ``interrupted`` rather than ``error``: nothing went wrong with the analysis, it was cut off,
     and the two deserve different rows when the question is "does this pipeline work".
+
+    ``awaiting_plan`` rows have a saved review and no executing thread; a restart leaves them
+    waiting for the user's reply.
     """
     import datetime as _dt3
 

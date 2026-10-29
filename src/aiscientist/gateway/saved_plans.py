@@ -1,0 +1,105 @@
+"""Versioned plan documents kept with a run's artifacts, independent of a live worker."""
+
+from __future__ import annotations
+
+import json
+import os
+import re
+import tempfile
+import threading
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Any
+
+from aiscientist.agents.plan_doc import _load, parse_plan_yaml
+
+_LOCKS: dict[str, Any] = {}
+_LOCKS_GUARD = threading.Lock()
+_VERSION_FILE = re.compile(r"v(\d+)\.yaml\Z")
+
+
+def lock(art: Path) -> Any:
+    """Serialize a read/change/write transaction for one run, including nested store calls."""
+    key = str(Path(art).resolve()).casefold()
+    with _LOCKS_GUARD:
+        return _LOCKS.setdefault(key, threading.RLock())
+
+
+def _write(path: Path, text: str) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, temporary = tempfile.mkstemp(prefix=".plan-", dir=path.parent)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8", newline="\n") as stream:
+            stream.write(text)
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(temporary, path)
+    finally:
+        if os.path.exists(temporary):
+            os.unlink(temporary)
+
+
+def load(art: Path) -> dict[str, Any] | None:
+    """Read the current document afresh; edits to the file are authoritative."""
+    with lock(art):
+        folder = Path(art) / "plan"
+        try:
+            pointer = json.loads((folder / "current.json").read_text(encoding="utf-8"))
+        except FileNotFoundError:
+            return None
+        filename = pointer.get("filename", "")
+        if not isinstance(filename, str) or not _VERSION_FILE.fullmatch(filename):
+            raise ValueError("Invalid saved plan pointer")
+        text = (folder / filename).read_text(encoding="utf-8")
+        data = _load(text)
+        if not isinstance(data, dict) or not isinstance(data.get("_review"), dict):
+            raise ValueError("Saved plan has no review metadata")
+        return {**data["_review"], "yaml": text, "filename": filename}
+
+
+def save(art: Path, plan_yaml: str, *, source: str, state: str = "shown",
+         kind: str = "agenda", payload: Any = None,
+         prompt: dict[str, Any] | None = None) -> dict[str, Any]:
+    """Commit a full version before publishing its pointer or showing its card."""
+    import yaml
+
+    if source not in {"draft", "reply", "edit", "question"}:
+        raise ValueError("Invalid saved plan source")
+    if state not in {"shown", "approved", "cancelled"}:
+        raise ValueError("Invalid saved plan state")
+    data = _load(plan_yaml) if plan_yaml.strip() else {"plan": 1, "steps": []}
+    if not isinstance(data, dict):
+        raise ValueError("Saved plan must be a YAML mapping")
+    data.pop("_review", None)
+    with lock(art):
+        folder = Path(art) / "plan"
+        versions = [int(match.group(1)) for path in folder.glob("v*.yaml")
+                    if (match := _VERSION_FILE.fullmatch(path.name))]
+        version = max(versions, default=0) + 1
+        filename = f"v{version:02d}.yaml"
+        metadata = {"version": version, "source": source, "state": state,
+                    "kind": kind, "payload": payload, "prompt": prompt,
+                    "saved_at": datetime.now(timezone.utc).isoformat()}
+        data["_review"] = metadata
+        text = yaml.safe_dump(data, allow_unicode=True, sort_keys=False)
+        _write(folder / filename, text)
+        if state == "approved":
+            _write(Path(art) / "report" / "plan.yaml", text)
+        _write(folder / "current.json", json.dumps({"version": version, "filename": filename}))
+        return {**metadata, "yaml": text, "filename": filename}
+
+
+def build_prompt(art: Path) -> dict[str, Any] | None:
+    """Rebuild the waiting card from its current file, including after a restart."""
+    current = load(art)
+    if current is None or current["state"] != "shown":
+        return None
+    prompt = dict(current.get("prompt") or {})
+    if current["kind"] == "clarify":
+        prompt.update(type="plan_clarify", questions=current.get("payload") or [])
+    else:
+        data = _load(current["yaml"])
+        doc = parse_plan_yaml(current["yaml"], request=str(data.get("request") or ""))
+        prompt.update(type="plan_prompt", agenda=doc.agenda(),
+                      plan={"yaml": current["yaml"], "steps": doc.to_public()})
+    return prompt
