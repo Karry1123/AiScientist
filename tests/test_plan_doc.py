@@ -183,6 +183,64 @@ def test_a_value_of_the_wrong_type_or_outside_the_closed_set_is_dropped():
     assert {d["param"]: d["why"] for d in dropped} == {"resolution": "wrong_type", "method": "not_allowed"}
 
 
+def test_a_multi_library_step_does_not_bind_one_species_or_a_subset_of_samples():
+    from aiscientist.tools.run_cellqc.tool import make_tool
+
+    text = ("Run `run_cellqc` on the three Cell Ranger libraries in this delivery. "
+            "Sample1_WT and Sample2_Ddx41 are mouse (GRCm39) and are merged into one QC'd "
+            "mouse object; Sample3_GSM5676874 is human (GRCh38) and is QC'd in its own "
+            "CellQC run and kept as a separate object ...")
+    settings, dropped = bind_settings(
+        text, make_tool().parameters["properties"],
+        {"species": "human", "samples": ["Sample3_GSM5676874"]})
+    assert settings == {}
+    assert {d["param"]: d["why"] for d in dropped} == {
+        "species": "multiple_choices_in_text", "samples": "incomplete_list"}
+
+
+def test_a_single_library_step_still_binds_its_species_and_sample():
+    from aiscientist.tools.run_cellqc.tool import make_tool
+
+    proposed = {"species": "mouse", "samples": ["Sample2_Ddx41"]}
+    text = "Run run_cellqc on the Sample2_Ddx41 Cell Ranger library, which is mouse (GRCm39)."
+    assert bind_settings(text, make_tool().parameters["properties"], proposed) == (proposed, [])
+
+
+@pytest.mark.parametrize("text, expected", [
+    ("Use auto or mouse", {"species": "mouse"}),
+    ("Use mouse with a humanized reference", {"species": "mouse"}),
+    ("Use human and mouse", {}),
+])
+def test_closed_set_scope_ignores_defaults_and_partial_words(text, expected):
+    props = {"species": {"type": "string", "default": "auto",
+                         "enum": ["auto", "human", "mouse"]}}
+    assert bind_settings(text, props, {"species": "mouse"})[0] == expected
+
+
+def test_a_sentinel_choice_in_prose_does_not_unbind_a_closed_set():
+    from aiscientist.tools.run_cellqc.tool import make_tool
+
+    text = ("Run run_cellqc with decontX for the ambient RNA; none of the libraries is "
+            "corrected with SoupX.")
+    assert bind_settings(text, make_tool().parameters["properties"],
+                         {"ambient_method": "decontx"}) == ({"ambient_method": "decontx"}, [])
+
+
+@pytest.mark.parametrize("selected", [["WT"], ["WT", "KO"]])
+def test_list_scope_uses_named_items_from_the_schema(selected):
+    props = {"groups": {"type": "array", "items": {"type": "string", "enum": ["WT", "KO"]}}}
+    settings, dropped = bind_settings("Compare WT and KO", props, {"groups": selected})
+    assert settings == ({"groups": selected} if len(selected) == 2 else {})
+    assert bool(dropped) == (len(selected) == 1)
+
+
+def test_a_multi_library_step_can_bind_the_complete_sample_list():
+    samples = ["Sample1_WT", "Sample2_Ddx41", "Sample3_GSM5676874"]
+    props = {"samples": {"type": "array", "items": {"type": "string"}}}
+    assert bind_settings("Run on " + ", ".join(samples), props,
+                         {"samples": samples}) == ({"samples": samples}, [])
+
+
 def test_arguments_written_as_a_call_are_read_from_the_step():
     step = 'Contrast the arms with `run_de(groupby="sampleid", reference="WT", padj=0.05)`.'
     assert call_settings(step, "run_de") == {"groupby": "sampleid", "reference": "WT", "padj": "0.05"}
