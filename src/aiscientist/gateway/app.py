@@ -14555,20 +14555,28 @@ def _qc_chat_reply(art: Path, result: Any) -> str:
 
 
 def _qc_step_result(result: Any) -> "tuple[str, dict] | None":
-    """The first QC step that completed and counted its input: ``(tool, return value)``, or None.
+    """The latest accepted round's QC result, else the latest QC result, or None.
 
     Reads both round shapes: LabRound dataclasses in production, dicts in tests and run_state.json
     replays. This section used to read only dicts — the defect _pipeline_section had — so a live
     run's report never carried its QC paragraph."""
-    for rnd in (getattr(result, "rounds", None) or []):
+    latest = None
+    for rnd in reversed(getattr(result, "rounds", None) or []):
         sr = (rnd.get("scientist_result") if isinstance(rnd, dict)
               else getattr(rnd, "scientist_result", None))
+        verdict = rnd.get("verdict") if isinstance(rnd, dict) else getattr(rnd, "verdict", None)
+        verdict = verdict.get("verdict") if isinstance(verdict, dict) else getattr(verdict, "verdict", None)
         for st in ((sr or {}).get("steps") or []):
             r = st.get("result") if isinstance(st, dict) else None
             if (isinstance(r, dict) and st.get("tool") in _QC_TOOLS and r.get("status") == "ok"
                     and r.get("cells_before") is not None):
-                return str(st["tool"]), r
-    return None
+                qc = str(st["tool"]), r
+                if verdict == "accept":
+                    return qc
+                if latest is None:
+                    latest = qc
+                break
+    return latest
 
 
 def _qc_input_counts(qc: "tuple[str, dict] | None", primary: str) -> str:
