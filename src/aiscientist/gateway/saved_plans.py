@@ -146,11 +146,20 @@ def build_prompt(art: Path) -> dict[str, Any] | None:
     if current is None or current["state"] != "shown":
         return None
     prompt = dict(current.get("prompt") or {})
+    expected = prompt.pop("step_outputs", None)
     if current["kind"] == "clarify":
         prompt.update(type="plan_clarify", questions=current.get("payload") or [])
     else:
         data = _parse(current["yaml"], "The plan")
         doc = parse_plan_yaml(current["yaml"], request=str(data.get("request") or ""))
+        steps = doc.to_public()
+        # The outputs each step is expected to leave, as the lab listed them when this version was
+        # shown (its skill's declared outputs). Kept for a step whose tool and skill are unchanged.
+        for step in steps:
+            known = expected.get(step["id"]) if isinstance(expected, dict) else None
+            if (isinstance(known, dict) and known.get("outputs")
+                    and known.get("tool") == step.get("tool") and known.get("skill") == step.get("skill")):
+                step["outputs"] = known["outputs"]
         prompt.update(type="plan_prompt", agenda=doc.agenda(),
-                      plan={"yaml": current["yaml"], "steps": doc.to_public()})
+                      plan={"yaml": current["yaml"], "steps": steps})
     return prompt

@@ -13791,10 +13791,17 @@ async def _run_lab(conn: Connection, req: LabRequest, *,
                 source = "edit" if saved_decision["action"] == "edit" else "reply"
             if kind == "clarify" or run_flags.get("plan_answer"):
                 source = "question"
+            # The outputs the lab expects of each step (its skill's declared outputs), which the
+            # card lists under the step: kept with the version, since only the lab can work them out.
+            step_outputs = {str(s.get("id")): {"tool": s.get("tool"), "skill": s.get("skill"),
+                                               "outputs": s["outputs"]}
+                            for s in (run_flags["plan_doc"] or {}).get("steps") or []
+                            if isinstance(s, dict) and s.get("outputs")}
             prompt = {"revised": list(run_flags["plan_revised"]),
                       "problems": list(run_flags["plan_problems"]),
                       **(run_flags.get("plan_answer") or {}),
-                      "estimate": plan_estimate(agenda) if agenda else None}
+                      "estimate": plan_estimate(agenda) if agenda else None,
+                      **({"step_outputs": step_outputs} if step_outputs else {})}
             saved_plans.save(art, doc_yaml, source=source, kind=kind, payload=payload, prompt=prompt)
             card = saved_plans.build_prompt(art)
             _finish_run_record(conn, run_id, "awaiting_plan", str(art), "Plan waiting for review.")

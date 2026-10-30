@@ -16,6 +16,7 @@ from starlette.requests import Request
 from aiscientist.agents import registry, research_lab
 from aiscientist.agents.plan_doc import parse_plan_yaml
 from aiscientist.agents.research_harness import HarnessTool
+from aiscientist.agents.research_lab import ResearchLab as _ResearchLab
 from aiscientist.gateway import app as gw, saved_plans
 from aiscientist.gateway.settings import HPCSettings
 
@@ -276,3 +277,32 @@ def test_the_scan_reads_only_the_plans_that_wait(lab_gateway, monkeypatch):
     monkeypatch.setattr(saved_plans, "load", lambda a: loaded.append(a) or real_load(a))
     assert [p["conversation_id"] for p in gw._saved_plan_replays(conn)] == ["conv-B"]
     assert art not in loaded
+
+
+def test_the_saved_card_keeps_each_steps_expected_outputs(lab_gateway, monkeypatch):
+    env = lab_gateway
+    outputs = [{"path": "figures/qc_violin.png", "kind": "figure", "required": True,
+                "description": "QC metrics per cell"}]
+    real = _ResearchLab._public_plan_steps     # the class, not the fixture's factory
+
+    def with_outputs(self, doc):
+        steps = real(self, doc)
+        for step in steps:
+            step["outputs"] = outputs          # what a skill declaring this output would add
+        return steps
+
+    monkeypatch.setattr(_ResearchLab, "_public_plan_steps", with_outputs)
+    first = env.connection()
+    rid, art, current, _ = _show(first)
+    assert env.cards[-1]["plan"]["steps"][0]["outputs"] == outputs
+    # After a restart the card is drawn from the file, with the same expected outputs.
+    gw.CONNECTIONS.pop(first.id)
+    restored = env.connection()
+    card = gw._saved_plan_replays(restored)[0]
+    assert card["plan"]["steps"][0]["outputs"] == outputs and "step_outputs" not in card
+    # A step whose tool was changed by hand no longer claims the old tool's outputs.
+    path = art / "plan" / current["filename"]
+    document, mark, record = path.read_text(encoding="utf-8").partition("# --- Saved by AiScientist")
+    path.write_text(document.replace("tool: run_scanpy_qc", "tool: run_code") + mark + record,
+                    encoding="utf-8")
+    assert "outputs" not in gw._saved_plan_replays(restored)[0]["plan"]["steps"][0]
