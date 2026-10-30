@@ -41,7 +41,7 @@ import threading
 import time
 from functools import lru_cache
 from pathlib import Path
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass, field, replace
 from typing import Any, Callable, Iterable
 
 from . import claim_audit
@@ -3934,6 +3934,15 @@ class _RunCancelled(BaseException):
     """Unwind cancellation past best-effort model/tool fallbacks."""
 
 
+def _from_fields(cls: Any, data: "dict[str, Any]") -> Any:
+    """``cls(**data)`` with only the fields ``cls`` has: a plan saved before a deploy that drops a
+    field is still restored after it."""
+    from dataclasses import fields
+
+    names = {f.name for f in fields(cls)}
+    return cls(**{k: v for k, v in data.items() if k in names})
+
+
 class ResearchLab:
     """PI → Scientist → Critic loop. Roles are injectable for offline tests."""
 
@@ -3987,6 +3996,7 @@ class ResearchLab:
         # Steps are pinned to the approved one and the finished run is checked against it.
         self._plan_doc: "PlanDoc | None" = None
         self._approved_plan: "PlanDoc | None" = None
+        self._plan_feedback: list[str] = []
         self._plan_adherence: dict[str, Any] = {}
         # Steps the researcher said yes to DURING the run (``_approve_new_step``). They are not in
         # the approved document, and the read-back must not report them as unapproved work.
@@ -4039,6 +4049,38 @@ class ResearchLab:
         self._compacted_block: str = ""
         # Mid-run durability (see :meth:`_checkpoint_state`). Set per-run by ``run()``.
         self._checkpoint: "Callable[[LabResult], None] | None" = None
+
+    @property
+    def plan_context(self) -> "dict[str, Any]":
+        """Resolved planning inputs saved alongside a waiting plan, including its full team."""
+        return {
+            "guidance": self._guidance, "scope": self._scope.to_dict(),
+            "skills": [asdict(s) for s in self._skills], "mode": self._mode,
+            "team": [asdict(s) for s in self._team] if self._team else None,
+            "self_sourced": self._self_sourced, "later": list(self._later),
+            "request_breadth": self._request_breadth, "feedback": list(self._plan_feedback),
+            "design_background": list(self._design_citations),
+        }
+
+    def _restore_plan_context(self, state: "dict[str, Any]") -> None:
+        self._guidance = state.get("guidance", self._guidance)
+        self._scope = RunScope.from_dict(state.get("scope", {}))
+        if "skills" in state:
+            # A pipeline's declared outputs come back as DeclaredOutput, which the output checks
+            # read (``_expected_outputs``); JSON gave them back as dicts.
+            self._skills = [_from_fields(PresetPipeline, {
+                **s, "tools": tuple(s.get("tools", ())),
+                "outputs": tuple(_from_fields(skill_outputs.DeclaredOutput, o)
+                                 for o in s.get("outputs") or () if isinstance(o, dict))})
+                            for s in state["skills"]]
+        self._mode = str(state.get("mode") or self.config.mode)
+        self._team = tuple(_from_fields(Specialist, {**s, "keywords": tuple(s.get("keywords", ()))})
+                           for s in state.get("team") or []) or None
+        self._self_sourced = str(state.get("self_sourced") or "")
+        self._later = list(state.get("later") or [])
+        self._request_breadth = str(state.get("request_breadth") or "")
+        self._plan_feedback = list(state.get("feedback") or [])
+        self._design_citations = list(state.get("design_background") or [])
 
     @property
     def approved_plan_yaml(self) -> str:
@@ -4202,11 +4244,22 @@ class ResearchLab:
         decision_review: "Callable[[Any], dict[str, Any]] | None" = None,
         should_compact: "Callable[[], bool] | None" = None,
         checkpoint: "Callable[[LabResult], None] | None" = None,
+        saved_plan: "PlanDoc | None" = None,
+        approved_plan: "PlanDoc | None" = None,
+        plan_context: "dict[str, Any] | None" = None,
+        saved_plan_decision: "dict[str, Any] | None" = None,
+        saved_plan_kind: str = "agenda",
+        saved_plan_payload: Any = None,
     ) -> LabResult:
         emit: EventFn = on_event or (lambda _e: None)
         self._checkpoint = checkpoint
         self._decision_review = decision_review
         self._proposed_steps, self._step_asks_unanswered = [], False
+        restored = approved_plan is not None or saved_plan is not None or saved_plan_kind != "agenda"
+        if saved_plan is not None and approved_plan is not None:
+            raise ValueError("Provide saved_plan or approved_plan, not both")
+        if resume is not None and restored:
+            raise ValueError("A saved plan cannot also resume completed rounds")
         self._skipped_steps = []
 
         # A2 continuation: re-enter the SAME state machine without re-planning. Skip skill/mode/PI
@@ -4238,97 +4291,7 @@ class ResearchLab:
                 exec_roster=self.config.specialists, exec_multi=self.config.multi_specialist,
                 redo_indices=redo_indices, kept_by_index=kept_by_index, seed_notes=resume.modify_note)
 
-        # Axis B — PI-autonomous skill selection: if the user did not force a research path,
-        # the PI reads the skill library and picks one itself (researchers do not know which
-        # protocol they need). The chosen skill's body then STEERS planning, exactly like a
-        # user-picked preset. An explicit preset_prompt (already in self._guidance) wins.
-        # Axis B. ``self._skills`` already holds the user-PINNED skills (the multi-select — mandatory).
-        # The PI ALSO auto-selects the best-fit skill — from the DATASET profile as well as the
-        # question, so a VCF / annotated .h5ad routes correctly even from a vague ask — and it AUGMENTS
-        # the pinned set (never replaces it), deduped by key. A user-EDITED free-text override
-        # (``self._guidance`` from ``preset_prompt``) turns auto OFF — "I'm taking over the guidance";
-        # pinned skills do NOT (they leave ``self._guidance`` None), so they still get the auto pick.
-        # The dataset's description (DATASET.md): read when it is kept, written by the PI the first
-        # time a run reads the dataset. Before the protocol is chosen and the plan drafted, so both
-        # read it (RCHENLAB/AiScientist issue 10, part 3).
-        self._describe_dataset(emit)
-        # The limit the request itself sets ("only QC", "no DE, no enrichment", "a short report"),
-        # read before anything that could widen the plan.
-        self._scope = read_scope(
-            question, {t.name: t.description for t in self.scientist.catalog},
-            lambda m: self._complete(m, role="classify"))
-        if self._scope.limited or self._scope.brief_report:
-            emit({"type": "scope", **self._scope.to_dict(), "text": self._scope.describe()})
-        # A request limited to named analyses is planned from the data profile alone: a matched
-        # protocol exists to lay out the WHOLE pipeline, which is what the user just declined.
-        if self._guidance is None and self.config.auto_select_skill and not self._scope.keep:
-            # Feature ② Phase B: the run-start content triage (peek/describe) stamped the PRIMARY
-            # file's modality into decisions; hand it to the router so a file's actual CONTENT — not
-            # its extension — picks the modality bucket. Absent/low-confidence → the router falls back
-            # to the suffix-derived dataset profile (self._dataset_context()).
-            _dec = self.ctx.decisions or {}
-            chosen = select_pipeline(self._complete, question, self._dataset_context(),
-                                     self.config.skill_library, emit,
-                                     content_modality=str(_dec.get("content_modality") or ""),
-                                     content_confidence=str(_dec.get("content_confidence") or ""),
-                                     available_tools=self._usable_tool_names())
-            if chosen is not None:
-                # The auto pick is DATASET-derived (select_pipeline reads the dataset profile), so it
-                # is the ground truth on modality. When it names a different ``data_type`` than a
-                # user-PINNED pipeline (e.g. the dataset is a VCF → variant_annotation, but a
-                # single-cell pipeline was pinned from the chat), the dataset wins: drop the
-                # conflicting pinned pipelines so a scanpy protocol is never forced onto a VCF (its
-                # QC→clustering steps would be composed into the plan alongside the variant workflow).
-                kept, dropped = drop_conflicting_pinned(self._skills, chosen)
-                if dropped:
-                    self._skills = kept
-                    emit({"type": "skills_dropped",
-                          "skills": [s.key for s in dropped],
-                          "kept": chosen.key,
-                          "reason": f"dataset routed to '{chosen.data_type}'"})
-                if chosen.key not in {s.key for s in self._skills}:
-                    self._skills.append(chosen)
-        # Guidance = the (optional) user-edited free-text override first, then every loaded skill's
-        # prompt (pinned + auto). ``self._guidance`` was seeded with the override in __init__.
-        skill_text = compose_pipeline_prompts(self._skills)
-        if skill_text:
-            self._guidance = ((self._guidance + "\n\n") if self._guidance else "") + skill_text
-        # User-REQUIRED atomic skills (the console's skill multi-select): the plan MUST apply each of
-        # these specific capabilities. Unlike the global manifest (available on demand), these are
-        # mandatory, so the directive goes into the PI's planning guidance. Validated against the
-        # loaded atomic library; unknown names are dropped.
-        _reqs = [s for n in self.config.required_skills if (s := get_skill(n, ATOMIC_SKILLS))]
-        if _reqs:
-            block = ("REQUIRED skills for this study — the plan MUST apply EACH of these (read its "
-                     "guidance with read_skill_reference(name), fetch the code with "
-                     "read_skill_reference(name, file=\"reference.py\"), adapt it to the dataset, and run "
-                     "it via run_code):\n"
-                     + "\n".join(f"- {s.name}" + (f" — {s.summary}" if s.summary else "") for s in _reqs))
-            self._guidance = ((self._guidance + "\n\n") if self._guidance else "") + block
-            emit({"type": "skills_required",
-                  "skills": [{"name": s.name, "summary": s.summary} for s in _reqs]})
-        # Announce the active research paths NOW — BEFORE the plan is drafted/reviewed — so the user
-        # sees which pipelines (pinned + auto) are steering the plan, not only after they approve it.
-        # Each pipeline reports the tools it composes AND the ones this deployment cannot run, so
-        # "Loaded preset pipeline: scGPT foundation-model annotation" can never again be announced
-        # for a protocol whose defining tool is dead here — the user learns that at load time, not
-        # from an empty section in the final report.
-        _usable = self._usable_tool_names()
-        emit({"type": "skills_loaded",
-              "skills": [{"key": s.key, "label": s.label, "tools": list(s.tools),
-                          **({"unavailable_tools": list(gaps)}
-                             if (gaps := s.missing_tools(_usable)) else {})}
-                         for s in self._skills]})
-
-        # Axis A — execution mode (Virtual-Lab team vs single scientist). "auto" lets the PI
-        # route; the frontend mode toggle sets "team"/"single" explicitly. In team mode the
-        # PI forms a team and the team DESIGNS the approach in a meeting (each expert keeps an
-        # independent context) — its synthesis augments the planning guidance below.
-        # Per-RUN, not per-object: a ResearchLab instance can serve more than one run, and a
-        # spent budget carried into the next one would silently stop asking from the first
-        # failure — the opposite of the guarantee.
         self._human_failure_asks = 0
-
         def _cancelled_before_plan() -> "LabResult | None":
             if should_cancel is not None and should_cancel():
                 emit({"type": "run_cancelled", "completed_steps": 0, "agenda": 0})
@@ -4336,53 +4299,159 @@ class ResearchLab:
                                  "Stopped by the user before the plan was drafted — no tools ran.")
             return None
 
-        if (self._scope.keep or self.config.prior_work) and self.config.mode == "auto":
-            # The design meeting designs a study. A request that names the only analyses it wants,
-            # or one that adds a step to work this conversation already did, has no study to design.
-            self._mode = "single"
-            emit({"type": "mode_selected", "mode": "single",
-                  "reason": "scope" if self._scope.keep else "continuation"})
+        if restored:
+            if plan_context is not None:
+                self._restore_plan_context(plan_context)
+            self.config = replace(self.config, plan_yaml=True)
+            self._plan_doc = approved_plan if approved_plan is not None else saved_plan
+            kind = "agenda" if approved_plan is not None else saved_plan_kind
+            payload = (self._plan_doc.agenda() if kind == "agenda" and self._plan_doc is not None
+                       else saved_plan_payload)
+            exec_roster = self._team or self.config.specialists
+            exec_multi = True if self._mode == "team" else self.config.multi_specialist
+            if approved_plan is not None:
+                self._approve_plan_document(emit)
+                plan_review = None
         else:
-            self._mode = (self._route_mode(question, emit) if self.config.mode == "auto"
-                          else self.config.mode)
-        exec_roster, exec_multi = self.config.specialists, self.config.multi_specialist
-        if self._mode == "team":
-            self._team = self._form_team(question, emit)
-            exec_roster, exec_multi = self._team, True
-            design = self._team_meeting(
-                question,
-                "How should we carry out what this request asks for? Propose how to do the "
-                "requested analysis on THIS data, the key pitfalls to avoid, and how to validate "
-                "the result. Stay inside the request: an analysis the user did not ask for is a "
-                "suggestion for a later message, not part of this plan.",
-                self._team, "design", emit)
-            self._guidance = ((self._guidance + "\n\n") if self._guidance else "") + \
-                ("Team design-meeting synthesis (how to carry out the request — it does not "
-                 "widen it):\n") + design
+            self._plan_feedback = []
+            # Axis B — PI-autonomous skill selection: if the user did not force a research path,
+            # the PI reads the skill library and picks one itself (researchers do not know which
+            # protocol they need). The chosen skill's body then STEERS planning, exactly like a
+            # user-picked preset. An explicit preset_prompt (already in self._guidance) wins.
+            # Axis B. ``self._skills`` already holds the user-PINNED skills (the multi-select — mandatory).
+            # The PI ALSO auto-selects the best-fit skill — from the DATASET profile as well as the
+            # question, so a VCF / annotated .h5ad routes correctly even from a vague ask — and it AUGMENTS
+            # the pinned set (never replaces it), deduped by key. A user-EDITED free-text override
+            # (``self._guidance`` from ``preset_prompt``) turns auto OFF — "I'm taking over the guidance";
+            # pinned skills do NOT (they leave ``self._guidance`` None), so they still get the auto pick.
+            # The dataset's description (DATASET.md): read when it is kept, written by the PI the first
+            # time a run reads the dataset. Before the protocol is chosen and the plan drafted, so both
+            # read it (RCHENLAB/AiScientist issue 10, part 3).
+            self._describe_dataset(emit)
+            # The limit the request itself sets ("only QC", "no DE, no enrichment", "a short report"),
+            # read before anything that could widen the plan.
+            self._scope = read_scope(
+                question, {t.name: t.description for t in self.scientist.catalog},
+                lambda m: self._complete(m, role="classify"))
+            if self._scope.limited or self._scope.brief_report:
+                emit({"type": "scope", **self._scope.to_dict(), "text": self._scope.describe()})
+            # A request limited to named analyses is planned from the data profile alone: a matched
+            # protocol exists to lay out the WHOLE pipeline, which is what the user just declined.
+            if self._guidance is None and self.config.auto_select_skill and not self._scope.keep:
+                # Feature ② Phase B: the run-start content triage (peek/describe) stamped the PRIMARY
+                # file's modality into decisions; hand it to the router so a file's actual CONTENT — not
+                # its extension — picks the modality bucket. Absent/low-confidence → the router falls back
+                # to the suffix-derived dataset profile (self._dataset_context()).
+                _dec = self.ctx.decisions or {}
+                chosen = select_pipeline(self._complete, question, self._dataset_context(),
+                                         self.config.skill_library, emit,
+                                         content_modality=str(_dec.get("content_modality") or ""),
+                                         content_confidence=str(_dec.get("content_confidence") or ""),
+                                         available_tools=self._usable_tool_names())
+                if chosen is not None:
+                    # The auto pick is DATASET-derived (select_pipeline reads the dataset profile), so it
+                    # is the ground truth on modality. When it names a different ``data_type`` than a
+                    # user-PINNED pipeline (e.g. the dataset is a VCF → variant_annotation, but a
+                    # single-cell pipeline was pinned from the chat), the dataset wins: drop the
+                    # conflicting pinned pipelines so a scanpy protocol is never forced onto a VCF (its
+                    # QC→clustering steps would be composed into the plan alongside the variant workflow).
+                    kept, dropped = drop_conflicting_pinned(self._skills, chosen)
+                    if dropped:
+                        self._skills = kept
+                        emit({"type": "skills_dropped",
+                              "skills": [s.key for s in dropped],
+                              "kept": chosen.key,
+                              "reason": f"dataset routed to '{chosen.data_type}'"})
+                    if chosen.key not in {s.key for s in self._skills}:
+                        self._skills.append(chosen)
+            # Guidance = the (optional) user-edited free-text override first, then every loaded skill's
+            # prompt (pinned + auto). ``self._guidance`` was seeded with the override in __init__.
+            skill_text = compose_pipeline_prompts(self._skills)
+            if skill_text:
+                self._guidance = ((self._guidance + "\n\n") if self._guidance else "") + skill_text
+            # User-REQUIRED atomic skills (the console's skill multi-select): the plan MUST apply each of
+            # these specific capabilities. Unlike the global manifest (available on demand), these are
+            # mandatory, so the directive goes into the PI's planning guidance. Validated against the
+            # loaded atomic library; unknown names are dropped.
+            _reqs = [s for n in self.config.required_skills if (s := get_skill(n, ATOMIC_SKILLS))]
+            if _reqs:
+                block = ("REQUIRED skills for this study — the plan MUST apply EACH of these (read its "
+                         "guidance with read_skill_reference(name), fetch the code with "
+                         "read_skill_reference(name, file=\"reference.py\"), adapt it to the dataset, and run "
+                         "it via run_code):\n"
+                         + "\n".join(f"- {s.name}" + (f" — {s.summary}" if s.summary else "") for s in _reqs))
+                self._guidance = ((self._guidance + "\n\n") if self._guidance else "") + block
+                emit({"type": "skills_required",
+                      "skills": [{"name": s.name, "summary": s.summary} for s in _reqs]})
+            # Announce the active research paths NOW — BEFORE the plan is drafted/reviewed — so the user
+            # sees which pipelines (pinned + auto) are steering the plan, not only after they approve it.
+            # Each pipeline reports the tools it composes AND the ones this deployment cannot run, so
+            # "Loaded preset pipeline: scGPT foundation-model annotation" can never again be announced
+            # for a protocol whose defining tool is dead here — the user learns that at load time, not
+            # from an empty section in the final report.
+            _usable = self._usable_tool_names()
+            emit({"type": "skills_loaded",
+                  "skills": [{"key": s.key, "label": s.label, "tools": list(s.tools),
+                              **({"unavailable_tools": list(gaps)}
+                                 if (gaps := s.missing_tools(_usable)) else {})}
+                             for s in self._skills]})
 
-        # PI node. In plan mode the PI may ask a clarifying question first; without it,
-        # force a straight agenda (there is no one to answer a clarify).
-        if (early := _cancelled_before_plan()) is not None:
-            return early
-        # In plan mode the reviewed agenda is presented below; streaming the draft as well
-        # repeats the same plan card when review leaves it unchanged.
-        def draft_event(ev: dict[str, Any]) -> None:
-            if plan_review is None or ev.get("type") != "pi_agenda":
-                emit(ev)
+            # Axis A — execution mode (Virtual-Lab team vs single scientist). "auto" lets the PI
+            # route; the frontend mode toggle sets "team"/"single" explicitly. In team mode the
+            # PI forms a team and the team DESIGNS the approach in a meeting (each expert keeps an
+            # independent context) — its synthesis augments the planning guidance below.
+            # Per-RUN, not per-object: a ResearchLab instance can serve more than one run, and a
+            # spent budget carried into the next one would silently stop asking from the first
+            # failure — the opposite of the guarantee.
+            self._human_failure_asks = 0
 
-        kind, payload = self._pi_plan(question, draft_event, allow_clarify=plan_review is not None)
-        if kind == "failed":
-            emit({"type": "plan_failed", "reason": payload})
-            return LabResult(question, [], [], False, 0, str(payload))
-        # PI<->Critic review runs BEFORE the plan reaches the human, not instead of it. The old
-        # condition skipped the review whenever a human was curating ("their decision wins") —
-        # and "Plan first" is checked by default, so on the path almost every real run takes, the
-        # only thing that ever read a plan back was switched off. A human reviewing a plan that
-        # has already been critiqued still decides everything; they just decide with the Critic's
-        # objections in front of them instead of without them.
-        if plan_review is not None and kind == "agenda":
-            payload = self._apply_scope(self._plan_review(question, list(payload), emit), emit)
-            emit({"type": "pi_agenda", "agenda": payload})
+            if (self._scope.keep or self.config.prior_work) and self.config.mode == "auto":
+                # The design meeting designs a study. A request that names the only analyses it wants,
+                # or one that adds a step to work this conversation already did, has no study to design.
+                self._mode = "single"
+                emit({"type": "mode_selected", "mode": "single",
+                      "reason": "scope" if self._scope.keep else "continuation"})
+            else:
+                self._mode = (self._route_mode(question, emit) if self.config.mode == "auto"
+                              else self.config.mode)
+            exec_roster, exec_multi = self.config.specialists, self.config.multi_specialist
+            if self._mode == "team":
+                self._team = self._form_team(question, emit)
+                exec_roster, exec_multi = self._team, True
+                design = self._team_meeting(
+                    question,
+                    "How should we carry out what this request asks for? Propose how to do the "
+                    "requested analysis on THIS data, the key pitfalls to avoid, and how to validate "
+                    "the result. Stay inside the request: an analysis the user did not ask for is a "
+                    "suggestion for a later message, not part of this plan.",
+                    self._team, "design", emit)
+                self._guidance = ((self._guidance + "\n\n") if self._guidance else "") + \
+                    ("Team design-meeting synthesis (how to carry out the request — it does not "
+                     "widen it):\n") + design
+
+            # PI node. In plan mode the PI may ask a clarifying question first; without it,
+            # force a straight agenda (there is no one to answer a clarify).
+            if (early := _cancelled_before_plan()) is not None:
+                return early
+            # In plan mode the reviewed agenda is presented below; streaming the draft as well
+            # repeats the same plan card when review leaves it unchanged.
+            def draft_event(ev: dict[str, Any]) -> None:
+                if plan_review is None or ev.get("type") != "pi_agenda":
+                    emit(ev)
+
+            kind, payload = self._pi_plan(question, draft_event, allow_clarify=plan_review is not None)
+            if kind == "failed":
+                emit({"type": "plan_failed", "reason": payload})
+                return LabResult(question, [], [], False, 0, str(payload))
+            # PI<->Critic review runs BEFORE the plan reaches the human, not instead of it. The old
+            # condition skipped the review whenever a human was curating ("their decision wins") —
+            # and "Plan first" is checked by default, so on the path almost every real run takes, the
+            # only thing that ever read a plan back was switched off. A human reviewing a plan that
+            # has already been critiqued still decides everything; they just decide with the Critic's
+            # objections in front of them instead of without them.
+            if plan_review is not None and kind == "agenda":
+                payload = self._apply_scope(self._plan_review(question, list(payload), emit), emit)
+                emit({"type": "pi_agenda", "agenda": payload})
 
         # Plan mode (human-in-the-loop): the user does NOT text-edit the plan — they
         # review it and reply in natural language; that feedback goes BACK to the PI,
@@ -4392,7 +4461,7 @@ class ResearchLab:
         #   {"action": "revise", "feedback": ...} -> re-plan with the user's notes
         #   {"action": "cancel"}                  -> abort, run nothing
         if plan_review is not None:
-            feedback_log: list[str] = []
+            feedback_log = self._plan_feedback
             reported_tooling: set[str] = set()
             while True:
                 # A Stop clicked while the PI was re-drafting (the previous loop turn's model
@@ -4404,10 +4473,13 @@ class ResearchLab:
                 # run after approval, where saying "that tool does not exist" costs the reviewer
                 # the decision they had already made. Inside the loop, so a revision that
                 # introduces a bad name is caught on the same terms as the first draft.
-                if kind == "agenda":
+                if kind == "agenda" and saved_plan_decision is None:
                     payload = self._check_plan_tooling(list(payload), emit, reported_tooling)
                     self._present_plan_document(question, list(payload), emit)
-                decision = plan_review(kind, payload) or {"action": "cancel"}
+                if saved_plan_decision is not None:
+                    decision, saved_plan_decision = saved_plan_decision, None
+                else:
+                    decision = plan_review(kind, payload) or {"action": "cancel"}
                 action = str(decision.get("action", "cancel")).lower()
                 if action == "approve" and kind == "agenda":
                     self._approve_plan_document(emit)
@@ -4531,7 +4603,7 @@ class ResearchLab:
         # labels, circular enrichment, a step nothing consumes) at its SOURCE, before any compute. Only
         # In plan mode this already ran ABOVE, before the human saw the plan; here it covers the
         # autonomous path, where nothing else ever reads the plan back.
-        if plan_review is None:
+        if plan_review is None and approved_plan is None:
             agenda = self._apply_scope(self._plan_review(question, agenda, emit), emit)
 
         # Read-back guard (deterministic). A step that only re-reads a table an earlier step wrote
@@ -6616,6 +6688,8 @@ class ResearchLab:
         parts = [f"Research question:\n{question}\n",
                  "The plan you proposed:\n"
                  + "\n".join(f"{i}. {s}" for i, s in enumerate(agenda, 1)) + "\n"]
+        if self._plan_doc is not None:
+            parts.append("The current plan document and its settings:\n" + self._plan_doc.to_yaml())
         if self._guidance:
             parts.append(f"The research-path guidance you followed:\n{self._guidance}\n")
         ctx = self._dataset_context()

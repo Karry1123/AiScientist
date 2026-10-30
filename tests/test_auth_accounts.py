@@ -422,3 +422,40 @@ def test_an_interrupted_run_keeps_a_summary_it_already_had(app_ctx):
     assert row["status"] == "interrupted"
     with session_scope() as s:
         assert s.scalar(select(Run).where(Run.run_id == "run_spoke")).summary == "got to step 4"
+
+
+def test_a_saved_plan_waiting_for_review_survives_the_startup_sweep(app_ctx):
+    client, _auth, routes, _db = app_ctx
+    _login(client, "root", "rootpass1")
+    uid = client.get("/api/auth/me").json()["user"]["id"]
+    routes.record_run_start(uid, "run_waiting", "review this plan", plan_mode=True)
+    from aiscientist.gateway.db import session_scope
+    from aiscientist.gateway.models import Run
+    from sqlalchemy import select
+    with session_scope() as s:
+        row = s.scalar(select(Run).where(Run.run_id == "run_waiting"))
+        row.status = "awaiting_plan"
+        s.commit()
+
+    assert routes.mark_interrupted_runs() == 0
+    with session_scope() as s:
+        row = s.scalar(select(Run).where(Run.run_id == "run_waiting"))
+        assert row.status == "awaiting_plan"
+        assert row.finished_at is None
+
+
+@pytest.mark.parametrize("status", ["awaiting_plan", "running"])
+def test_unfinished_run_statuses_clear_the_finish_timestamp(app_ctx, status):
+    client, _auth, routes, _db = app_ctx
+    _login(client, "root", "rootpass1")
+    uid = client.get("/api/auth/me").json()["user"]["id"]
+    routes.record_run_start(uid, "run_reopened", "review", plan_mode=True)
+    routes.record_run_finish("run_reopened", "done")
+    routes.record_run_finish("run_reopened", status)
+    from aiscientist.gateway.db import session_scope
+    from aiscientist.gateway.models import Run
+    from sqlalchemy import select
+    with session_scope() as s:
+        row = s.scalar(select(Run).where(Run.run_id == "run_reopened"))
+        assert row.status == status
+        assert row.finished_at is None

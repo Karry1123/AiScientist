@@ -425,3 +425,87 @@ def test_a_turn_without_a_plan_times_from_when_the_question_was_sent():
 """, working=True)
     assert out["start"] == 1000
     assert "7s" in out["text"]
+
+
+def test_saved_plan_waits_without_a_running_stream_and_survives_replay():
+    out = _run("""
+  api.handleWsMessage({ type: "chat_start", conversation_id: "A", run_id: "r1" });
+  api.handleWsMessage(plan({ saved: true }));
+  api.notePlanDraft(EDIT);
+  out.runningWhenShown = A().running;
+  api.handleWsMessage({ type: "chat_stopped", conversation_id: "A", run_id: "r1", awaiting_plan: true });
+  out.waiting = { pending: A().planPending, running: A().running, run: A().run, draft: A().planDraftYaml };
+  reload(); A().owned = false;
+  api.handleWsMessage(plan({ saved: true }));
+  out.replayed = { pending: A().planPending, saved: A().plan.saved, running: A().running, draft: A().planDraftYaml };
+  out.stoppedToasts = log.filter((x) => x.includes("Run stopped"));
+""")
+    assert out["runningWhenShown"] is False
+    assert out["waiting"]["pending"] is True and out["waiting"]["running"] is False
+    assert out["waiting"]["run"] is None and "resolution: 0.8" in out["waiting"]["draft"]
+    assert out["replayed"] == {"pending": True, "saved": True, "running": False, "draft": out["waiting"]["draft"]}
+    assert out["stoppedToasts"] == []
+
+
+@pytest.mark.parametrize("status", ["stale", "not_delivered"])
+def test_a_reply_without_a_saved_plan_says_not_delivered(status):
+    out = _run("""
+  api.handleWsMessage(plan({ saved: true }));
+  sandbox.fetch = async (url, options) => {
+    out.request = JSON.parse(options.body);
+    return { ok: true, json: async () => ({ status: STATUS, message: "The plan was cancelled." }) };
+  };
+  await api.submitPlan("revise", "raise the mitochondrial limit to 25");
+  out.toasts = log.filter((x) => x.startsWith("toast:"));
+  out.status = A().answered.status;
+""".replace("STATUS", json.dumps(status)))
+    assert out["request"]["run_id"] == "r1"
+    assert out["toasts"] == ["toast:Not delivered: The plan was cancelled."]
+    assert out["status"] == "Not delivered: The plan was cancelled."
+
+
+def test_saved_clarify_replays_in_a_new_browser_without_a_running_slot():
+    out = _run("""
+  A().owned = false;
+  api.handleWsMessage({ type: "plan_clarify", saved: true, conversation_id: "A", run_id: "r1", questions: [{ question: "Which tissue?" }] });
+  api.handleWsMessage({ type: "chat_stopped", conversation_id: "A", run_id: "r1", awaiting_plan: true });
+  out.pending = A().planPending; out.kind = A().plan.kind; out.running = A().running; out.draws = draws();
+""")
+    assert out == {"pending": True, "kind": "clarify", "running": False, "draws": ["draw:clarify"]}
+
+
+@pytest.mark.parametrize("action", ["approve", "edit", "revise"])
+def test_a_refused_saved_plan_remains_retryable_with_the_editor_draft(action):
+    out = _run("""
+  api.handleWsMessage(plan({ saved: true }));
+  api.notePlanDraft(EDIT); api.notePlanEditorOpen(true);
+  sandbox.fetch = async () => ({ ok: false, json: async () => ({ error: "Not delivered: No run slot is available." }) });
+  await api.submitPlan(ACTION, "raise the limit", EDIT);
+  out.pending = A().planPending; out.yaml = A().planDraftYaml; out.open = A().planEditorOpen;
+  out.saved = log.filter((x) => x.startsWith("saved:"));
+  out.toasts = log.filter((x) => x.startsWith("toast:"));
+""".replace("ACTION", json.dumps(action)))
+    assert out["pending"] is True and out["open"] is True
+    assert "resolution: 0.8" in out["yaml"]
+    assert out["saved"] == []
+    assert out["toasts"] == ["toast:Not delivered: No run slot is available."]
+
+
+def test_saved_plan_approval_can_confirm_the_budget_and_retry():
+    out = _run("""
+  api.handleWsMessage(plan({ saved: true }));
+  out.requests = []; sandbox.userTz = () => "America/Los_Angeles";
+  sandbox.confirm = () => true;
+  sandbox.fetch = async (url, options) => {
+    out.requests.push(JSON.parse(options.body));
+    return out.requests.length === 1
+      ? { ok: false, json: async () => ({ needs_budget_confirm: true, error: "Budget reached." }) }
+      : { ok: true, json: async () => ({ status: "ok" }) };
+  };
+  await api.submitPlan("approve");
+  out.saved = log.filter((x) => x.startsWith("saved:"));
+""")
+    assert len(out["requests"]) == 2
+    assert out["requests"][1]["budget_ack"] is True
+    assert out["requests"][1]["tz"] == "America/Los_Angeles"
+    assert out["saved"] == ["saved:A"]

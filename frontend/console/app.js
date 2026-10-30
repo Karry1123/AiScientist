@@ -1409,11 +1409,17 @@ function renderContextMeter(msg) {
 function hideContextMeter() { const el = $("ctxMeter"); if (el) el.classList.add("hidden"); }
 
 function finishAssistantStream(c) {
+  finishAssistantTurn(c, false);
+}
+
+// awaitingPlan: the turn ended because its plan was saved and is waiting (a saved plan holds no
+// run): its card, and any draft typed into its editor, stay.
+function finishAssistantTurn(c, awaitingPlan) {
   // The run is over, so nothing of it can still be waiting for an answer. A run that ended while its
   // card waited may send no plan_done: without this its card would be drawn again on every switch of chats.
-  if (c.plan || c.planPending) { if (chatVisible(c)) removePlanCard(); hidePlanPanel(c); }
+  if (!awaitingPlan && (c.plan || c.planPending)) { if (chatVisible(c)) removePlanCard(); hidePlanPanel(c); }
   if (c.confirm) closeConfirm(c, "The run ended — this request is no longer waiting.");
-  dropPlanDraft(c);
+  if (!awaitingPlan) dropPlanDraft(c);
   if (!c.run) { saveRunOwners(); return; }
   const run = c.run;
   // Persist the finished report to the chat that ran it (which may no longer be active), and
@@ -2972,6 +2978,13 @@ const RUN_SCOPED = new Set([...STREAM_TYPES,
 // follow-up question comes before its run starts).
 function chatForEvent(msg) {
   if (msg.conversation_id) {
+    // Saved plans belong to the account's chat, including on a new browser after a restart.
+    if ((msg.type === "plan_prompt" || msg.type === "plan_clarify") && msg.saved
+        && state.sessions.some((s) => String(s.id) === String(msg.conversation_id))) {
+      const c = chatOf(String(msg.conversation_id));
+      c.owned = true;
+      return c;
+    }
     const c = chats.get(String(msg.conversation_id));
     return c && c.owned ? c : null;
   }
@@ -3035,6 +3048,10 @@ function handleRunEvent(c, msg) {
       break;
     case "chat_done": finishAssistantStream(c); setChatRunning(c, false); renderChatUsage(); checkBudgetNotices(); break;
     case "chat_stopped":
+      if (msg.awaiting_plan) {
+        finishAssistantTurn(c, true); setChatRunning(c, false);
+        break;
+      }
       if (c.run && !c.run.text) c.run.text = "_⏹ Stopped._";
       finishAssistantStream(c); setChatRunning(c, false);
       toast(chatVisible(c) ? "Run stopped — compute released." : `Run stopped in “${chatTitle(c.sid)}”.`); break;
@@ -3050,10 +3067,13 @@ function handleRunEvent(c, msg) {
     // The three prompts that wait for the user are held in the chat's record first and drawn from
     // there (holdPlanPrompt): only into their own chat, and again whenever that chat is rebuilt.
     case "plan_prompt":
+      if (msg.saved) setChatRunning(c, false);
       holdPlanPrompt(c, "plan", { agenda: msg.agenda || [], doc: msg.plan || null, problems: msg.problems || [],
                                     estimate: msg.estimate || null }, msg);
       break;
-    case "plan_clarify": holdPlanPrompt(c, "clarify", { questions: msg.questions || [] }, msg); break;
+    case "plan_clarify":
+      if (msg.saved) setChatRunning(c, false);
+      holdPlanPrompt(c, "clarify", { questions: msg.questions || [] }, msg); break;
     case "decision_prompt": holdPlanPrompt(c, "decision", { goal: msg.goal || "", options: msg.options || [] }, msg); break;
     case "plan_done": hidePlanPanel(c); break;
     case "plan_status": if (chatVisible(c)) setPlanStatus(msg.text); break;
@@ -3747,7 +3767,7 @@ async function sendChat(e) {
   if (state.status !== "ready") { toast("Connect to HPC3 first."); return; }
   // The session's limit on runs at once, checked here before the question is saved to the chat: the
   // server refuses it anyway (and has the last word — runs started from another window count too).
-  const inFlight = [...chats.values()].filter((x) => x.running || x.planPending).length;
+  const inFlight = [...chats.values()].filter((x) => x.running || (x.planPending && !(x.plan && x.plan.saved))).length;
   if (state.maxRuns && inFlight >= state.maxRuns) {
     toast(`${inFlight} chats already have a run in progress on this session (at most ${state.maxRuns} at once). Wait for one to finish, or stop one, then send this again.`);
     return;
@@ -3845,6 +3865,7 @@ function planPromptVisible(c = activeChat()) {
 function holdPlanPrompt(c, kind, payload, msg) {
   const held = c.plan;
   const next = { kind, sid: c.sid, run: (msg && msg.run_id) || null, ...payload };
+  if (msg && msg.saved) next.saved = true;
   if (kind === "plan") {
     // The server sends a pending plan again whenever a socket subscribes (a reconnect, a reload),
     // without the `revised` marks: a plan that is repeated keeps the ones it first came with.
@@ -4983,18 +5004,20 @@ async function submitDecision(choice, c = activeChat()) {
   } catch (err) { toast("Failed to send decision: " + err.message); }
 }
 
-// /api/lab/plan answers {status: "stale"} when no run of this chat is waiting for the answer any
-// more (it ended, or the gateway restarted): the answer went nowhere.
+// /api/lab/plan answers {status: "not_delivered"} (older gateways: "stale") when neither a run of
+// this chat nor a saved plan is waiting for the answer any more: the answer went nowhere.
 async function planAnswerStale(res) {
   if (!res || !res.ok) return false;
   const body = await res.json().catch(() => null);
-  return !!body && body.status === "stale";
+  return !!body && (body.status === "not_delivered" || body.status === "stale");
 }
 
 // Said on the card and in the chat, and the chat stops showing a run: without this the card kept
-// "Sent to the PI — reading your reply…" for good, waiting for a run that was gone.
-function planNotDelivered(c) {
-  const text = "Not delivered — this chat's run is no longer waiting for an answer. Send your request again.";
+// "Sent to the PI — reading your reply…" for good, waiting for a run that was gone. `message`: the
+// server's own wording, when it gave one.
+function planNotDelivered(c, message) {
+  const text = !message ? "Not delivered — this chat's run is no longer waiting for an answer. Send your request again."
+    : /^Not delivered\b/i.test(message) ? message : "Not delivered: " + message;
   if (c.answered) c.answered.status = text;
   if (chatVisible(c) && state.planStatusEl && state.planStatusEl.isConnected) state.planStatusEl.textContent = text;
   if (c.running) { finishAssistantStream(c); setChatRunning(c, false); }
@@ -5082,6 +5105,13 @@ async function submitPlan(action, feedback, planYaml, c = activeChat()) {
   if (!state.connectionId || !c) return;
   // The approved document is saved with the plan: it is what the run was held to.
   const plan = c.plan || {};
+  const draft = { planDraftYaml: action === "edit" ? (planYaml || "") : c.planDraftYaml,
+                  planDraftBase: c.planDraftBase, planEditorOpen: c.planEditorOpen };
+  const restore = () => {
+    if (!plan.saved || c.plan) return;
+    Object.assign(c, draft);
+    holdPlanPrompt(c, plan.kind, plan, { run_id: plan.run, saved: true, revised: plan.revised });
+  };
   const savedPlan = (plan.agenda && plan.agenda.length) ? planSavedMessage(plan) : null;
   // An edit that is sent stays as the draft until the server answers: refused, it comes back in the
   // editor. A reply in words leaves the draft alone too — the PI may answer a question and send the
@@ -5091,7 +5121,7 @@ async function submitPlan(action, feedback, planYaml, c = activeChat()) {
   else if (action !== "revise") dropPlanDraft(c);
   if (action === "approve") {
     if (c.run) { c.run.startedAt = Date.now(); c.run.statusLabel = ""; }
-    finalizePlanCard("▶ Approved — running…", savedPlan, c);
+    finalizePlanCard(plan.saved ? "Submitting approval…" : "▶ Approved — running…", plan.saved ? null : savedPlan, c);
     // Re-anchor the live bubble below the just-approved plan so the run's activity
     // (reasoning / running code / report) streams in AFTER it, where the user is looking.
     if (chatVisible(c)) { mountStream(); repaintWorking(); }
@@ -5108,17 +5138,47 @@ async function submitPlan(action, feedback, planYaml, c = activeChat()) {
   if (chatVisible(c)) repaintWorking();
   updateComposerButton();
   try {
-    const res = await fetch("/api/lab/plan", {
+    const body = { connection_id: state.connectionId, conversation_id: c.sid, run_id: plan.run || "", action, feedback: feedback || "",
+                   plan_yaml: action === "edit" || action === "revise" ? (planYaml || "") : "",
+                   tz: typeof userTz === "function" ? userTz() : "" };
+    const postPlan = () => fetch("/api/lab/plan", {
       method: "POST", headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ connection_id: state.connectionId, conversation_id: c.sid, action, feedback: feedback || "",
-                             plan_yaml: action === "edit" || action === "revise" ? (planYaml || "") : "" }),
+      body: JSON.stringify(body),
     });
-    if (action !== "cancel" && await planAnswerStale(res)) { planNotDelivered(c); return; }
+    let res = await postPlan();
+    let reply = await res.json().catch(() => ({}));
+    if (!res.ok && reply.needs_budget_confirm
+        && confirm(`${reply.error}\n\nThe figure is an estimate; the Claude Console has the actual spend.`)) {
+      body.budget_ack = true;
+      res = await postPlan();
+      reply = await res.json().catch(() => ({}));
+    }
+    // No plan of this chat is waiting any more (it ended, or was answered elsewhere): the answer
+    // went nowhere. A Cancel of such a card has nothing left to cancel.
+    if (res.ok && (reply.status === "not_delivered" || reply.status === "stale")) {
+      if (action !== "cancel") planNotDelivered(c, reply.message);
+      return;
+    }
+    // Refused (the run limit, the budget, a plan already being handled): the card and the
+    // editor's draft come back, so the answer can be sent again.
+    if (!res.ok) {
+      const message = reply.message || reply.error || `The server refused the answer (${res.status}).`;
+      const note = /^Not delivered\b/i.test(message) ? message : "Not delivered: " + message;
+      restore();
+      if (chatVisible(c)) setPlanStatus(note);
+      else if (c.answered) c.answered.status = note;
+      toast(note);
+      return;
+    }
+    if (action === "approve" && plan.saved && savedPlan) pushToSession(c.sid, savedPlan);
     if (action === "approve") toast("Plan approved — running…");
     else if (action === "cancel") toast("Plan cancelled.");
     else if (action === "edit") toast("Edit sent — checking it…");
     else toast("Sent to the PI — re-planning…");
-  } catch (err) { toast(isUnreachable(err) ? "Can't reach the local server." : "Plan submit failed: " + err.message); }
+  } catch (err) {
+    restore();
+    toast(isUnreachable(err) ? "Can't reach the local server." : "Plan submit failed: " + err.message);
+  }
 }
 
 // ---- uploads ------------------------------------------------------------------------------------

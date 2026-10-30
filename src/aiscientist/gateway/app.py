@@ -6877,6 +6877,8 @@ class PlanReviewRequest(BaseModel):
     # Back-compat: older clients sent {approved, agenda}. `approved=False` maps to cancel.
     approved: bool | None = None
     agenda: list[str] = []
+    budget_ack: bool = False
+    tz: str | None = None
 
 
 @app.post("/api/upload")
@@ -8425,7 +8427,7 @@ async def _dispatch_lab(conn: Connection, req: LabRequest) -> None:
         # waiting at its plan card. Ending it left that run waiting with no way to reach it.
         conn.end_run(run)
         current = conn._context_run()
-        if current is not None and current is not run:
+        if current is not None and current is not run and current.conversation_id == req.conversation_id:
             conn.end_run(current)
 
 
@@ -10554,6 +10556,105 @@ def _prepare_continue(connection_id: str, conn: Connection, run_id: str, art: Pa
 _PLAN_YAML_MAX_CHARS = 200_000
 
 
+class _PlanSaved(Exception):
+    """The review is durable; leave the worker rather than wait for a browser."""
+
+
+_SAVED_PLAN_TASKS: set[Path] = set()
+
+
+def _saved_plan_candidates(conn: Connection):
+    """Waiting plans in this account's workspace, newest first (also after a restart).
+
+    A run folder removed meanwhile, or a version that cannot be read (edited by hand into YAML that
+    does not parse), is skipped: one bad file must not take the account's socket or replies with
+    it. Only the plans whose pointer says they wait are read."""
+    from . import saved_plans
+
+    pointers = []
+    for pointer in conn.workspace.glob("*/artifacts/plan/current.json"):
+        try:
+            pointers.append((pointer.stat().st_mtime_ns, pointer))
+        except OSError:
+            continue
+    for _mtime, pointer in sorted(pointers, reverse=True):
+        art = pointer.parent.parent
+        try:
+            if saved_plans.current_state(art) not in (None, "shown"):
+                continue
+            current = saved_plans.load(art)
+            if current is None or current["state"] != "shown":
+                continue
+            state = json.loads((art / "process" / "run_state.json").read_text(encoding="utf-8"))
+        except (OSError, ValueError) as exc:
+            print(f"[plan] saved plan of run {art.parent.name} skipped: {exc}")
+            continue
+        yield art.parent.name, art, current, state
+
+
+def _find_saved_plan(conn: Connection, run_id: str | None, conversation_id: str | None):
+    for rid, art, current, state in _saved_plan_candidates(conn):
+        if run_id and rid != run_id:
+            continue
+        if conversation_id and state.get("conversation_id") != conversation_id:
+            continue
+        return rid, art, current, state
+    return None
+
+
+def _saved_plan_replays(conn: Connection) -> list[dict[str, Any]]:
+    from . import saved_plans
+
+    prompts = []
+    seen = set()
+    for rid, art, _current, state in _saved_plan_candidates(conn):
+        cid = state.get("conversation_id")
+        if cid in seen or art in _SAVED_PLAN_TASKS:
+            continue
+        try:
+            prompt = saved_plans.build_prompt(art)
+        except (OSError, ValueError) as exc:     # e.g. a plan edited by hand into one with no steps
+            print(f"[plan] saved plan of run {rid} not shown: {exc}")
+            continue
+        seen.add(cid)
+        if prompt:
+            prompts.append({**prompt, "run_id": rid, "conversation_id": cid, "saved": True})
+    return prompts
+
+
+async def _continue_saved_plan(conn: Connection, req: LabRequest, run_id: str,
+                               state: dict, decision: dict, version: int) -> None:
+    art = conn.workspace / run_id / "artifacts"
+    try:
+        await _run_lab(conn, req, resume_run_id=run_id, saved_state=state,
+                       saved_decision=decision)
+    finally:
+        _SAVED_PLAN_TASKS.discard(art)
+        _keep_saved_plan_waiting(conn, run_id, art, state, version)
+
+
+def _keep_saved_plan_waiting(conn: Connection, run_id: str, art: Path, state: dict,
+                             version: int) -> None:
+    """A reply or a Run that ended before it saved a new version or the approval (a Stop while the PI
+    redrafted, a model call that failed, data that could not be staged again) leaves the version it
+    started from as the plan. Its run row goes back to ``awaiting_plan`` and its card is shown
+    again, so the row, the file and the chat agree, and the user can answer it again or cancel it."""
+    from . import saved_plans
+
+    try:
+        current = saved_plans.load(art)
+        if current is None or current["state"] != "shown" or current["version"] != version:
+            return
+        card = saved_plans.build_prompt(art)
+    except (OSError, ValueError) as exc:
+        print(f"[plan] saved plan of run {run_id} not shown again: {exc}")
+        return
+    _finish_run_record(conn, run_id, "awaiting_plan", str(art), "Plan waiting for review.")
+    if card:
+        conn.push({**card, "run_id": run_id, "conversation_id": state.get("conversation_id"),
+                   "saved": True})
+
+
 @app.post("/api/lab/plan")
 async def lab_plan_review(req: PlanReviewRequest, request: Request) -> JSONResponse:
     """Receive the user's decision on the PI's proposed plan and unblock the lab worker
@@ -10577,8 +10678,51 @@ async def lab_plan_review(req: PlanReviewRequest, request: Request) -> JSONRespo
     # session. A decision that names a run that isn't active (a stale plan card from a finished run) is
     # a no-op. No identifiers (older client) → the active run.
     target = conn.resolve_run(req.run_id, req.conversation_id)
+    # In-run decisions still have a waiting worker. Initial plan review has no live scope. A saved
+    # plan is found only by its run or its chat: a decision that names neither (an older client)
+    # must not land on whichever chat's plan was saved last.
+    saved = (_find_saved_plan(conn, req.run_id, req.conversation_id)
+             if (req.run_id or req.conversation_id) else None)
+    if saved is not None and (target is None or target.pending_plan is None):
+        from . import saved_plans
+
+        run_id, art, current, state = saved
+        if art in _SAVED_PLAN_TASKS:
+            return JSONResponse({"error": "This plan is already being processed."}, status_code=409)
+        decision = {"action": action, "feedback": (req.feedback or "").strip(),
+                    **({"plan_yaml": req.plan_yaml} if carries_doc else {})}
+        if action == "cancel":
+            saved_plans.save(art, current["yaml"], source=current["source"], state="cancelled",
+                             kind=current["kind"], payload=current.get("payload"))
+            _finish_run_record(conn, run_id, "cancelled", str(art), "Plan cancelled.")
+            conn.push({"type": "plan_done", "run_id": run_id,
+                       "conversation_id": state.get("conversation_id")})
+            return JSONResponse({"status": "ok", "action": action})
+        if conn.status != "ready" or conn.executor is None:
+            return JSONResponse({"error": f"Connection is not ready (status={conn.status})."}, status_code=409)
+        refused = _run_slot_refusal(conn, state.get("conversation_id"))
+        if refused is None:
+            refused = _budget_refusal(conn, req.budget_ack, req.tz)
+        if refused is not None:
+            return refused
+        if action == "approve" and current["kind"] == "clarify":
+            return JSONResponse({"error": "Answer the PI's question before running."}, status_code=409)
+        options = dict(state.get("run_options") or {})
+        options.update(connection_id=conn.id, conversation_id=state.get("conversation_id"),
+                       question=state.get("question", ""))
+        cont_req = LabRequest(**options)
+        # The task loads the current document again, rather than using a copy from the card.
+        _SAVED_PLAN_TASKS.add(art)
+        # The budget answer goes with the run, as for /api/lab and /api/lab/continue: the in-run
+        # check (key_guard) does not ask again what the user just confirmed.
+        _note_budget_choice(conn.begin_run(state.get("conversation_id"), run_id=run_id), req)
+        conn.push({"type": "plan_done"})
+        asyncio.create_task(_continue_saved_plan(conn, cont_req, run_id, state, decision,
+                                                 current["version"]))
+        return JSONResponse({"status": "ok", "action": action, "run_id": run_id})
     if target is None:
-        return JSONResponse({"status": "stale", "action": "ignored"})
+        return JSONResponse({"status": "not_delivered", "action": "ignored",
+                             "message": "Not delivered: no saved plan was found for this chat."})
     target.plan_value = {"action": action, "feedback": (req.feedback or "").strip(),
                          **({"plan_yaml": req.plan_yaml} if carries_doc else {})}
     target.pending_plan = None
@@ -12213,7 +12357,7 @@ def _write_run_state(art: Path, result: Any, guidance: str | None, decisions: di
                      execution: dict[str, Any] | None = None,
                      protocols: "list[dict[str, str]] | None" = None,
                      self_sourced: str = "",
-                     extra: "dict[str, Any] | None" = None) -> None:
+                     extra: "dict[str, Any] | None" = None, *, strict: bool = False) -> None:
     """Persist everything an A2 resume needs — the agenda + accepted rounds (via ``result.to_dict``)
     plus the resolved skill ``guidance`` and the dataset pointers — to
     ``artifacts/process/run_state.json``. A future ``/api/lab/continue`` loads this to re-enter the
@@ -12227,6 +12371,8 @@ def _write_run_state(art: Path, result: Any, guidance: str | None, decisions: di
     try:
         state = result.to_dict()
         state["guidance"] = guidance
+        state["decisions"] = decisions
+        state["session_meta"] = dict(extra or {})
         # The protocol's IDENTITY, alongside its text. `guidance` is the prompt body, which
         # answers "what was it told" but not "which protocol was this" — and the protocol
         # files get edited, so the text alone cannot be traced back to a version later.
@@ -12261,8 +12407,11 @@ def _write_run_state(art: Path, result: Any, guidance: str | None, decisions: di
                 state[key] = value
         p = art / "process" / "run_state.json"
         p.parent.mkdir(parents=True, exist_ok=True)
-        p.write_text(json.dumps(state, default=str, indent=2), encoding="utf-8")
+        from .saved_plans import _write
+        _write(p, json.dumps(state, default=str, indent=2))
     except Exception as exc:  # noqa: BLE001 - best-effort resumability metadata
+        if strict:
+            raise
         print(f"[lab] run_state persist failed: {exc}")
 
 
@@ -12539,7 +12688,9 @@ async def _run_lab(conn: Connection, req: LabRequest, *,
                    resume: "ResumeState | None" = None,
                    resume_run_id: str | None = None,
                    resume_decisions: dict[str, Any] | None = None,
-                   prior: "dict | None" = None) -> None:
+                   prior: "dict | None" = None,
+                   saved_state: "dict | None" = None,
+                   saved_decision: "dict | None" = None) -> None:
     # This run's isolation scope — cancel + plan events keyed to THIS run, and its identity stamped on
     # every streamed WS event so the client demuxes it into the owning conversation bubble. The caller
     # (dispatch / continue endpoints) opened it via begin_run; a direct/legacy call gets a fresh one.
@@ -12583,7 +12734,7 @@ async def _run_lab(conn: Connection, req: LabRequest, *,
 
         # Record the run in this user's history (when logged in); updated on finish. A resume
         # keeps the SAME run row (it overwrites the same bundle), so don't insert a new one.
-        if resume is None and _AUTH_ENABLED and conn.app_user_id:
+        if resume is None and saved_state is None and _AUTH_ENABLED and conn.app_user_id:
             try:
                 auth_routes.record_run_start(conn.app_user_id, run_id, req.question, req.plan_mode,
                                              conversation_id=run.conversation_id)
@@ -12593,7 +12744,7 @@ async def _run_lab(conn: Connection, req: LabRequest, *,
         # Load the dataset (path only — the raw matrix never enters a prompt) into the
         # derived dataset_result the QC/DE tools read.
         _watch_stage(run, "data")
-        decisions: dict[str, Any] = dict(resume_decisions or {})
+        decisions: dict[str, Any] = dict((saved_state or {}).get("decisions") or resume_decisions or {})
         # The attached case note (see LabRequest.case_note): map_phenotype_to_hpo reads it from here
         # when the model doesn't pass `text` itself. A resume keeps the note it already had.
         note = _clean_case_note(req.case_note)
@@ -12613,11 +12764,11 @@ async def _run_lab(conn: Connection, req: LabRequest, *,
         # What rides into run_state.json beside the decisions: the dataset as the browser bound it
         # (the follow-up router compares the next message's against it), and, for a run that
         # continues an earlier one, which run and the conversation's work so far.
-        session_meta: dict[str, Any] = {}
-        if resume is None:
+        session_meta: dict[str, Any] = dict((saved_state or {}).get("session_meta") or {})
+        if resume is None and saved_state is None:
             session_meta["bound_primary"] = ((prior or {}).get("bound_primary")
                                              or (bound[0]["path"] if bound else ""))
-        if resume is None and bound:
+        if resume is None and saved_state is None and bound:
             # A dataset moved from HPC3 to this host is read from here, whatever path the chat
             # still holds for it.
             bound, moved = await asyncio.to_thread(_current_bound_paths, conn, bound)
@@ -12643,7 +12794,14 @@ async def _run_lab(conn: Connection, req: LabRequest, *,
                         "disconnects, or after a few days, unless saved to your data), so this run "
                         "starts from the original input and "
                         "repeats the steps the new request needs.", "warning")
-        if resume is None:
+        if saved_state is not None and prior is None:
+            # A saved plan goes on with the request it was drafted for, including the earlier run of
+            # this chat it continues (saved with the plan): the prior work the lab and the report
+            # name, and that run's HPC3 folder, which a session's cleanup keeps while this one runs.
+            prior = session_meta.get("prior") or None
+            continues_from_dataset = bool(session_meta.get("continues_from_dataset"))
+            run.continues = str((prior or {}).get("run_id") or "") or None
+        if resume is None and saved_state is None:
             # What the run reads, by UUID (its result's provenance), and what the owners' reviewed
             # Croissant metadata says about it (the planner's dataset notes).
             decisions["metadata_inputs"] = await asyncio.to_thread(
@@ -12662,14 +12820,16 @@ async def _run_lab(conn: Connection, req: LabRequest, *,
         # The bound datasets this run cannot use, and why: the planner says so instead of planning
         # around them in silence (RCHENLAB/AiScientist issue 22).
         unusable: list[dict] = []
-        if resume is None and bound:
+        if resume is None and saved_state is None and bound:
             bound, server_mirrors = await _admit_bound_paths(conn, bound, say_key, emit, unusable)
             decisions["input_name"] = _display_name(bound[0]) if bound else ""
         primary_path = bound[0]["path"] if bound else None
         primary_name = _display_name(bound[0]) if bound else ""
         # The primary's matrix as staged here from dfs3b, so describing its folder reads that copy.
         staged_matrices: dict[str, str] = {}
-        if resume is not None:
+        if saved_state is not None:
+            await _restage_server_data(conn, decisions, say_key, emit)
+        elif resume is not None:
             # Resume: reuse the prior run's decisions (dataset_path / hpc_primary / datasets already
             # staged); the redone step reads its input from the preserved checkpoint, not the raw matrix.
             # A dataset bound from the server was copied by the session that first ran this: copy it
@@ -12763,7 +12923,7 @@ async def _run_lab(conn: Connection, req: LabRequest, *,
         # so a local readable copy exists for the tools and the dfs3b path is remembered for on-HPC
         # steps, and record the whole set in decisions["datasets"]. On a resume this is already restored
         # in resume_decisions — do not re-stage.
-        if resume is None and bound:
+        if resume is None and saved_state is None and bound:
             records: list[dict] = [_primary_dataset_record(bound[0], decisions)]
             for entry in bound[1:]:
                 try:
@@ -12809,7 +12969,7 @@ async def _run_lab(conn: Connection, req: LabRequest, *,
                         say_key(f"⚠ {folder['name']}/ holds no Cell Ranger library, so CellQC "
                                 "will not QC it", "warning")
                 _folder_gists(records, folders, layout)
-        if resume is None and unusable:
+        if resume is None and saved_state is None and unusable:
             decisions["unusable_inputs"] = unusable
 
         _llm = _lab_llm(conn)
@@ -12819,7 +12979,7 @@ async def _run_lab(conn: Connection, req: LabRequest, *,
             run.monitor.model = model
         llm_remote = _llm.scientist_remote
         emit("step", "lab", f"Research lab starting (LLM: {llm_label}, model: {model}).")
-        if resume is None and (llm_remote or _llm.lab_role_remote) and _AUTH_ENABLED:
+        if resume is None and saved_state is None and (llm_remote or _llm.lab_role_remote) and _AUTH_ENABLED:
             # A rough price before anything is spent, from this user's own finished runs on the same
             # model. Said only when there are at least two to go by; never a promise.
             from . import llm_usage
@@ -12833,7 +12993,7 @@ async def _run_lab(conn: Connection, req: LabRequest, *,
         # since connect; no extra provisioning). Records each file's "what is this" and sets
         # the primary's content modality so pipeline routing (Phase B) uses CONTENT, not the extension.
         # Skipped on a resume (routing guidance is already restored). Best-effort — never fails the run.
-        if resume is None and decisions.get("datasets"):
+        if resume is None and saved_state is None and decisions.get("datasets"):
             try:
                 gists = await asyncio.to_thread(_triage_bound_datasets, conn, decisions, model)
                 for g in gists:
@@ -12941,7 +13101,12 @@ async def _run_lab(conn: Connection, req: LabRequest, *,
         # or a saved result the user bound themselves — gets it as its own checkpoints, so every
         # tool reads it as it would the output of this run's QC and clustering steps.
         _profile = decisions.get("dataset_result")
-        if resume is None and isinstance(_profile, dict) and _profile.get("handed_on"):
+        # Approving a saved plan adopts the handed-on dataset again: the run may now be in a later
+        # session, whose HPC3 folder never held the checkpoints written when the plan was drafted
+        # (the earlier session's folder goes when it disconnects). A reply only plans.
+        approving_saved = saved_state is not None and (saved_decision or {}).get("action") == "approve"
+        if (resume is None and (saved_state is None or approving_saved)
+                and isinstance(_profile, dict) and _profile.get("handed_on")):
             adopted = await _adopt_handed_on_dataset(conn, run_id, decisions, analysis_executor)
             session_meta["adopted"] = adopted
             emit("info", "lab", "Starting from a processed dataset: "
@@ -12951,7 +13116,7 @@ async def _run_lab(conn: Connection, req: LabRequest, *,
                  + (f", {adopted.get('n_labels')} cell types ({adopted.get('label_key')})"
                     if adopted.get("label_key") else "")
                  + f" — in place as {' + '.join(adopted.get('checkpoints') or [])}.")
-        elif continues_from_dataset:
+        elif continues_from_dataset and saved_state is None:
             # Bound, but the profile did not recognise it as a handed-on dataset: it is then read
             # as a plain input, and the plan must not assume the earlier steps are in it.
             continues_from_dataset = False
@@ -13479,6 +13644,19 @@ async def _run_lab(conn: Connection, req: LabRequest, *,
                                              plan_yaml=plan_yaml,
                                              context_management=context_management),
                               complete_fn=complete_fn, scientist=scientist)
+        if saved_state is not None:
+            from dataclasses import fields, replace
+            # Only the fields this code has: a plan saved before a deploy that drops one still runs.
+            known = {f.name for f in fields(LabConfig)}
+            config = {k: v for k, v in (saved_state.get("lab_config") or {}).items() if k in known}
+            if isinstance(config.get("scientist"), dict):
+                harness = {f.name for f in fields(HarnessConfig)}
+                config["scientist"] = HarnessConfig(**{k: v for k, v in config["scientist"].items()
+                                                       if k in harness})
+            if "required_skills" in config:
+                config["required_skills"] = tuple(config["required_skills"])
+            lab_obj.config = replace(lab_obj.config, **config)
+
         # manifest.json: the images this session's jobs run in and its model server (issue 29).
         from ..agents import run_manifest
         run_manifest.record_environment(ctx, conn.settings)
@@ -13606,6 +13784,8 @@ async def _run_lab(conn: Connection, req: LabRequest, *,
                 run_flags["plan_revised"] = [n for n in (ev.get("steps") or []) if isinstance(n, int)]
             elif t == "plan_edit_rejected":
                 run_flags["plan_problems"] = [str(x) for x in (ev.get("problems") or [])]
+            elif t == "plan_answer":
+                run_flags["plan_answer"] = {"question": ev.get("question"), "answer": ev.get("answer")}
             elif t == "plan_cancelled":
                 run_flags["plan_cancelled"] = True
                 run_flags["plan_timed_out"] = ev.get("reason") == "timeout"
@@ -13622,41 +13802,58 @@ async def _run_lab(conn: Connection, req: LabRequest, *,
                 # (the WS feed alone is in-memory and lost on restart). One line per call.
                 print(f"[budget] {ev}")
 
-        # Plan mode: after the PI plans, push the proposal to the UI and block (in this
-        # worker thread) until the user decides. The user does NOT edit the agenda text —
-        # they Approve / Cancel, or reply in natural language (which re-plans), and a
-        # clarify question is answered the same way. Returns the decision dict the lab
-        # negotiation loop expects.
+        def save_plan_state(agenda: list[str]) -> None:
+            from dataclasses import asdict
+
+            config = asdict(lab_obj.config)
+            config.pop("specialists", None)
+            config.pop("pinned_skills", None)
+            session_meta.update(
+                conversation_id=run.conversation_id,
+                run_options=req.model_dump(exclude={"history", "connection_id"}),
+                plan_context=lab_obj.plan_context, lab_config=config,
+                later=lab_obj.later, prior_work=lab_obj.config.prior_work,
+                prior=prior, continues_from_dataset=continues_from_dataset)
+            snapshot = SimpleNamespace(to_dict=lambda: {
+                "question": req.question, "agenda": agenda, "rounds": [],
+                "accepted_steps": 0, "converged": False, "final_answer": ""})
+            _write_run_state(art, snapshot, lab_obj.guidance, decisions,
+                             lab_obj.execution_profile, protocols=lab_obj.protocols,
+                             self_sourced=lab_obj.self_sourced, extra=session_meta, strict=True)
+
         def plan_review(kind: str, payload: Any) -> dict[str, Any]:
-            run.plan_value = None
-            run.plan_event.clear()
-            run.pending_plan = {"kind": kind, "payload": payload}
-            if kind == "clarify":
-                conn.push({"type": "plan_clarify", "questions": payload})
-                emit("step", "lab", "The PI needs a quick decision — pick an option or type your own.")
-            else:
-                prompt: dict[str, Any] = {"type": "plan_prompt", "agenda": list(payload),
-                                          "revised": list(run_flags["plan_revised"])}
-                estimate = plan_estimate(list(payload))
-                prompt["estimate"] = estimate
-                run.pending_plan["estimate"] = estimate
-                if run_flags["plan_doc"]:
-                    prompt["plan"] = run_flags["plan_doc"]
-                    prompt["problems"] = list(run_flags["plan_problems"])
-                    # Kept with the pending card so a browser that reconnects mid-review gets the
-                    # document (and the refused edit's reasons) back, not only the prose.
-                    run.pending_plan = {"kind": kind, "payload": payload, "estimate": estimate,
-                                        "plan": prompt["plan"], "problems": prompt["problems"]}
-                    run_flags["plan_problems"] = []
-                conn.push(prompt)
-                emit("step", "lab", "Plan ready — Run it, or tell the PI what to change in chat.")
-            # No time limit: a plan (or the PI's question) waits for the person — Run, Cancel, a
-            # reply, an edit, Stop, Release GPU, or the session ending. Reading a methods section and
-            # asking the PI about it takes as long as it takes. The wait is on THIS run's own event,
-            # so only an answer meant for this run (``/api/lab/plan`` resolves it by chat) ends it.
-            run.plan_event.wait()
-            run.pending_plan = None
-            return run.plan_value or {"action": "cancel"}
+            from ..agents.plan_doc import PlanDoc, PlanStep
+            from . import saved_plans
+
+            # No card is visible until both its inputs and its document are durable.
+            agenda = list(payload) if kind == "agenda" else []
+            save_plan_state(agenda)
+            doc_yaml = (run_flags["plan_doc"] or {}).get("yaml")
+            if not doc_yaml:
+                doc_yaml = PlanDoc(req.question, tuple(
+                    PlanStep(id=f"s{i}", text=text) for i, text in enumerate(agenda, 1))).to_yaml()
+            source = "draft"
+            if saved_decision:
+                source = "edit" if saved_decision["action"] == "edit" else "reply"
+            if kind == "clarify" or run_flags.get("plan_answer"):
+                source = "question"
+            # The outputs the lab expects of each step (its skill's declared outputs), which the
+            # card lists under the step: kept with the version, since only the lab can work them out.
+            step_outputs = {str(s.get("id")): {"tool": s.get("tool"), "skill": s.get("skill"),
+                                               "outputs": s["outputs"]}
+                            for s in (run_flags["plan_doc"] or {}).get("steps") or []
+                            if isinstance(s, dict) and s.get("outputs")}
+            prompt = {"revised": list(run_flags["plan_revised"]),
+                      "problems": list(run_flags["plan_problems"]),
+                      **(run_flags.get("plan_answer") or {}),
+                      "estimate": plan_estimate(agenda) if agenda else None,
+                      **({"step_outputs": step_outputs} if step_outputs else {})}
+            saved_plans.save(art, doc_yaml, source=source, kind=kind, payload=payload, prompt=prompt)
+            card = saved_plans.build_prompt(art)
+            _finish_run_record(conn, run_id, "awaiting_plan", str(art), "Plan waiting for review.")
+            conn.push({**card, "saved": True})
+            conn.push({"type": "chat_stopped", "awaiting_plan": True})
+            raise _PlanSaved()
 
         def decision_review(node: Any) -> dict[str, Any]:
             return _decision_review(conn, emit, node)
@@ -13692,6 +13889,28 @@ async def _run_lab(conn: Connection, req: LabRequest, *,
             _write_run_state(art, partial, lab_obj.guidance, decisions,
                              lab_obj.execution_profile, extra=session_meta)
 
+        saved_args: dict[str, Any] = {}
+        if saved_state is not None:
+            from ..agents.plan_doc import parse_plan_yaml
+            from . import saved_plans
+            current = saved_plans.load(art)
+            if current is None or current["state"] != "shown":
+                raise GatewayError("Not delivered: the saved plan is no longer waiting.", stage="plan")
+            doc = (parse_plan_yaml(current["yaml"], request=req.question)
+                   if current["kind"] == "agenda" else None)
+            saved_args["plan_context"] = saved_state.get("plan_context")
+            if saved_decision and saved_decision["action"] == "approve":
+                saved_plans.save(art, current["yaml"], source=current["source"], state="approved",
+                                 kind=current["kind"], payload=current.get("payload"))
+                saved_args["approved_plan"] = doc
+                want_plan_review = False
+                _finish_run_record(conn, run_id, "running", str(art), None)
+            else:
+                saved_args.update(saved_plan=doc, saved_plan_decision=saved_decision,
+                                  saved_plan_kind=current["kind"],
+                                  saved_plan_payload=current.get("payload"))
+                want_plan_review = True
+
         result = await asyncio.to_thread(
             lab_obj.run, req.question, on_event,
             plan_review if want_plan_review else None,
@@ -13699,7 +13918,7 @@ async def _run_lab(conn: Connection, req: LabRequest, *,
             resume=resume,
             decision_review=(decision_review if want_decisions else None),
             should_compact=take_compact_request,
-            checkpoint=checkpoint_run)
+            checkpoint=checkpoint_run, **saved_args)
 
         # A plan cancelled or timed-out during review — or a run that executed and accepted NOTHING —
         # has no results to write up. Rendering a report from it produced a placeholder, DATALESS
@@ -13757,7 +13976,7 @@ async def _run_lab(conn: Connection, req: LabRequest, *,
         try:
             approved_yaml = getattr(lab_obj, "approved_plan_yaml", "")
             adherence = getattr(lab_obj, "plan_adherence", None)
-            if approved_yaml:
+            if approved_yaml and not (art / "plan" / "current.json").exists():
                 (art / "report").mkdir(parents=True, exist_ok=True)
                 (art / "report" / "plan.yaml").write_text(approved_yaml, encoding="utf-8")
             if adherence:
@@ -14213,6 +14432,8 @@ async def _run_lab(conn: Connection, req: LabRequest, *,
             # Still inside the run, so its one classify call is billed and counted with the run's
             # usage (shown next, from ``finally``), and no other chat's run is charged for it.
             await asyncio.to_thread(_summarize_skill_request, skill_request, complete_fn, lab_obj)
+    except _PlanSaved:
+        return
     except GatewayError as exc:
         # Also persist to STDOUT → journal: the WS error feed is in-memory and lost on
         # restart, so without this a `journalctl` pull can't see why a run died.
@@ -18211,6 +18432,10 @@ async def ws_endpoint(websocket: WebSocket, connection_id: str) -> None:
         for replay in conn.replays():
             for payload in replay:
                 await websocket.send_json(payload)
+        # Disk is authoritative, after the old stream so its stopped/done events cannot erase
+        # the waiting card. A new Connection after a deploy has no in-memory replay at all.
+        for prompt in _saved_plan_replays(conn):
+            await websocket.send_json(prompt)
         while True:
             payload = await queue.get()
             await websocket.send_json(payload)

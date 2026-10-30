@@ -194,7 +194,7 @@ def test_plan_endpoint_ignores_a_stale_mismatched_conversation():
     # An approve tagged for a different conversation must not unblock this run's plan.
     r = client.post("/api/lab/plan", json={"connection_id": conn.id, "conversation_id": "conv-OTHER",
                                            "action": "approve"})
-    assert r.json()["status"] == "stale" and not run.plan_event.is_set()
+    assert r.json()["status"] == "not_delivered" and not run.plan_event.is_set()
     # The owning conversation's approve unblocks it.
     r = client.post("/api/lab/plan", json={"connection_id": conn.id, "conversation_id": "conv-A",
                                            "action": "approve"})
