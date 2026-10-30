@@ -162,8 +162,11 @@ def test_reply_and_edit_use_changed_disk_plan_after_restart(lab_gateway, action)
         assert card["conversation_id"] == "conv-A" and "max_pct_mt: 25" in card["plan"]["yaml"]
     options = {"conversation_id": "conv-A", "feedback": "Set min_genes to 300"}
     if action == "edit":
-        options["plan_yaml"] = saved_plans.load(art)["yaml"].replace(
-            "max_pct_mt: 25", "max_pct_mt: 25\n    min_genes: 300")
+        # The editor's text is the document the card showed; the edit adds a setting to it.
+        doc = parse_plan_yaml(saved_plans.load(art)["yaml"])
+        step = doc.steps[0]
+        options["plan_yaml"] = replace(doc, steps=(
+            replace(step, settings={**step.settings, "min_genes": 300}),)).to_yaml()
     assert _reply(restored, action, **options)["run_id"] == rid
     latest = saved_plans.load(art)
     assert latest["version"] == 2
@@ -226,3 +229,17 @@ def test_dispatch_cleanup_only_closes_its_own_scope(lab_gateway, monkeypatch):
     req = gw.LabRequest(connection_id=conn.id, question="QC", conversation_id="first-chat")
     asyncio.run(gw._dispatch_lab(conn, req))
     assert conn.live_runs == [other] and other.running
+
+
+def test_the_card_shows_the_lab_document_and_the_report_holds_no_record(lab_gateway):
+    env = lab_gateway
+    conn = env.connection()
+    rid, art, current, _ = _show(conn)
+    card = env.cards[-1]
+    # The plan document as the lab wrote it, header comments included; its record stays on disk.
+    assert card["plan"]["yaml"].startswith("# AiScientist plan.")
+    assert "_review" not in card["plan"]["yaml"]
+    assert "_review:" in (art / "plan" / current["filename"]).read_text(encoding="utf-8")
+    _reply(conn, "approve", run_id=rid)
+    report = (art / "report" / "plan.yaml").read_text(encoding="utf-8")
+    assert "_review" not in report and report == saved_plans.load(art)["yaml"]

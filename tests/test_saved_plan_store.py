@@ -26,12 +26,14 @@ def test_each_version_exists_before_its_card_and_records_its_source(tmp_path):
         record = saved_plans.save(tmp_path, PLAN, source=source,
                                   prompt={"estimate": {"minutes": 5}})
         path = tmp_path / "plan" / f"v{version:02d}.yaml"
-        assert path.read_text(encoding="utf-8") == record["yaml"]
+        # The file is the plan document followed by the version's record.
+        assert path.read_text(encoding="utf-8").startswith(record["yaml"])
+        assert record["yaml"] == PLAN and "_review" not in record["yaml"]
         assert record["source"] == source and record["state"] == "shown"
         pointer = json.loads((tmp_path / "plan" / "current.json").read_text())
         assert pointer == {"version": version, "filename": path.name}
         card = saved_plans.build_prompt(tmp_path)
-        assert card["plan"]["yaml"] == path.read_text(encoding="utf-8")
+        assert card["plan"]["yaml"] == record["yaml"]
         assert card["estimate"] == {"minutes": 5}
     assert len(list((tmp_path / "plan").glob("v*.yaml"))) == 4
 
@@ -57,7 +59,7 @@ def test_approval_writes_the_exact_approved_version_and_hides_waiting_card(tmp_p
     approved = saved_plans.save(tmp_path, saved_plans.load(tmp_path)["yaml"],
                                 source="reply", state="approved")
     assert (tmp_path / "report" / "plan.yaml").read_text(encoding="utf-8") == approved["yaml"]
-    assert (tmp_path / "plan" / "v01.yaml").read_text(encoding="utf-8") == shown["yaml"]
+    assert (tmp_path / "plan" / "v01.yaml").read_text(encoding="utf-8").startswith(shown["yaml"])
     assert saved_plans.build_prompt(tmp_path) is None
 
 
@@ -82,3 +84,40 @@ def test_pointer_cannot_escape_the_plan_folder(tmp_path):
     (folder / "current.json").write_text('{"filename": "../outside.yaml"}')
     with pytest.raises(ValueError, match="pointer"):
         saved_plans.load(tmp_path)
+
+
+def test_the_card_and_the_report_get_the_document_as_written_without_the_record(tmp_path):
+    from aiscientist.agents.plan_doc import PlanDoc, PlanStep
+
+    doc = PlanDoc("Check cells", (
+        PlanStep(id="s1", text="**QC** — Filter cells with `run_scanpy_qc`.", tool="run_scanpy_qc",
+                 settings={"max_pct_mt": 20, "batch": "no", "alpha": 1e-05}),))
+    text = doc.to_yaml()
+    saved_plans.save(tmp_path, text, source="draft", payload=doc.agenda(), prompt={"estimate": None})
+    card = saved_plans.build_prompt(tmp_path)
+    # The editor shows the document the lab wrote, its header comments included, and none of the
+    # record: what produced the version and its state stay in the version's file.
+    assert card["plan"]["yaml"] == text and "_review" not in card["plan"]["yaml"]
+    assert card["plan"]["yaml"].startswith("# AiScientist plan.")
+    version_file = (tmp_path / "plan" / "v01.yaml").read_text(encoding="utf-8")
+    assert "_review:" in version_file and "source: draft" in version_file
+    # The file is still one plan document: read whole, it is the same plan.
+    assert parse_plan_yaml(version_file) == parse_plan_yaml(text)
+    approved = saved_plans.save(tmp_path, saved_plans.load(tmp_path)["yaml"], source="draft",
+                                state="approved")
+    report = (tmp_path / "report" / "plan.yaml").read_text(encoding="utf-8")
+    assert report == text == approved["yaml"]
+
+
+def test_a_version_edited_by_hand_without_its_mark_still_loads(tmp_path):
+    saved_plans.save(tmp_path, PLAN, source="draft")
+    path = tmp_path / "plan" / "v01.yaml"
+    # Someone rewrote the file through a YAML tool: the comment line is gone, the record is a key.
+    import yaml
+    data = yaml.safe_load(path.read_text(encoding="utf-8"))
+    path.write_text(yaml.safe_dump(data, sort_keys=False), encoding="utf-8")
+    current = saved_plans.load(tmp_path)
+    assert current["source"] == "draft" and "_review" not in current["yaml"]
+    assert parse_plan_yaml(current["yaml"]).steps[0].settings == {"max_pct_mt": 20}
+    nxt = saved_plans.save(tmp_path, path.read_text(encoding="utf-8"), source="edit")
+    assert "_review" not in nxt["yaml"]
