@@ -43,6 +43,15 @@ def _write(path: Path, text: str) -> None:
             os.unlink(temporary)
 
 
+def _parse(text: str, what: str) -> Any:
+    """``text`` read as YAML; a ValueError when it does not parse (a hand edit can break it)."""
+    try:
+        return _load(text)
+    except Exception as exc:  # noqa: BLE001 - yaml.YAMLError, or no PyYAML
+        first = str(getattr(exc, "problem", None) or exc).split("\n", 1)[0]
+        raise ValueError(f"{what} does not parse: {first}") from exc
+
+
 def _document(text: str, data: Any = None) -> str:
     """The plan document of ``text`` without the record of its version. A file with no mark (edited
     by hand) that still holds a ``_review`` key is written out again without it."""
@@ -50,7 +59,7 @@ def _document(text: str, data: Any = None) -> str:
     if mark:
         return head.rstrip("\n") + "\n"
     if data is None:
-        data = _load(text)
+        data = _parse(text, "The plan")
     if isinstance(data, dict) and "_review" in data:
         import yaml
 
@@ -59,19 +68,38 @@ def _document(text: str, data: Any = None) -> str:
     return text.rstrip("\n") + "\n"
 
 
+def _pointer(folder: Path) -> dict[str, Any] | None:
+    try:
+        pointer = json.loads((folder / "current.json").read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        return None
+    if not isinstance(pointer, dict):
+        raise ValueError("Invalid saved plan pointer")
+    return pointer
+
+
+def current_state(art: Path) -> str | None:
+    """The state the pointer recorded for the current version (``shown`` …), without reading the
+    version: a scan of every run skips the plans nobody waits on. None when the pointer says none."""
+    with lock(art):
+        pointer = _pointer(Path(art) / "plan")
+    state = (pointer or {}).get("state")
+    return state if isinstance(state, str) else None
+
+
 def load(art: Path) -> dict[str, Any] | None:
-    """Read the current document afresh; edits to the file are authoritative."""
+    """Read the current document afresh; edits to the file are authoritative. Raises ValueError for
+    a version that cannot be read (a bad pointer, YAML that does not parse, no record)."""
     with lock(art):
         folder = Path(art) / "plan"
-        try:
-            pointer = json.loads((folder / "current.json").read_text(encoding="utf-8"))
-        except FileNotFoundError:
+        pointer = _pointer(folder)
+        if pointer is None:
             return None
         filename = pointer.get("filename", "")
         if not isinstance(filename, str) or not _VERSION_FILE.fullmatch(filename):
             raise ValueError("Invalid saved plan pointer")
         text = (folder / filename).read_text(encoding="utf-8")
-        data = _load(text)
+        data = _parse(text, f"Saved plan {filename}")
         if not isinstance(data, dict) or not isinstance(data.get("_review"), dict):
             raise ValueError("Saved plan has no review metadata")
         return {**data["_review"], "yaml": _document(text, data), "filename": filename}
@@ -91,7 +119,7 @@ def save(art: Path, plan_yaml: str, *, source: str, state: str = "shown",
         document = _document(plan_yaml)
     else:
         document = yaml.safe_dump({"plan": 1, "steps": []}, sort_keys=False)
-    data = _load(document)
+    data = _parse(document, "The plan")
     if not isinstance(data, dict):
         raise ValueError("Saved plan must be a YAML mapping")
     with lock(art):
@@ -107,7 +135,8 @@ def save(art: Path, plan_yaml: str, *, source: str, state: str = "shown",
         _write(folder / filename, document + _RECORD_MARK + record)
         if state == "approved":
             _write(Path(art) / "report" / "plan.yaml", document)
-        _write(folder / "current.json", json.dumps({"version": version, "filename": filename}))
+        _write(folder / "current.json", json.dumps({"version": version, "filename": filename,
+                                                    "state": state}))
         return {**metadata, "yaml": document, "filename": filename}
 
 
@@ -120,7 +149,7 @@ def build_prompt(art: Path) -> dict[str, Any] | None:
     if current["kind"] == "clarify":
         prompt.update(type="plan_clarify", questions=current.get("payload") or [])
     else:
-        data = _load(current["yaml"])
+        data = _parse(current["yaml"], "The plan")
         doc = parse_plan_yaml(current["yaml"], request=str(data.get("request") or ""))
         prompt.update(type="plan_prompt", agenda=doc.agenda(),
                       plan={"yaml": current["yaml"], "steps": doc.to_public()})

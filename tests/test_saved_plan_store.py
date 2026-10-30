@@ -31,7 +31,7 @@ def test_each_version_exists_before_its_card_and_records_its_source(tmp_path):
         assert record["yaml"] == PLAN and "_review" not in record["yaml"]
         assert record["source"] == source and record["state"] == "shown"
         pointer = json.loads((tmp_path / "plan" / "current.json").read_text())
-        assert pointer == {"version": version, "filename": path.name}
+        assert pointer == {"version": version, "filename": path.name, "state": "shown"}
         card = saved_plans.build_prompt(tmp_path)
         assert card["plan"]["yaml"] == record["yaml"]
         assert card["estimate"] == {"minutes": 5}
@@ -121,3 +121,11 @@ def test_a_version_edited_by_hand_without_its_mark_still_loads(tmp_path):
     assert parse_plan_yaml(current["yaml"]).steps[0].settings == {"max_pct_mt": 20}
     nxt = saved_plans.save(tmp_path, path.read_text(encoding="utf-8"), source="edit")
     assert "_review" not in nxt["yaml"]
+
+
+def test_a_version_that_does_not_parse_is_a_value_error(tmp_path):
+    saved_plans.save(tmp_path, PLAN, source="draft")
+    (tmp_path / "plan" / "v01.yaml").write_text("steps: [unclosed\n", encoding="utf-8")
+    with pytest.raises(ValueError, match="does not parse"):
+        saved_plans.load(tmp_path)
+    assert saved_plans.current_state(tmp_path) == "shown"

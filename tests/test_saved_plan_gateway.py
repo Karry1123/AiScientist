@@ -243,3 +243,36 @@ def test_the_card_shows_the_lab_document_and_the_report_holds_no_record(lab_gate
     _reply(conn, "approve", run_id=rid)
     report = (art / "report" / "plan.yaml").read_text(encoding="utf-8")
     assert "_review" not in report and report == saved_plans.load(art)["yaml"]
+
+
+@pytest.mark.parametrize("broken", ["steps: [unclosed\n", "plan: 1\nsteps: []\n"])
+def test_a_saved_plan_that_cannot_be_read_does_not_break_the_socket_or_a_reply(lab_gateway, broken):
+    env = lab_gateway
+    conn = env.connection()
+    rid_a, art_a, current_a, _ = _show(conn, "conv-A")
+    _show(conn, "conv-B")
+    # Chat A's version edited by hand into YAML that does not parse, or into a plan with no steps.
+    path = art_a / "plan" / current_a["filename"]
+    text = path.read_text(encoding="utf-8")
+    path.write_text(broken + text[text.index("# --- Saved by AiScientist"):], encoding="utf-8")
+    gw.CONNECTIONS.pop(conn.id)
+    restored = env.connection()
+    replays = gw._saved_plan_replays(restored)
+    assert [p["conversation_id"] for p in replays] == ["conv-B"]
+    with TestClient(gw.app).websocket_connect(f"/ws/{restored.id}") as ws:
+        assert ws.receive_json()["type"] == "status"
+        assert ws.receive_json()["conversation_id"] == "conv-B"
+    assert _reply(restored, "approve", conversation_id="conv-B")["status"] == "ok"
+
+
+def test_the_scan_reads_only_the_plans_that_wait(lab_gateway, monkeypatch):
+    env = lab_gateway
+    conn = env.connection()
+    rid, art, _, _ = _show(conn, "conv-A")
+    _show(conn, "conv-B")
+    _reply(conn, "cancel", run_id=rid)
+    loaded = []
+    real_load = saved_plans.load
+    monkeypatch.setattr(saved_plans, "load", lambda a: loaded.append(a) or real_load(a))
+    assert [p["conversation_id"] for p in gw._saved_plan_replays(conn)] == ["conv-B"]
+    assert art not in loaded

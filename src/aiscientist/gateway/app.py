@@ -10564,18 +10564,30 @@ _SAVED_PLAN_TASKS: set[Path] = set()
 
 
 def _saved_plan_candidates(conn: Connection):
-    """Waiting plans in this account's workspace, newest first (also after a restart)."""
+    """Waiting plans in this account's workspace, newest first (also after a restart).
+
+    A run folder removed meanwhile, or a version that cannot be read (edited by hand into YAML that
+    does not parse), is skipped: one bad file must not take the account's socket or replies with
+    it. Only the plans whose pointer says they wait are read."""
     from . import saved_plans
 
-    paths = list(conn.workspace.glob("*/artifacts/plan/current.json"))
-    for pointer in sorted(paths, key=lambda p: p.stat().st_mtime_ns, reverse=True):
+    pointers = []
+    for pointer in conn.workspace.glob("*/artifacts/plan/current.json"):
+        try:
+            pointers.append((pointer.stat().st_mtime_ns, pointer))
+        except OSError:
+            continue
+    for _mtime, pointer in sorted(pointers, reverse=True):
         art = pointer.parent.parent
         try:
+            if saved_plans.current_state(art) not in (None, "shown"):
+                continue
             current = saved_plans.load(art)
             if current is None or current["state"] != "shown":
                 continue
             state = json.loads((art / "process" / "run_state.json").read_text(encoding="utf-8"))
-        except (OSError, ValueError):
+        except (OSError, ValueError) as exc:
+            print(f"[plan] saved plan of run {art.parent.name} skipped: {exc}")
             continue
         yield art.parent.name, art, current, state
 
@@ -10599,8 +10611,12 @@ def _saved_plan_replays(conn: Connection) -> list[dict[str, Any]]:
         cid = state.get("conversation_id")
         if cid in seen or art in _SAVED_PLAN_TASKS:
             continue
+        try:
+            prompt = saved_plans.build_prompt(art)
+        except (OSError, ValueError) as exc:     # e.g. a plan edited by hand into one with no steps
+            print(f"[plan] saved plan of run {rid} not shown: {exc}")
+            continue
         seen.add(cid)
-        prompt = saved_plans.build_prompt(art)
         if prompt:
             prompts.append({**prompt, "run_id": rid, "conversation_id": cid, "saved": True})
     return prompts
