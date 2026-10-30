@@ -10623,13 +10623,36 @@ def _saved_plan_replays(conn: Connection) -> list[dict[str, Any]]:
 
 
 async def _continue_saved_plan(conn: Connection, req: LabRequest, run_id: str,
-                               state: dict, decision: dict) -> None:
+                               state: dict, decision: dict, version: int) -> None:
     art = conn.workspace / run_id / "artifacts"
     try:
         await _run_lab(conn, req, resume_run_id=run_id, saved_state=state,
                        saved_decision=decision)
     finally:
         _SAVED_PLAN_TASKS.discard(art)
+        _keep_saved_plan_waiting(conn, run_id, art, state, version)
+
+
+def _keep_saved_plan_waiting(conn: Connection, run_id: str, art: Path, state: dict,
+                             version: int) -> None:
+    """A reply or a Run that ended before it saved a new version or the approval (a Stop while the PI
+    redrafted, a model call that failed, data that could not be staged again) leaves the version it
+    started from as the plan. Its run row goes back to ``awaiting_plan`` and its card is shown
+    again, so the row, the file and the chat agree, and the user can answer it again or cancel it."""
+    from . import saved_plans
+
+    try:
+        current = saved_plans.load(art)
+        if current is None or current["state"] != "shown" or current["version"] != version:
+            return
+        card = saved_plans.build_prompt(art)
+    except (OSError, ValueError) as exc:
+        print(f"[plan] saved plan of run {run_id} not shown again: {exc}")
+        return
+    _finish_run_record(conn, run_id, "awaiting_plan", str(art), "Plan waiting for review.")
+    if card:
+        conn.push({**card, "run_id": run_id, "conversation_id": state.get("conversation_id"),
+                   "saved": True})
 
 
 @app.post("/api/lab/plan")
@@ -10694,7 +10717,8 @@ async def lab_plan_review(req: PlanReviewRequest, request: Request) -> JSONRespo
         # check (key_guard) does not ask again what the user just confirmed.
         _note_budget_choice(conn.begin_run(state.get("conversation_id"), run_id=run_id), req)
         conn.push({"type": "plan_done"})
-        asyncio.create_task(_continue_saved_plan(conn, cont_req, run_id, state, decision))
+        asyncio.create_task(_continue_saved_plan(conn, cont_req, run_id, state, decision,
+                                                 current["version"]))
         return JSONResponse({"status": "ok", "action": action, "run_id": run_id})
     if target is None:
         return JSONResponse({"status": "not_delivered", "action": "ignored",

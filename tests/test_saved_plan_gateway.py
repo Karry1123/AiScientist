@@ -331,3 +331,48 @@ def test_approving_a_saved_plan_keeps_the_budget_answer_on_its_run(lab_gateway, 
     _reply(conn, "approve", run_id=rid, budget_ack=True, tz="America/Los_Angeles")
     # The in-run budget check (key_guard) reads these: the user already said yes once.
     assert seen == [(True, "America/Los_Angeles")]
+
+
+@pytest.mark.parametrize("action", ["approve", "revise"])
+def test_a_reply_or_run_that_fails_before_a_new_version_leaves_the_plan_waiting(
+        lab_gateway, monkeypatch, action):
+    env = lab_gateway
+    conn = env.connection()
+    rid, art, current, _ = _show(conn)
+
+    async def unreachable(*args):
+        raise gw.GatewayError("The dataset could not be copied to HPC3 again.", stage="data")
+
+    if action == "approve":
+        monkeypatch.setattr(gw, "_restage_server_data", unreachable)
+    else:
+        def broken(self, *args, **kwargs):
+            raise RuntimeError("the model endpoint went away")
+        monkeypatch.setattr(_ResearchLab, "_revise_plan_document", broken)
+    cards = len(env.cards)
+    _reply(conn, action, run_id=rid, feedback="Set min_genes to 300")
+    # The version the reply started from is still the plan: the row, the file and the chat agree.
+    latest = saved_plans.load(art)
+    assert latest["state"] == "shown" and latest["version"] == current["version"]
+    assert env.records[-1][1:3] == (rid, "awaiting_plan")
+    assert len(env.cards) == cards + 1 and env.cards[-1]["run_id"] == rid
+    assert env.cards[-1]["conversation_id"] == "conv-A" and env.cards[-1]["saved"] is True
+    assert not conn.live_runs and not gw._SAVED_PLAN_TASKS
+    assert [p["run_id"] for p in gw._saved_plan_replays(conn)] == [rid]
+
+
+def test_stop_while_the_pi_redrafts_leaves_the_saved_plan_waiting(lab_gateway, monkeypatch):
+    env = lab_gateway
+    conn = env.connection()
+    rid, art, current, _ = _show(conn)
+
+    def stopped_midway(self, *args, **kwargs):
+        conn.active_run.chat_stop.set()          # the user pressed Stop during the PI's call
+        return None                              # no patch: the lab redrafts, and sees the Stop
+
+    monkeypatch.setattr(_ResearchLab, "_revise_plan_document", stopped_midway)
+    _reply(conn, "revise", run_id=rid, feedback="Set min_genes to 300")
+    latest = saved_plans.load(art)
+    assert latest["state"] == "shown" and latest["version"] == current["version"]
+    assert env.records[-1][1:3] == (rid, "awaiting_plan")
+    assert env.cards[-1]["run_id"] == rid and not env.calls
