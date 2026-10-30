@@ -3934,6 +3934,15 @@ class _RunCancelled(BaseException):
     """Unwind cancellation past best-effort model/tool fallbacks."""
 
 
+def _from_fields(cls: Any, data: "dict[str, Any]") -> Any:
+    """``cls(**data)`` with only the fields ``cls`` has: a plan saved before a deploy that drops a
+    field is still restored after it."""
+    from dataclasses import fields
+
+    names = {f.name for f in fields(cls)}
+    return cls(**{k: v for k, v in data.items() if k in names})
+
+
 class ResearchLab:
     """PI → Scientist → Critic loop. Roles are injectable for offline tests."""
 
@@ -4057,10 +4066,15 @@ class ResearchLab:
         self._guidance = state.get("guidance", self._guidance)
         self._scope = RunScope.from_dict(state.get("scope", {}))
         if "skills" in state:
-            self._skills = [PresetPipeline(**{**s, "tools": tuple(s.get("tools", ()))})
+            # A pipeline's declared outputs come back as DeclaredOutput, which the output checks
+            # read (``_expected_outputs``); JSON gave them back as dicts.
+            self._skills = [_from_fields(PresetPipeline, {
+                **s, "tools": tuple(s.get("tools", ())),
+                "outputs": tuple(_from_fields(skill_outputs.DeclaredOutput, o)
+                                 for o in s.get("outputs") or () if isinstance(o, dict))})
                             for s in state["skills"]]
         self._mode = str(state.get("mode") or self.config.mode)
-        self._team = tuple(Specialist(**{**s, "keywords": tuple(s.get("keywords", ()))})
+        self._team = tuple(_from_fields(Specialist, {**s, "keywords": tuple(s.get("keywords", ()))})
                            for s in state.get("team") or []) or None
         self._self_sourced = str(state.get("self_sourced") or "")
         self._later = list(state.get("later") or [])

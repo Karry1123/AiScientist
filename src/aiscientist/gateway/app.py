@@ -13645,10 +13645,14 @@ async def _run_lab(conn: Connection, req: LabRequest, *,
                                              context_management=context_management),
                               complete_fn=complete_fn, scientist=scientist)
         if saved_state is not None:
-            from dataclasses import replace
-            config = dict(saved_state.get("lab_config") or {})
+            from dataclasses import fields, replace
+            # Only the fields this code has: a plan saved before a deploy that drops one still runs.
+            known = {f.name for f in fields(LabConfig)}
+            config = {k: v for k, v in (saved_state.get("lab_config") or {}).items() if k in known}
             if isinstance(config.get("scientist"), dict):
-                config["scientist"] = HarnessConfig(**config["scientist"])
+                harness = {f.name for f in fields(HarnessConfig)}
+                config["scientist"] = HarnessConfig(**{k: v for k, v in config["scientist"].items()
+                                                       if k in harness})
             if "required_skills" in config:
                 config["required_skills"] = tuple(config["required_skills"])
             lab_obj.config = replace(lab_obj.config, **config)

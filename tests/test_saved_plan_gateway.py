@@ -408,3 +408,16 @@ def test_a_saved_plan_that_continues_an_earlier_run_keeps_it_when_approved(lab_g
     # are written again, and the earlier run is known as the one this run continues.
     _reply(conn, "approve", run_id=rid)
     assert adopted == [(rid, "earlier00001")]
+
+
+def test_a_plan_saved_before_a_deploy_that_drops_a_setting_still_runs(lab_gateway):
+    env = lab_gateway
+    conn = env.connection()
+    rid, art, _, _ = _show(conn)
+    path = art / "process" / "run_state.json"
+    state = json.loads(path.read_text(encoding="utf-8"))
+    state["lab_config"]["retired_setting"] = 1
+    state["lab_config"]["scientist"]["retired_setting"] = 1
+    path.write_text(json.dumps(state), encoding="utf-8")
+    _reply(conn, "approve", run_id=rid)
+    assert env.calls and saved_plans.load(art)["state"] == "approved"

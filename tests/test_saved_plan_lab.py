@@ -169,3 +169,22 @@ def test_saved_clarification_reuses_feedback_without_initial_planner(monkeypatch
                 saved_plan_decision={"action": "revise", "feedback": "Use 25 percent"})
     assert len(calls) == 1
     assert calls[0]["feedback"] == "Use the supplied cells\nUse 25 percent"
+
+
+def test_restored_skills_keep_their_declared_outputs():
+    from aiscientist.agents.skill_outputs import DeclaredOutput
+
+    lab = _lab([])
+    declared = DeclaredOutput(path="tables/qc_summary.csv", kind="table",
+                              description="Cells kept per sample", tool="run_scanpy_qc")
+    lab._skills = [PresetPipeline("qc", "QC", "Saved protocol", ("run_scanpy_qc",),
+                                  outputs=(declared,))]
+    context = json.loads(json.dumps(lab.plan_context))
+    # A field a later deploy no longer has must not stop the plan from being restored.
+    context["skills"][0]["retired_field"] = "x"
+    restored = _lab([])
+    restored._restore_plan_context(context)
+    assert restored._skills[0].outputs == (declared,)
+    restored._plan_doc = _doc()
+    expected, sources = restored._expected_outputs(_doc().agenda()[0])
+    assert expected == [declared] and sources == ["pipeline qc"]
