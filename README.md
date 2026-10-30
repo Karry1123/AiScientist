@@ -89,7 +89,8 @@ python3 -m pytest        # the test suite: offline, no cluster, .env or network 
 - **Configuration:** every setting is described in
   [`configs/aiscientist.example.env`](configs/aiscientist.example.env).
 - **Accounts:** `aiscientist-admin` manages users from the command line.
-- **Production:** a systemd unit on the lab server behind the Envoy ingress. The runbook is
+- **Production:** a systemd unit on the lab server behind the Envoy ingress. A deploy is a release
+  tag on RCHENLAB/AiScientist, which the server installs itself. The runbook is
   [`deploy/README.md`](deploy/README.md).
 
 ## Plan resource estimates
@@ -102,6 +103,8 @@ parallel steps may overlap.
 Set `AISCIENTIST_CPU_HOUR_RATE` and `AISCIENTIST_GPU_HOUR_RATE` in the gateway environment
 (USD per allocated hour; zero defaults mean unpriced). Tool calls, including failures, are
 recorded in the existing database; successful runs refine later estimates for the same tool.
+Each run counts once (its slowest call per unit), and a run under a fifth of the median time
+does not set the low end.
 SLURM uses allocation accounting where available; other measurements use wall time and
 requested resources and remain rough. Run API records expose `compute_usage`.
 
@@ -123,7 +126,7 @@ src/aiscientist/
   hpc/           the HPC3 shell session and its tools
 frontend/console/  the browser UI
 preset_pipelines/  protocols for the PI
-deploy/            the systemd unit, Kubernetes and Envoy config, HPC3 container definitions
+deploy/            the release scripts, the systemd units, Kubernetes and Envoy config, HPC3 container definitions
 configs/           the configuration reference
 docs/              architecture, findings, HPC3 storage and assets
 tests/             the offline test suite

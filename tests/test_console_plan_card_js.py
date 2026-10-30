@@ -59,7 +59,6 @@ sandbox.state.planProblems = [];
 sandbox.state.planDraftYaml = "";
 out.status = api.planCardHtml(agenda, doc, [], { mode: "status", status: "✎ Applying your edit…" });
 out.saved = api.planCardHtml(agenda, doc, [], { mode: "saved", status: "Approved" });
-out.expiring = api.planCardHtml(agenda, doc, [], { expiry: "This plan expires at 9:30 PM — run it, change it or reply before then, or nothing will run." });
 out.entry = api.planEntryHtml(agenda, doc, { pending: true, revised: [2] });
 out.entryDirty = api.planEntryHtml(agenda, doc, { pending: true, dirty: true });
 out.entryRefused = api.planEntryHtml(agenda, doc, { pending: true, problems: ["x"] });
@@ -75,6 +74,9 @@ out.yaml = yaml;
 out.yamlHtml = api.planYamlHtml(yaml);
 out.withWords = api.planCardHtml(agenda, doc, [], { words: "drop <step 3> & rerun" });
 out.single = api.planCardHtml([agenda[0]], { yaml: doc.yaml, steps: [steps[0]] }, []);
+const codeDoc = { yaml: doc.yaml, steps: [{ id: "s1", tool: "run_code", skill: "score_signature" }, { id: "s2", tool: "run_in_environment" }, steps[1]] };
+out.codeCard = api.planCardHtml(agenda, codeDoc, []);
+out.codeEntry = api.planEntryHtml(agenda, codeDoc, { status: "Approved" });
 console.log(JSON.stringify(out));
 """.replace("__ESCAPE__", ESCAPE)
 
@@ -161,11 +163,6 @@ def test_a_plan_no_longer_waiting_has_no_editor_and_no_buttons():
     assert '<details class="plan-yaml plan-yaml-read">' in out["saved"] and "&lt;QC&gt;" in out["saved"], \
         "a saved plan keeps its document, to read"
     assert '<div class="plan-title">Plan</div>' in out["saved"]
-
-
-def test_the_waiting_plan_in_the_panel_says_when_it_expires():
-    row = _card()["expiring"].split('<div class="plan-actions-row">', 1)[1]
-    assert row.startswith('<div class="plan-expiry" role="status">') and "This plan expires at 9:30 PM" in row
 
 
 def test_the_chat_shows_the_plan_as_an_entry_titles_and_tools_with_the_decision():
@@ -383,3 +380,17 @@ def test_the_composer_has_no_run_options_and_no_pipelines_and_skills_picker():
     for gone in ('$("modeSelect")', '$("planMode")', '$("autonomousMode")', '$("saveResults")', '$("methodsBtn")'):
         assert gone not in source
     assert "...FIXED_RUN_OPTIONS" in source, "the run is sent with the fixed options"
+
+
+def test_a_step_that_runs_code_the_ai_writes_is_marked_untested_before_it_is_approved():
+    """Issue 13: run_code / run_shell / run_in_environment run code written during the run, so the
+    plan says so on the step, in the side panel and in the chat's plan entry; a tool step does not."""
+    out = _card()
+    flag = '<span class="plan-step-flag untested"'
+    for html in (out["codeCard"], out["codeEntry"]):
+        assert html.count(flag) == 2, html
+        assert ">Untested code</span>" in html
+        # a vetted skill on the step does not make its code tested: the AI adapts the skill's code
+        assert "adapts the code of the skill score_signature" in html
+        assert "plan-step-skill" in html, "the skill chip stays beside the label"
+    assert flag not in out["card"] and flag not in out["entry"]

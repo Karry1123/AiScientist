@@ -1,6 +1,6 @@
 [project]
 name = "aiscientist"
-version = "0.2.0"
+version = "0.4.1"
 description = "AiScientist — a privacy-first, DAG-planned multi-agent bioinformatics research console (UCI HPC3 + vLLM) for single-cell / ocular biology workflows."
 requires-python = ">=3.10"
 dependencies = [
@@ -63,6 +63,13 @@ biomni = [
 # LLM is pointed at the session's local Qwen vLLM endpoint (no cloud model).
 literature = [
   "paper-qa[local]>=5",
+]
+# The Eye Server copy of the RetiGene index (gateway/local_corpus.py): a search embeds its queries with
+# PubMedBERT on the gateway's CPU instead of a Slurm job on HPC3. Install torch from the CPU index
+# first (deploy/deploy_release.sh does), or pip pulls the CUDA build and its NVIDIA libraries, which
+# this server never uses. Without this extra the searches run on HPC3.
+corpus = [
+  "sentence-transformers>=3",
 ]
 # Single-cell analysis stack for the run_code (CodeAct) sandbox + the analysis line
 # (real scanpy QC/cluster/DE + gseapy enrichment + matplotlib figures). Eye-server

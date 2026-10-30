@@ -13,7 +13,10 @@ module removes such originals, explicitly and in two steps, each a Slurm job of
              remove, and that are still candidates now, go to a second job, which checks each one
              again before removing it
     settle   the job's log says what was removed; each dataset's ``source.json`` records it, so
-             the next check does not list it again
+             the next check does not list it again. Every plan with a job still queued is settled,
+             not only the newest: a Check made right after a Remove must not leave that removal
+             unrecorded. An original a job found already gone ("not there") is recorded the same
+             way when its server copy is complete.
 
 What is never removed: anything outside the session's own HPC3 uploads folder
 (``<shared root>/uploads/<user>/``); an original copied by another HPC3 account; one whose server
@@ -177,13 +180,14 @@ def manifest(entries: Iterable[dict]) -> str:
 
 # --- the job --------------------------------------------------------------------------------------
 
-def remote_paths(shared_root: str, user: str, plan_id: str, phase: str) -> dict:
-    """Where a plan's files go on HPC3, under ``<shared root>/bin/<user>/``."""
-    bin_dir = f"{shared_root.rstrip('/')}/bin/{user}"
-    return {"bin": bin_dir, "script": f"{bin_dir}/{SCRIPT_NAME}",
-            "dir": f"{bin_dir}/originals",
-            "manifest": f"{bin_dir}/originals/{plan_id}.{phase}.tsv",
-            "log": f"{bin_dir}/originals/{plan_id}.{phase}.log"}
+def remote_paths(session_dir: str, plan_id: str, phase: str) -> dict:
+    """Where a plan's files go on HPC3: the script in the session's ``scripts/``, what each phase
+    was given and said in ``logs/originals/`` (``hpc_layout``). The plan keeps each job's log path,
+    so a Remove in a later session still settles its Check."""
+    base = session_dir.rstrip("/")
+    logs = f"{base}/logs/originals"
+    return {"bin": f"{base}/scripts", "script": f"{base}/scripts/{SCRIPT_NAME}", "dir": logs,
+            "manifest": f"{logs}/{plan_id}.{phase}.tsv", "log": f"{logs}/{plan_id}.{phase}.log"}
 
 
 def command(script: str, shared_root: str, user: str, manifest_path: str, *,
@@ -210,12 +214,12 @@ def job_spec(payload: str, user: str, log_path: str, submit_dir: str, *,
     return SlurmJobSpec(script="\n".join(lines), job_name=f"{JOB_PREFIX}{user}", submit_dir=submit_dir)
 
 
-def stage(executor: Any, shared_root: str, user: str, plan_id: str, phase: str,
+def stage(executor: Any, session_dir: str, plan_id: str, phase: str,
           entries: Iterable[dict]) -> dict:
     """Put the script and this phase's manifest on HPC3 (through the transfer host); returns the
     remote paths."""
-    paths = remote_paths(shared_root, user, plan_id, phase)
-    executor.exec(f"mkdir -p {shlex.quote(paths['dir'])}", timeout=30)
+    paths = remote_paths(session_dir, plan_id, phase)
+    executor.exec(f"mkdir -p {shlex.quote(paths['dir'])} {shlex.quote(paths['bin'])}", timeout=30)
     executor.put_file(str(SCRIPT_SRC), paths["script"])
     fd, local = tempfile.mkstemp(prefix="originals-", suffix=".tsv")
     try:
@@ -228,10 +232,11 @@ def stage(executor: Any, shared_root: str, user: str, plan_id: str, phase: str,
 
 
 def submit(backend: Any, executor: Any, plan: dict, phase: str, entries: list[dict], *,
-           shared_root: str, partition: str, account: str = "", personal_dir: str = "") -> dict:
+           shared_root: str, session_dir: str, partition: str, account: str = "",
+           personal_dir: str = "") -> dict:
     """Stage and submit one phase (``check`` = the dry run, ``remove``); returns its job record."""
     user, plan_id = plan["hpc_user"], plan["id"]
-    paths = stage(executor, shared_root, user, plan_id, phase, entries)
+    paths = stage(executor, session_dir, plan_id, phase, entries)
     payload = command(paths["script"], shared_root, user, paths["manifest"],
                       personal_dir=personal_dir, dry_run=phase == "check")
     job_id = backend.submit(job_spec(payload, user, paths["log"], paths["bin"],
@@ -315,6 +320,62 @@ def record_removed(owner: str, plan: dict) -> int:
     return marked
 
 
+NOT_THERE = "not there"             # the script's SKIP reason for an original that is already gone
+
+
+def record_missing(owner: str, plan: dict) -> int:
+    """Mark as removed, in its dataset's ``source.json``, each candidate of the plan that one of
+    its jobs found already gone from HPC3 ("not there"), when the server copy is still complete.
+    Bookkeeping only: nothing is removed. Returns how many were marked."""
+    gone: dict[str, str] = {}
+    for phase in ("check", "remove"):
+        job = plan.get(phase) or {}
+        for r in job.get("results") or []:
+            if r.get("verdict") == "skip" and r.get("reason") == NOT_THERE and r.get("path"):
+                gone.setdefault(str(r["path"]), str(job.get("job_id") or ""))
+    marked = 0
+    for entry in plan.get("candidates") or []:
+        job_id = gone.get(entry.get("path", ""))
+        if job_id is None:
+            continue
+        try:
+            tree = dataset_storage.dataset_dir(entry["dataset"], owner)
+            source_file = tree / "source.json"
+            source = json.loads(source_file.read_text(encoding="utf-8"))
+            expected = int(source.get("bytes"))
+        except (OSError, ValueError, TypeError):
+            continue
+        if source.get("hpc3_path", "").rstrip("/") != entry["path"] or source.get("hpc3_removed"):
+            continue
+        original = tree / "original"
+        if not original.is_dir() or _local_bytes(original) != expected:
+            continue                       # the server copy is not whole: say nothing about HPC3
+        source["hpc3_removed"] = {"at": _now(), "job_id": job_id, "plan": plan["id"],
+                                  "found_missing": True}
+        source["note"] = ("This dataset was kept only on HPC3; this folder holds its copy, and the "
+                          "HPC3 original is gone.")
+        source_file.write_text(json.dumps(source, indent=2), encoding="utf-8")
+        marked += 1
+    return marked
+
+
+def unsettled(plans: Iterable[dict], hpc_user: str) -> list[dict]:
+    """The plans of this HPC3 account that still have something to settle: a job recorded as
+    queued, a finished removal not yet written to ``source.json``, or a finished job whose "not
+    there" originals were not yet looked at."""
+    out = []
+    for p in plans:
+        if p.get("hpc_user") != hpc_user:
+            continue
+        jobs = {ph: p.get(ph) or {} for ph in ("check", "remove")}
+        if (any(j.get("status") == "queued" for j in jobs.values())
+                or (jobs["remove"].get("status") == "done" and not p.get("settled"))
+                or any(j.get("status") == "done" and ph not in (p.get("missing_phases") or [])
+                       for ph, j in jobs.items())):
+            out.append(p)
+    return out
+
+
 def removable(plan: dict, now_candidates: Iterable[dict], *, now: "float | None" = None) -> "tuple[list[dict], str]":
     """What a removal of ``plan`` may take: the originals its dry run would remove that are still
     candidates now, unchanged. ``(entries, "")``, or ``([], why not)``."""
@@ -358,8 +419,15 @@ def get_plan(store_dir: Path, plan_id: str) -> "dict | None":
 
 
 def save_plan(store_dir: Path, plan: dict) -> None:
+    """Keep ``plan``: a new one goes last; one already kept is replaced where it is, so settling an
+    older plan does not make it the newest."""
     with _LOCK:
-        plans = [p for p in load_plans(store_dir) if p["id"] != plan["id"]] + [plan]
+        plans = load_plans(store_dir)
+        at = next((i for i, p in enumerate(plans) if p["id"] == plan["id"]), None)
+        if at is None:
+            plans.append(plan)
+        else:
+            plans[at] = plan
         path = _store(store_dir)
         path.parent.mkdir(parents=True, exist_ok=True)
         tmp = path.with_name(f"{path.name}.{os.getpid()}.tmp")
@@ -376,4 +444,5 @@ def public(plan: dict) -> dict:
     return {**plan,
             "candidate_bytes": sum(int(c["bytes"]) for c in plan.get("candidates") or []),
             "would_remove": len(would), "would_remove_bytes": sum(r["bytes"] for r in would),
-            "removed": len(done), "removed_bytes": sum(r["bytes"] for r in done)}
+            "removed": len(done), "removed_bytes": sum(r["bytes"] for r in done),
+            "found_missing": int(plan.get("marked_missing") or 0)}

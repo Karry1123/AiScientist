@@ -43,7 +43,8 @@ flowchart LR
 The gateway orchestrates and never does the heavy compute. On each connect it syncs its own code to
 `pysrc/<user>` on dfs3b; Slurm jobs bind-mount that code into purpose-built Apptainer images, so a
 tool change never needs an image rebuild. All gateway-to-HPC3 traffic goes over one SSH session per
-user. Deploys use `scripts/sync_deploy.sh` (rsync; the server never git-pulls).
+user. A deploy is a release tag on RCHENLAB/AiScientist, which the server's deploy timer installs
+([deploy/README.md](../../deploy/README.md)).
 
 Users' data is kept on the gateway host ([dataset storage](../dataset_storage.md)); HPC3 holds a copy
 only while a session's runs need it. A session's data movement and housekeeping there go through a
@@ -92,7 +93,9 @@ of the lab's RetiGene corpus (`search_corpus`: the question's meaning and the mo
 merged by rank) at the same time; the model answers from the corpus passages and the abstracts, and
 code writes the reference list from the papers the answer cites; the answer is kept with the run.
 A question that names the RetiGene papers searches the corpus alone, and PubMed only when it asks for
-it. A list question about them ("What are haploinsufficient genes in RetiGene papers?") gets a
+it. A list question about them ("What are haploinsufficient genes in RetiGene papers?"), or one that
+names no source ("What are haploinsufficient genes?", in a chat with no data and no analysis: its plan
+card says it reads the RetiGene papers and that "search PubMed" asks the public literature), gets a
 RetiGene curation plan instead, which says how long it takes on the session: `extract_haploinsufficient_genes`
 reads the whole corpus (a GPU job of its own, or the session's API model through the gateway, or a
 kept scan of the same corpus at once), and the gateway builds two tables from its sentences
@@ -199,5 +202,5 @@ no platform file. `python scripts/tool_docs.py` regenerates each TOOL.md's gener
 5. `agents/registry.py` and `tools/catalog.py`: how the catalog is assembled and routed.
 6. `tools/run_de/`: a typical tool (`TOOL.md`, then `tool.py`).
 7. `docs/skills_and_pipelines_architecture.md`, `preset_pipelines/README.md`.
-8. `deploy/README.md`, `scripts/sync_deploy.sh`: deploys.
+8. `deploy/README.md`, `deploy/deploy_release.sh`: deploys.
 9. `docs/FINDINGS.md`: what has been measured and decided, and why.
