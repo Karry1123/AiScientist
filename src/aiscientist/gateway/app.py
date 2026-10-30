@@ -10655,8 +10655,11 @@ async def lab_plan_review(req: PlanReviewRequest, request: Request) -> JSONRespo
     # session. A decision that names a run that isn't active (a stale plan card from a finished run) is
     # a no-op. No identifiers (older client) → the active run.
     target = conn.resolve_run(req.run_id, req.conversation_id)
-    # In-run decisions still have a waiting worker. Initial plan review has no live scope.
-    saved = _find_saved_plan(conn, req.run_id, req.conversation_id)
+    # In-run decisions still have a waiting worker. Initial plan review has no live scope. A saved
+    # plan is found only by its run or its chat: a decision that names neither (an older client)
+    # must not land on whichever chat's plan was saved last.
+    saved = (_find_saved_plan(conn, req.run_id, req.conversation_id)
+             if (req.run_id or req.conversation_id) else None)
     if saved is not None and (target is None or target.pending_plan is None):
         from . import saved_plans
 

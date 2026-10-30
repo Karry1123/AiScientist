@@ -306,3 +306,13 @@ def test_the_saved_card_keeps_each_steps_expected_outputs(lab_gateway, monkeypat
     path.write_text(document.replace("tool: run_scanpy_qc", "tool: run_code") + mark + record,
                     encoding="utf-8")
     assert "outputs" not in gw._saved_plan_replays(restored)[0]["plan"]["steps"][0]
+
+
+def test_a_reply_that_names_no_chat_does_not_reach_a_saved_plan(lab_gateway):
+    env = lab_gateway
+    conn = env.connection()
+    rid, art, _, _ = _show(conn, "conv-A")
+    # No run id and no chat (an older client): it must not pick the newest waiting plan of any chat.
+    assert _reply(conn, "approve")["status"] == "not_delivered"
+    assert saved_plans.load(art)["state"] == "shown" and not env.calls
+
