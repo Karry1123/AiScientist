@@ -12794,6 +12794,13 @@ async def _run_lab(conn: Connection, req: LabRequest, *,
                         "disconnects, or after a few days, unless saved to your data), so this run "
                         "starts from the original input and "
                         "repeats the steps the new request needs.", "warning")
+        if saved_state is not None and prior is None:
+            # A saved plan goes on with the request it was drafted for, including the earlier run of
+            # this chat it continues (saved with the plan): the prior work the lab and the report
+            # name, and that run's HPC3 folder, which a session's cleanup keeps while this one runs.
+            prior = session_meta.get("prior") or None
+            continues_from_dataset = bool(session_meta.get("continues_from_dataset"))
+            run.continues = str((prior or {}).get("run_id") or "") or None
         if resume is None and saved_state is None:
             # What the run reads, by UUID (its result's provenance), and what the owners' reviewed
             # Croissant metadata says about it (the planner's dataset notes).
@@ -13094,7 +13101,12 @@ async def _run_lab(conn: Connection, req: LabRequest, *,
         # or a saved result the user bound themselves — gets it as its own checkpoints, so every
         # tool reads it as it would the output of this run's QC and clustering steps.
         _profile = decisions.get("dataset_result")
-        if resume is None and saved_state is None and isinstance(_profile, dict) and _profile.get("handed_on"):
+        # Approving a saved plan adopts the handed-on dataset again: the run may now be in a later
+        # session, whose HPC3 folder never held the checkpoints written when the plan was drafted
+        # (the earlier session's folder goes when it disconnects). A reply only plans.
+        approving_saved = saved_state is not None and (saved_decision or {}).get("action") == "approve"
+        if (resume is None and (saved_state is None or approving_saved)
+                and isinstance(_profile, dict) and _profile.get("handed_on")):
             adopted = await _adopt_handed_on_dataset(conn, run_id, decisions, analysis_executor)
             session_meta["adopted"] = adopted
             emit("info", "lab", "Starting from a processed dataset: "
@@ -13104,7 +13116,7 @@ async def _run_lab(conn: Connection, req: LabRequest, *,
                  + (f", {adopted.get('n_labels')} cell types ({adopted.get('label_key')})"
                     if adopted.get("label_key") else "")
                  + f" — in place as {' + '.join(adopted.get('checkpoints') or [])}.")
-        elif continues_from_dataset:
+        elif continues_from_dataset and saved_state is None:
             # Bound, but the profile did not recognise it as a handed-on dataset: it is then read
             # as a plain input, and the plan must not assume the earlier steps are in it.
             continues_from_dataset = False
@@ -13796,7 +13808,8 @@ async def _run_lab(conn: Connection, req: LabRequest, *,
                 conversation_id=run.conversation_id,
                 run_options=req.model_dump(exclude={"history", "connection_id"}),
                 plan_context=lab_obj.plan_context, lab_config=config,
-                later=lab_obj.later, prior_work=lab_obj.config.prior_work)
+                later=lab_obj.later, prior_work=lab_obj.config.prior_work,
+                prior=prior, continues_from_dataset=continues_from_dataset)
             snapshot = SimpleNamespace(to_dict=lambda: {
                 "question": req.question, "agenda": agenda, "rounds": [],
                 "accepted_steps": 0, "converged": False, "final_answer": ""})

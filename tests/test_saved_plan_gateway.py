@@ -376,3 +376,35 @@ def test_stop_while_the_pi_redrafts_leaves_the_saved_plan_waiting(lab_gateway, m
     assert latest["state"] == "shown" and latest["version"] == current["version"]
     assert env.records[-1][1:3] == (rid, "awaiting_plan")
     assert env.cards[-1]["run_id"] == rid and not env.calls
+
+
+def test_a_saved_plan_that_continues_an_earlier_run_keeps_it_when_approved(lab_gateway, monkeypatch):
+    env = lab_gateway
+    conn = env.connection()
+    prior = {"run_id": "earlier00001", "question": "QC the cells",
+             "steps": [{"title": "QC", "done": True, "finding": "kept 900 cells"}],
+             "dataset": None, "plan_yaml": "", "session": [], "bound_primary": ""}
+    monkeypatch.setattr(gw, "_handed_on_dataset", lambda c, p: None)
+    req = gw.LabRequest(connection_id=conn.id, question="Cluster them", conversation_id="conv-A",
+                        plan_mode=True, mode="single", planner="linear")
+    asyncio.run(gw._run_lab(conn, req, prior=prior))
+    rid, art, _, state = gw._find_saved_plan(conn, None, "conv-A")
+    assert state["prior"]["run_id"] == "earlier00001"
+    # The dataset this run starts from is the one the earlier run handed on (its profile says so).
+    path = art / "process" / "run_state.json"
+    saved = json.loads(path.read_text(encoding="utf-8"))
+    saved["decisions"]["dataset_result"] = {"handed_on": True}
+    path.write_text(json.dumps(saved), encoding="utf-8")
+    adopted = []
+
+    async def adopt(c, run_id, decisions, executor):
+        adopted.append((run_id, c.active_run.continues))
+        return {"checkpoints": ["adata_qc"]}
+
+    monkeypatch.setattr(gw, "_adopt_handed_on_dataset", adopt)
+    _reply(conn, "revise", run_id=rid, feedback="Set min_genes to 300")
+    assert adopted == []                 # a reply only plans
+    # Run, possibly in a later session whose HPC3 folder never held the adopted checkpoints: they
+    # are written again, and the earlier run is known as the one this run continues.
+    _reply(conn, "approve", run_id=rid)
+    assert adopted == [(rid, "earlier00001")]
