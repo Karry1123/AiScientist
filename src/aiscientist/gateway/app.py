@@ -10690,7 +10690,9 @@ async def lab_plan_review(req: PlanReviewRequest, request: Request) -> JSONRespo
         cont_req = LabRequest(**options)
         # The task loads the current document again, rather than using a copy from the card.
         _SAVED_PLAN_TASKS.add(art)
-        conn.begin_run(state.get("conversation_id"), run_id=run_id)
+        # The budget answer goes with the run, as for /api/lab and /api/lab/continue: the in-run
+        # check (key_guard) does not ask again what the user just confirmed.
+        _note_budget_choice(conn.begin_run(state.get("conversation_id"), run_id=run_id), req)
         conn.push({"type": "plan_done"})
         asyncio.create_task(_continue_saved_plan(conn, cont_req, run_id, state, decision))
         return JSONResponse({"status": "ok", "action": action, "run_id": run_id})

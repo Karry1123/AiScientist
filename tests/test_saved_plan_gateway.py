@@ -316,3 +316,18 @@ def test_a_reply_that_names_no_chat_does_not_reach_a_saved_plan(lab_gateway):
     assert _reply(conn, "approve")["status"] == "not_delivered"
     assert saved_plans.load(art)["state"] == "shown" and not env.calls
 
+
+def test_approving_a_saved_plan_keeps_the_budget_answer_on_its_run(lab_gateway, monkeypatch):
+    env = lab_gateway
+    conn = env.connection()
+    rid, _, _, _ = _show(conn)
+    seen = []
+
+    async def restage(c, decisions, say, emit):
+        run = c.active_run
+        seen.append((run.budget_ack, run.budget_tz))
+
+    monkeypatch.setattr(gw, "_restage_server_data", restage)
+    _reply(conn, "approve", run_id=rid, budget_ack=True, tz="America/Los_Angeles")
+    # The in-run budget check (key_guard) reads these: the user already said yes once.
+    assert seen == [(True, "America/Los_Angeles")]
