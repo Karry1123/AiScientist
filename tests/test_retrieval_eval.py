@@ -154,6 +154,14 @@ def test_fingerprint_and_main_end_to_end(tiny, tmp_path, monkeypatch):
     assert "Gene-query regressions" in report and "Enumeration coverage" in report
 
 
+@pytest.mark.parametrize("field", [{"queries": "rescue pathway"}, {"expected_pmids": "12345678"}])
+def test_a_string_where_a_list_belongs_is_refused(field):
+    # A string would be read character by character: one query or one PMID per character.
+    question = {"id": "q", "category": "mechanism", "queries": ["rescue pathway"], **field}
+    with pytest.raises(ValueError, match="list"):
+        ev.validate_questions({"questions": [question]})
+
+
 def test_template_requires_lab_labels():
     path = Path(__file__).resolve().parents[1] / "examples/retrieval_eval/questions.template.json"
     data = json.loads(path.read_text(encoding="utf-8"))

@@ -97,10 +97,13 @@ def validate_questions(data: dict[str, Any]) -> list[dict[str, Any]]:
         if q.get("placeholder") or q["id"] in seen or q["category"] not in CATEGORIES:
             raise ValueError("Question IDs must be unique, categories valid, and placeholders replaced")
         seen.add(q["id"])
+        if not isinstance(q["queries"], list):
+            raise ValueError("queries must be a list of strings")
         if not q["queries"] or any(not isinstance(s, str) or not s.strip() for s in q["queries"]):
             raise ValueError("Each question needs nonempty query strings")
-        if not isinstance(q.get("terms", []), list):
-            raise ValueError("terms must be a list of strings")
+        for key in ("terms", "expected_pmids"):
+            if not isinstance(q.get(key, []), list):
+                raise ValueError(f"{key} must be a list of strings")
         for key in ("relevant_passages", "supporting_passages"):
             for passage in q.get(key, []):
                 passage_key(passage)
