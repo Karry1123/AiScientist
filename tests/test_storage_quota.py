@@ -122,3 +122,33 @@ def test_remote_result_save_reserves_copy_before_starting(server, monkeypatch):
         "path": "/hpc/result.h5ad", "size_bytes": 5, "location": "hpc3", "saving": {"started_at": "now"}}))
     assert storage_policy.quota_error(server.uid, "yijus12", 1) is None
     assert storage_policy.quota_error(server.uid, "yijus12", 2)
+
+
+def test_the_quota_is_measured_off_the_event_loop(server, tmp_path, monkeypatch):
+    """Measuring walks every run folder of the account: on the event loop it would hold up every
+    other request of the gateway, once per file of a folder upload."""
+    import asyncio
+    conn = SimpleNamespace(app_user_id=server.uid, owner="yijus12", id="quota",
+                           workspace=tmp_path / "work", managed_storage=False, executor=None,
+                           settings=SimpleNamespace(uploads_on_hpc=False))
+    monkeypatch.setattr(server.gw, "_owned_conn", lambda *args, **kwargs: conn)
+    on_loop = []
+
+    def measured(*args, **kwargs):
+        try:
+            asyncio.get_running_loop()
+            on_loop.append(True)
+        except RuntimeError:
+            on_loop.append(False)
+        return "Account storage limit reached: 0.00 GB of space left."
+
+    monkeypatch.setattr(server.gw, "_upload_quota_error", measured)
+    meta = ",".join(f"{k} {base64.b64encode(v.encode()).decode()}" for k, v in
+                    {"connection_id": "quota", "filename": "new.csv"}.items())
+    assert server.client.post("/api/tus", headers={"Tus-Resumable": "1.0.0", "Upload-Length": "6",
+                                                   "Upload-Metadata": meta}).status_code == 507
+    assert server.client.post("/api/upload/reserve-folder", json={
+        "connection_id": "quota", "name": "data", "files": [["a.csv", 6]]}).status_code == 507
+    assert server.client.post("/api/upload", data={"connection_id": "quota"},
+                              files={"file": ("a.csv", b"abcdef")}).status_code == 507
+    assert on_loop == [False, False, False]

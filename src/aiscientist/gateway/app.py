@@ -6954,7 +6954,7 @@ async def upload_dataset(
         file.file.seek(0, 2)
         size = file.file.tell()
         file.file.seek(0)
-    if conn.app_user_id and (error := _upload_quota_error(conn, size)):
+    if conn.app_user_id and (error := await asyncio.to_thread(_upload_quota_error, conn, size)):
         await file.close()
         return JSONResponse({"error": error, "storage_url": "#account/storage"}, status_code=507)
     dest_dir = upload_storage.uploads(conn)
@@ -7053,7 +7053,7 @@ async def reserve_folder(payload: dict, request: Request) -> JSONResponse:
                             status_code=409)
     chosen = _chosen_files(files)
     if chosen and not got.get("merged") and not got.get("resume"):
-        error = _upload_quota_error(conn, sum(size for _, size in chosen))
+        error = await asyncio.to_thread(_upload_quota_error, conn, sum(size for _, size in chosen))
         if error:
             return JSONResponse({"error": error, "storage_url": "#account/storage"}, status_code=507)
     folder = got["folder"]
@@ -7409,7 +7409,8 @@ async def upload_chunk(
         with open(p, "ab") as out:
             out.write(b)
 
-    if conn.app_user_id and (error := _upload_quota_error(conn, current + len(data), part)):
+    if conn.app_user_id and (error := await asyncio.to_thread(_upload_quota_error, conn,
+                                                              current + len(data), part)):
         return JSONResponse({"error": error, "storage_url": "#account/storage"}, status_code=507)
     await asyncio.to_thread(_append, part, data)
     received = current + len(data)

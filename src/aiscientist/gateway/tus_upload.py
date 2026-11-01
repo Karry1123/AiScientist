@@ -420,7 +420,7 @@ async def _create_upload(request: Request) -> Response:
     if length < 0 or length > _MAX_SIZE:
         return _answer(413, body={"error": "upload exceeds Tus-Max-Size"})
     conn = gw._owned_conn(fields.get("connection_id"), request)
-    if conn.app_user_id and (error := gw._upload_quota_error(conn, length)):
+    if conn.app_user_id and (error := await asyncio.to_thread(gw._upload_quota_error, conn, length)):
         return _answer(507, body={"error": error, "storage_url": "#account/storage"})
     upload_storage.uploads(conn).mkdir(parents=True, exist_ok=True)
     if shutil.disk_usage(upload_storage.uploads(conn)).free < length + 64 * 1024**2:
