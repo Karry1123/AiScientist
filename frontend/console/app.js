@@ -3629,13 +3629,14 @@ async function stopGpu() {
   await doStopGpu();
 }
 
-// Drop a stored connection the server refuses to serve to this user, without calling it.
-function forgetConnection() {
+// Drop a stored connection the server refuses to serve to this user, without calling it. With
+// `redraw` false the page is left as it is (it already shows the disconnected state).
+function forgetConnection(redraw = true) {
   if (state.ws) { try { state.ws.close(); } catch {} }
   try { localStorage.removeItem(CONN_KEY); localStorage.removeItem(RUNOWNER_KEY); localStorage.removeItem(PLANDRAFT_KEY); } catch {}
   state.connectionId = null;
   state.lastJobId = null;
-  applyStatus({ status: "disconnected", model: "" });
+  if (redraw) applyStatus({ status: "disconnected", model: "" });
 }
 
 async function disconnect() {
@@ -9305,8 +9306,9 @@ async function restoreConnection() {
     const res = await fetch(`/api/connections/${id}`);
     if (res.status === 401 || res.status === 403) {
       // Stored by another account on this browser (or before a logout): not ours to reattach to
-      // or to advertise — drop it, run owner included.
-      forgetConnection();
+      // or to advertise — drop it, run owner included. init() has just shown the disconnected
+      // state; showing it again would reopen the left panel a sign-in has just collapsed (issue 65).
+      forgetConnection(false);
       return;
     }
     if (!res.ok) {

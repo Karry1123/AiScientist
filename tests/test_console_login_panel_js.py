@@ -149,3 +149,52 @@ assert(!$("layout").classList.contains("collapse-left"));
 assert.strictEqual(stored.get(UI_KEY), saved);
 assert.deepStrictEqual(writes, []);
 '''.replace("HANDLER", handler).replace("FAILURE", failure), {"left": True})
+
+
+def test_sign_in_stays_collapsed_when_another_accounts_connection_is_dropped():
+    """A connection id another account left in this browser is refused (403) after the sign-in and
+    dropped; that must not reopen the panel the sign-in just collapsed."""
+    from test_console_data_menu_js import _function
+
+    node = shutil.which("node")
+    if not node:
+        pytest.skip("node is not installed")
+    source = APP.read_text(encoding="utf-8")
+    funcs = "".join(_function(source, name) for name in (
+        "applyUiPrefs", "setPanel", "applyStatus", "forgetConnection", "restoreConnection", "showApp", "doLogin"))
+    script = r'''
+const assert = require("assert");
+const els = {};
+const $ = (id) => els[id] || (els[id] = {
+  value: "", textContent: "", className: "", closest() { return null; }, addEventListener() {},
+  classList: { values: new Set(), add(c) { this.values.add(c); }, remove(c) { this.values.delete(c); },
+    contains(c) { return this.values.has(c); },
+    toggle(c, on) { if (on === undefined) on = !this.contains(c); if (on) this.add(c); else this.remove(c); } },
+});
+const document = { querySelectorAll: () => [] };
+const UI_KEY = "ui", CONN_KEY = "conn", RUNOWNER_KEY = "owners", PLANDRAFT_KEY = "draft";
+const stored = new Map([[UI_KEY, '{"left":true}'], [CONN_KEY, "conn-of-another-account"]]);
+const localStorage = { getItem: (k) => (stored.has(k) ? stored.get(k) : null),
+  setItem: (k, v) => stored.set(k, v), removeItem: (k) => stored.delete(k) };
+const state = { status: "disconnected", leftAutoCollapsed: false, everConnected: false, connectionId: null, ws: null };
+const chats = new Map();
+const user = { username: "userB", role: "user" };
+const fetch = async (url) => url === "/api/auth/login" ? { ok: true, json: async () => ({ user }) }
+  : String(url).startsWith("/api/connections/") ? { ok: false, status: 403, json: async () => ({}) }
+  : { ok: true, json: async () => ({}) };
+const sessionModelLine = () => "", restoreUploads = () => {}, setStep = () => {};
+const renderSessionState = () => {}, hideDuoPanel = () => {}, hideBoot = () => {};
+const initShell = () => {}, renderAccount = () => {}, switchView = () => {}, checkBudgetNotices = () => {};
+let _appInited = false, restoring = null;
+// The real init() in this order: the saved panels, the disconnected status, the stored connection.
+function init() { applyUiPrefs(); applyStatus({ status: "disconnected", model: "" }); restoring = restoreConnection(); }
+FUNCS
+(async () => {
+  await doLogin({ preventDefault() {} });
+  await restoring;
+  assert.strictEqual(stored.get(CONN_KEY), undefined);
+  assert($("layout").classList.contains("collapse-left"), "the left panel reopened after the sign-in");
+})().catch((err) => { console.error(err.message); process.exit(1); });
+'''.replace("FUNCS", funcs)
+    out = subprocess.run([node, "-e", script], capture_output=True, text=True, encoding="utf-8", timeout=30)
+    assert out.returncode == 0, out.stderr or out.stdout
