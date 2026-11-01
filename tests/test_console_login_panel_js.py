@@ -61,6 +61,9 @@ const chats = new Map([["chat1", chat]]);
 const initShell = () => {};
 const wireRegister = () => {}, wireChatScroll = () => {};
 const renderAccount = () => {}, switchView = () => {}, checkBudgetNotices = () => {};
+// bootstrap() opens Account → Storage for a storage link (issue 74); these tests open the plain page.
+const window = { location: { href: "https://aiscientist.test/" } };
+const isStorageLink = () => false, openAccount = () => {};
 const user = { username: "tester", role: "user" };
 let response = { ok: true, json: async () => ({ user }) };
 let fetch = async (url) => { requests.push(url); return response; };

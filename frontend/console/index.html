@@ -312,6 +312,7 @@
             </div>
             <div id="filesPane-datasets" class="files-pane" role="tabpanel" aria-labelledby="filesTab-datasets">
             <div id="uploadsPanel" class="uploads-panel hidden"></div>
+            <div id="datasetNotices"></div>
             <p class="page-sub">Files you've uploaded to the server. Preview one to see what it holds, download it, review how it is described ("Metadata"), or click "Use" to load it into a Research run. To attach several to the open chat at once, tick them and click "Use selected".</p>
             <div class="list-search">
               <button id="datasetsUseSelected" class="primary small" disabled>Use selected (0)</button>
@@ -382,8 +383,8 @@
               <button id="userSearchClear" type="button" class="ghost small">Clear</button>
             </div>
             <table class="user-table">
-              <thead><tr><th>ID</th><th>Username</th><th>Email</th><th>Role</th><th>Status</th><th>Last login</th><th>Actions</th></tr></thead>
-              <tbody id="userTableBody"><tr><td colspan="7" class="empty-hint">Loading…</td></tr></tbody>
+              <thead><tr><th>ID</th><th>Username</th><th>Email</th><th>Role</th><th>Status</th><th>Last login</th><th>Server storage / due in 14 days</th><th>Actions</th></tr></thead>
+              <tbody id="userTableBody"><tr><td colspan="8" class="empty-hint">Loading…</td></tr></tbody>
             </table>
             </div>
             <div id="adminPane-skills" class="admin-pane hidden">
@@ -522,7 +523,7 @@
                   <span class="material-symbols-outlined msym store-ico" aria-hidden="true">dns</span>
                   <div class="store-sec-title">
                     <h3 id="storeServerH">On the server</h3>
-                    <p class="usage-sub">Your datasets and what your runs wrote. Kept until you delete them.</p>
+                    <p class="usage-sub">Your datasets and what your runs wrote. Dataset removal dates are listed below.</p>
                   </div>
                   <strong id="storeServerTotal" class="store-total"></strong>
                 </div>
