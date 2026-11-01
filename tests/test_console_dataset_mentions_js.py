@@ -21,6 +21,7 @@ const $ = (id) => els[id] ||= { value: '', selectionStart: 0, selectionEnd: 0,
   classList: { add() {}, remove() {} },
   setAttribute(k, v) { this.attrs[k] = v; }, removeAttribute(k) { delete this.attrs[k]; },
   setSelectionRange(a, b) { this.selectionStart = a; this.selectionEnd = b; },
+  addEventListener(t, f) { (this.on ||= {})[t] = f; },
   focus() {}, scrollIntoView() {} };
 const c = { bound: [], roles: {}, draft: '' };
 const state = { activeId: 'A', maxBoundDatasets: 10, datasets: [], boundPaths: c.bound, boundRoles: c.roles,
@@ -44,6 +45,7 @@ const fetch = async (url) => { requests++; if (url !== '/api/datasets') throw Er
   return {ok: true, json: async () => ({datasets: rows.slice()})}; };
 function positionDatasetMentions() {} // Layout is supplied by the browser; behavior runs here.
 const input = $('chatInput');
+BLUR_LISTENER
 const type = async (text, caret = text.length) => { input.value = text; input.setSelectionRange(caret, caret); await updateDatasetMentions(); };
 const key = (key) => { const e = {key, prevented: false, preventDefault() {this.prevented = true;}};
   const handled = datasetMentionKeydown(e); return {handled, prevented: e.prevented}; };
@@ -78,13 +80,20 @@ const key = (key) => { const e = {key, prevented: false, preventDefault() {this.
   await type(''); await type('@');
   out.escape = key('Escape'); await type('@Atlas');
   out.afterEscape = {text: input.value, open: input.attrs['aria-expanded']};
-  await type(''); await type('@Counts ');
+  await type(''); await type('@Counts'); await type('@Counts ');
   out.nameWithSpace = datasetMention.rows.map(d => d.id);
   await type(''); await type('Use\n@Atlas');
   out.afterWhitespace = datasetMention.rows.map(d => d.id);
   await type(''); await type('x@Atlas'); out.insideWord = input.attrs['aria-expanded'];
   state.datasets[0].gist = 'Short description';
   renderDatasetChips(); out.chips = $('datasetChips').innerHTML;
+  // Text already written past an @ (clicked back into after leaving the box, or pasted) is not reopened.
+  await type(''); await type('Compare @Atlas'); key('Enter');
+  await type(input.value + ' then run QC');
+  input.on.blur(); await type(input.value);   // the click listener runs updateDatasetMentions
+  out.reopened = {open: input.attrs['aria-expanded'], enter: key('Enter')};
+  await type(''); await type('Compare @Atlas with @Counts and go');
+  out.pasted = {open: input.attrs['aria-expanded'], enter: key('Enter')};
   // A response arriving after dismissal cannot reopen the picker.
   await type('');
   let finish;
@@ -114,7 +123,9 @@ def mentions():
         code += _function(source, "addDatasets") + _function(source, "canAttachDatasets")
     start = source.index("const datasets = c.bound.map")
     payload = source[start:source.index("\n  });", start) + len("\n  });")]
-    done = subprocess.run([node, "-e", code + HARNESS.replace("SEND_DATASETS", payload)],
+    blur = next(line for line in source.splitlines() if '$("chatInput").addEventListener("blur"' in line)
+    harness = HARNESS.replace("SEND_DATASETS", payload).replace("BLUR_LISTENER", blur)
+    done = subprocess.run([node, "-e", code + harness],
                           capture_output=True, text=True, encoding="utf-8", timeout=30)
     assert done.returncode == 0, done.stderr
     return json.loads(done.stdout)
@@ -131,6 +142,12 @@ def test_opens_and_filters_display_names_case_insensitively(mentions):
 def test_email_or_at_inside_a_word_does_not_open(mentions):
     assert mentions["email"] == {"requests": 0, "open": "false"}
     assert mentions["insideWord"] == "false"
+
+
+def test_text_already_past_a_space_does_not_reopen_and_enter_sends(mentions):
+    closed = {"open": "false", "enter": {"handled": False, "prevented": False}}
+    assert mentions["reopened"] == closed
+    assert mentions["pasted"] == closed
 
 
 def test_same_names_have_kind_size_date_and_source_chat_without_paths(mentions):

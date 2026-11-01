@@ -6286,6 +6286,9 @@ async function updateDatasetMentions() {
   if (!query) { m.dismissed = null; closeDatasetMentions(false); return; }
   if (query.start === m.dismissed) return;
   const opening = !m.query || m.query.start !== query.start;
+  // The list opens while an @ is being typed. Text already past a space (the box clicked again, a
+  // paste) is the message itself: an open list there would hold Enter back from sending it.
+  if (opening && /\s/.test(query.text)) { closeDatasetMentions(false); return; }
   m.query = query;
   m.index = 0;
   if (opening) { m.items = null; m.error = false; }
