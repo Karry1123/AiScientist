@@ -184,3 +184,14 @@ def test_a_refused_dataset_change_does_not_block_the_next_message():
   assert.deepStrictEqual(revised, ["use fewer clusters"]);
 ''')
 
+
+def test_a_run_the_server_refuses_for_its_dataset_count_says_why():
+    _run_review_checks(r'''
+  await addDataset(state.datasets[0]);
+  labReply = { status: 400, body: { detail: "At most 12 datasets per run. Remove one first." } };
+  $("chatInput").value = "run QC";
+  await sendChat({ preventDefault() {} });
+  assert.equal(posted.length, 1);
+  assert(notices.pop().includes("At most 12 datasets"), notices);
+  assert.equal($("chatInput").value, "run QC");
+''')

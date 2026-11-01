@@ -3847,7 +3847,8 @@ async function sendChat(e) {
         return;
       }
       giveBack();
-      toast(d.error || "Run failed");
+      // A refusal raised as an HTTP error (more datasets than a run takes) says why in `detail`.
+      toast(d.error || (typeof d.detail === "string" && d.detail) || "Run failed");
     }
   } catch (err) {
     giveBack();
