@@ -171,3 +171,16 @@ def test_an_upload_finishing_in_a_chat_not_opened_since_a_reload_keeps_its_saved
   assert.deepStrictEqual(chatOf("2").bound, ["/a.h5ad", "/b.csv", "/c.h5ad"]);
 ''')
 
+
+def test_a_refused_dataset_change_does_not_block_the_next_message():
+    _run_review_checks(r'''
+  maxBound = state.maxBoundDatasets = 1;
+  await addDataset(state.datasets[0]);
+  assert.equal(await addDataset(state.datasets[1]), false);
+  assert(notices.pop().includes("Up to 1"));
+  activeChat().planPending = true;
+  $("chatInput").value = "use fewer clusters";
+  await sendChat({ preventDefault() {} });
+  assert.deepStrictEqual(revised, ["use fewer clusters"]);
+''')
+

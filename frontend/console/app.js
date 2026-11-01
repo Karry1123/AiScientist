@@ -3753,7 +3753,9 @@ async function sendChat(e) {
   // a change request for the previous chat's plan.
   const c = activeChat();
   if (!c) return;
-  if (c.datasetSave && !await c.datasetSave) return;
+  // A dataset change still being saved goes first. One that was refused left the chat's datasets
+  // as its chips show them, so the message is sent with those.
+  if (c.datasetSave) await c.datasetSave;
   // While a PI plan/clarify is awaiting a decision, the composer is the "refine the plan" channel —
   // the message is natural-language feedback that re-plans (it does NOT start a new run).
   if (c.planPending) {
