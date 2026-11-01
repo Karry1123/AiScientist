@@ -47,7 +47,7 @@ function positionDatasetMentions() {} // Layout is supplied by the browser; beha
 const input = $('chatInput');
 BLUR_LISTENER
 const type = async (text, caret = text.length) => { input.value = text; input.setSelectionRange(caret, caret); await updateDatasetMentions(); };
-const key = (key) => { const e = {key, prevented: false, preventDefault() {this.prevented = true;}};
+const key = (key, extra = {}) => { const e = {key, ...extra, prevented: false, preventDefault() {this.prevented = true;}};
   const handled = datasetMentionKeydown(e); return {handled, prevented: e.prevented}; };
 (async () => {
   const out = {};
@@ -97,6 +97,9 @@ const key = (key) => { const e = {key, prevented: false, preventDefault() {this.
   // A pick with the caret inside an @word typed earlier replaces the whole word.
   await type(''); await type('@Atlas more', 3); key('Enter');
   out.midWord = {text: input.value, caret: input.selectionStart};
+  // Safari ends an IME composition with an Enter whose isComposing is false and keyCode is 229.
+  await type(''); await type('@Atl');
+  out.imeEnter = {key: key('Enter', {keyCode: 229, isComposing: false}), text: input.value, bound: c.bound.length};
   // A response arriving after dismissal cannot reopen the picker.
   await type('');
   let finish;
@@ -155,6 +158,29 @@ def test_text_already_past_a_space_does_not_reopen_and_enter_sends(mentions):
 
 def test_pick_inside_an_earlier_mention_replaces_the_whole_word(mentions):
     assert mentions["midWord"] == {"text": "@Atlas more", "caret": 6}
+
+
+def test_enter_ending_an_ime_composition_neither_picks_nor_sends(mentions):
+    assert mentions["imeEnter"] == {"key": {"handled": False, "prevented": False}, "text": "@Atl", "bound": 3}
+    node = shutil.which("node")
+    source = (ROOT / "app.js").read_text(encoding="utf-8")
+    listener = next(line for line in source.splitlines() if '$("chatInput").addEventListener("keydown"' in line)
+    script = r"""
+let submits = 0;
+const els = {};
+const $ = (id) => els[id] ||= { on: {}, addEventListener(t, f) { this.on[t] = f; }, requestSubmit() { submits++; } };
+const datasetMentionKeydown = () => false;
+LISTENER
+const press = (e) => $("chatInput").on.keydown({ shiftKey: false, isComposing: false, keyCode: 13, preventDefault() {}, ...e });
+press({ key: "Enter", isComposing: true, keyCode: 229 });
+press({ key: "Enter", keyCode: 229 });
+const composing = submits;
+press({ key: "Enter" });
+console.log(JSON.stringify({ composing, sent: submits - composing }));
+""".replace("LISTENER", listener)
+    done = subprocess.run([node, "-e", script], capture_output=True, text=True, encoding="utf-8", timeout=30)
+    assert done.returncode == 0, done.stderr
+    assert json.loads(done.stdout) == {"composing": 0, "sent": 1}
 
 
 def test_same_names_have_kind_size_date_and_source_chat_without_paths(mentions):

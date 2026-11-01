@@ -6327,7 +6327,8 @@ function selectDatasetMention(index) {
 
 function datasetMentionKeydown(e) {
   const m = datasetMention;
-  if (!m.query || e.isComposing) return false;
+  // Safari ends an IME composition with a keydown whose isComposing is false and keyCode is 229.
+  if (!m.query || e.isComposing || e.keyCode === 229) return false;
   if (e.key === "Escape") { e.preventDefault(); closeDatasetMentions(); return true; }
   if (e.key === " " && !m.rows.length) { closeDatasetMentions(); return false; }
   if (e.key === "ArrowDown" || e.key === "ArrowUp") {
@@ -9370,7 +9371,7 @@ function init() {
     if (e.key === "Escape" && !$("datasetPreviewModal").classList.contains("hidden")) closeDatasetPreview();
   });
   $("filePreviewModal").addEventListener("click", (e) => { if (e.target.id === "filePreviewModal") $("filePreviewModal").classList.add("hidden"); });
-  $("chatInput").addEventListener("keydown", (e) => { if (datasetMentionKeydown(e)) return; if (e.key === "Enter" && !e.shiftKey && !e.isComposing) { e.preventDefault(); $("chatForm").requestSubmit(); } });
+  $("chatInput").addEventListener("keydown", (e) => { if (datasetMentionKeydown(e)) return; if (e.key === "Enter" && !e.shiftKey && !e.isComposing && e.keyCode !== 229) { e.preventDefault(); $("chatForm").requestSubmit(); } });
   $("chatInput").addEventListener("click", updateDatasetMentions);
   $("chatInput").addEventListener("keyup", (e) => { if (["ArrowLeft", "ArrowRight", "Home", "End"].includes(e.key)) updateDatasetMentions(); });
   $("chatInput").addEventListener("blur", () => { closeDatasetMentions(false); datasetMention.dismissed = null; });
