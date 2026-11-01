@@ -31,6 +31,10 @@ let saves = 0, syncs = 0, requests = 0, pending = null;
 const saveComposer = () => saves++, syncDatasetSelection = () => syncs++;
 const updateComposerButton = () => {};
 const toast = () => {};
+// The chat's datasets are saved on the server (issue 72); `refuse` stands for a refused save.
+let refuse = false;
+const changeChatDatasets = async (chat, edit) => { if (refuse) return false; edit(chat); return true; };
+const tick = () => new Promise((resolve) => setTimeout(resolve, 0));
 const escapeHtml = (s) => String(s).replaceAll('&', '&amp;').replaceAll('<', '&lt;').replaceAll('"', '&quot;');
 const primaryBoundPath = () => c.bound[0], datasetIcon = () => 'file';
 const fmtSize = (s) => `${s} B`, fmtDate = (s) => s || '—';
@@ -60,10 +64,10 @@ const key = (key, extra = {}) => { const e = {key, ...extra, prevented: false, p
   out.filter = datasetMention.rows.map(d => d.id);
   out.down = key('ArrowDown'); out.activeAfterDown = input.attrs['aria-activedescendant'];
   out.up = key('ArrowUp'); out.activeAfterUp = input.attrs['aria-activedescendant'];
-  key('ArrowDown'); out.enter = key('Enter');
+  key('ArrowDown'); out.enter = key('Enter'); await tick();
   out.selected = {text: input.value, bound: [...c.bound], draft: c.draft, expanded: input.attrs['aria-expanded'], caret: input.selectionStart};
   await type(input.value + ' and @CoUnTs');
-  out.tab = key('Tab');
+  out.tab = key('Tab'); await tick();
   out.multiple = {text: input.value, bound: [...c.bound]};
   // Run the actual sendChat attachment serialization below.
   SEND_DATASETS
@@ -71,7 +75,7 @@ const key = (key, extra = {}) => { const e = {key, ...extra, prevented: false, p
   await type('');
   out.afterDeletingText = [...c.bound];
   await type('Compare @Atlas');
-  selectDatasetMention(0); // The same function the delegated click handler calls.
+  await selectDatasetMention(0); // The same function the delegated click handler calls.
   out.click = {text: input.value, bound: [...c.bound]};
   await type(''); await type('@missing');
   out.noMatch = {html: $('datasetMentions').innerHTML, active: input.attrs['aria-activedescendant'] || null};
@@ -88,18 +92,22 @@ const key = (key, extra = {}) => { const e = {key, ...extra, prevented: false, p
   state.datasets[0].gist = 'Short description';
   renderDatasetChips(); out.chips = $('datasetChips').innerHTML;
   // Text already written past an @ (clicked back into after leaving the box, or pasted) is not reopened.
-  await type(''); await type('Compare @Atlas'); key('Enter');
+  await type(''); await type('Compare @Atlas'); key('Enter'); await tick();
   await type(input.value + ' then run QC');
   input.on.blur(); await type(input.value);   // the click listener runs updateDatasetMentions
   out.reopened = {open: input.attrs['aria-expanded'], enter: key('Enter')};
   await type(''); await type('Compare @Atlas with @Counts and go');
   out.pasted = {open: input.attrs['aria-expanded'], enter: key('Enter')};
   // A pick with the caret inside an @word typed earlier replaces the whole word.
-  await type(''); await type('@Atlas more', 3); key('Enter');
+  await type(''); await type('@Atlas more', 3); key('Enter'); await tick();
   out.midWord = {text: input.value, caret: input.selectionStart};
   // Safari ends an IME composition with an Enter whose isComposing is false and keyCode is 229.
   await type(''); await type('@Atl');
   out.imeEnter = {key: key('Enter', {keyCode: 229, isComposing: false}), text: input.value, bound: c.bound.length};
+  // A dataset the chat's save refuses (over the per-run limit) leaves the typed text as it is.
+  await type(''); await type('Compare @Coun'); refuse = true;
+  const before = c.bound.length; key('Enter'); await tick(); refuse = false;
+  out.refused = {text: input.value, added: c.bound.length - before, open: input.attrs['aria-expanded']};
   // A response arriving after dismissal cannot reopen the picker.
   await type('');
   let finish;
@@ -257,3 +265,8 @@ def test_markup_and_events_connect_accessible_picker_to_composer():
     assert 'role="listbox" aria-label="Your datasets"' in html
     assert 'if (datasetMentionKeydown(e)) return;' in source
     assert 'if (row) selectDatasetMention(Number(row.dataset.mentionIndex));' in source
+
+
+def test_a_refused_dataset_leaves_the_typed_text(mentions):
+    """Since issue 72 the chat's datasets are saved on the server: a refused one adds no @name."""
+    assert mentions["refused"] == {"text": "Compare @Coun", "added": 0, "open": "false"}

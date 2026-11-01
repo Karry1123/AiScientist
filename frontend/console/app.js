@@ -6344,19 +6344,25 @@ async function updateDatasetMentions() {
   renderDatasetMentions();
 }
 
-function selectDatasetMention(index) {
+async function selectDatasetMention(index) {
   const m = datasetMention, d = m.rows[index], input = $("chatInput"), q = m.query;
   if (!d || !q) return;
-  const name = d.name;
-  if (addDataset({ id: d.id, name, path: d.path, kind: d.kind, size: d.size_bytes, at: d.uploaded_at }) === false) return;
-  // The caret may sit inside an @word typed earlier: the pick replaces the whole word.
-  const end = q.end + /^\S*/.exec(input.value.slice(q.end))[0].length;
-  input.value = input.value.slice(0, q.start) + "@" + name + input.value.slice(end);
-  const caret = q.start + name.length + 1;
-  input.setSelectionRange(caret, caret);
-  const c = activeChat();
-  if (c) { c.draft = input.value; saveComposer(c); }
+  const name = d.name, typed = input.value.slice(q.start, q.end);
   closeDatasetMentions();
+  // The chat's datasets are saved on the server first: one it refuses (over the per-run limit, say)
+  // leaves the typed text as it is.
+  const attached = await addDataset({ id: d.id, name, path: d.path, kind: d.kind, size: d.size_bytes,
+                                      at: d.uploaded_at });
+  // Typing while the dataset was being saved moved the @word: the dataset is attached all the same.
+  if (attached && input.value.slice(q.start, q.end) === typed) {
+    // The caret may sit inside an @word typed earlier: the pick replaces the whole word.
+    const end = q.end + /^\S*/.exec(input.value.slice(q.end))[0].length;
+    input.value = input.value.slice(0, q.start) + "@" + name + input.value.slice(end);
+    const caret = q.start + name.length + 1;
+    input.setSelectionRange(caret, caret);
+    const c = activeChat();
+    if (c) { c.draft = input.value; saveComposer(c); }
+  }
   updateComposerButton();
   input.focus();
 }
