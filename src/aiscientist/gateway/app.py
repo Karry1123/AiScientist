@@ -5036,18 +5036,25 @@ def _stage_secondary_dataset(conn: Connection, path: str, name: str, role: "str 
             "hpc_primary": None, "remote": False, "primary": False}
 
 
-def _plan_dataset_inputs(decisions: dict) -> dict:
-    """The staged inputs and actual QC grouping shown before a plan runs."""
+def _plan_dataset_inputs(decisions: dict, primary_name: str = "") -> dict:
+    """The staged inputs and actual QC grouping shown before a plan runs.
+
+    The main dataset is named as the chat attached it (``primary_name``): its record names the matrix
+    found inside a folder. A dataset the run cannot use is listed once, with the reason."""
     together = {str(n).rstrip("/") for n in
                 (decisions.get("cellranger_layout") or {}).get("datasets", [])}
+    unusable = list(decisions.get("unusable_inputs") or [])
+    cannot = {str(d.get("name") or "") for d in unusable if isinstance(d, dict)}
     datasets = []
     for rec in decisions.get("datasets") or []:
-        name = _display_name(rec)
+        name = (primary_name or _display_name(rec)) if rec.get("primary") else _display_name(rec)
+        if name in cannot:
+            continue
         role = str(rec.get("role") or "").lower()
         use = ("reference" if role == "reference" else "main" if rec.get("primary") else
                "sample" if name.rstrip("/") in together else "extra input")
         datasets.append({"name": name, "role": rec.get("role"), "use": use})
-    return {"datasets": datasets, "unusable_inputs": list(decisions.get("unusable_inputs") or [])}
+    return {"datasets": datasets, "unusable_inputs": unusable}
 
 
 def _input_folder_list(bound: "list[dict]", records: "list[dict]", decisions: dict,
@@ -13984,7 +13991,7 @@ async def _run_lab(conn: Connection, req: LabRequest, *,
                                                "outputs": s["outputs"]}
                             for s in (run_flags["plan_doc"] or {}).get("steps") or []
                             if isinstance(s, dict) and s.get("outputs")}
-            prompt = {**_plan_dataset_inputs(decisions),
+            prompt = {**_plan_dataset_inputs(decisions, primary_name),
                       "revised": list(run_flags["plan_revised"]),
                       "problems": list(run_flags["plan_problems"]),
                       **(run_flags.get("plan_answer") or {}),
