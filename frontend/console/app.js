@@ -6313,7 +6313,9 @@ function selectDatasetMention(index) {
   if (!d || !q) return;
   const name = d.name;
   if (addDataset({ id: d.id, name, path: d.path, kind: d.kind, size: d.size_bytes, at: d.uploaded_at }) === false) return;
-  input.value = input.value.slice(0, q.start) + "@" + name + input.value.slice(q.end);
+  // The caret may sit inside an @word typed earlier: the pick replaces the whole word.
+  const end = q.end + /^\S*/.exec(input.value.slice(q.end))[0].length;
+  input.value = input.value.slice(0, q.start) + "@" + name + input.value.slice(end);
   const caret = q.start + name.length + 1;
   input.setSelectionRange(caret, caret);
   const c = activeChat();

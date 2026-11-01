@@ -94,6 +94,9 @@ const key = (key) => { const e = {key, prevented: false, preventDefault() {this.
   out.reopened = {open: input.attrs['aria-expanded'], enter: key('Enter')};
   await type(''); await type('Compare @Atlas with @Counts and go');
   out.pasted = {open: input.attrs['aria-expanded'], enter: key('Enter')};
+  // A pick with the caret inside an @word typed earlier replaces the whole word.
+  await type(''); await type('@Atlas more', 3); key('Enter');
+  out.midWord = {text: input.value, caret: input.selectionStart};
   // A response arriving after dismissal cannot reopen the picker.
   await type('');
   let finish;
@@ -148,6 +151,10 @@ def test_text_already_past_a_space_does_not_reopen_and_enter_sends(mentions):
     closed = {"open": "false", "enter": {"handled": False, "prevented": False}}
     assert mentions["reopened"] == closed
     assert mentions["pasted"] == closed
+
+
+def test_pick_inside_an_earlier_mention_replaces_the_whole_word(mentions):
+    assert mentions["midWord"] == {"text": "@Atlas more", "caret": 6}
 
 
 def test_same_names_have_kind_size_date_and_source_chat_without_paths(mentions):
