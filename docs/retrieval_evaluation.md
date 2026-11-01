@@ -16,6 +16,7 @@ nonempty `queries` (executed verbatim) and optional `terms` (a list of strings).
 
 - `relevant_passages`: objects such as `{"pmid": "12345678", "chunk": 0}`. These identify passages by the
   `(pmid, chunk)` pair in `chunks.jsonl`; corpus pairs must be unique. Do not use the array index as the chunk ID.
+  The script refuses a passage or PMID label that the corpus snapshot does not have.
 - `expected_pmids`: strings identifying supporting papers; exhaustive-list coverage needs a complete reviewed set.
 - `supporting_passages`: optional passage objects supporting the answer; defaults to `relevant_passages` if omitted.
   An explicit empty list means there are no passage-level support labels.

@@ -103,6 +103,17 @@ def test_hand_computed_metrics_enumeration_and_regressions(tiny):
     assert result["summary"]["dense"]["metrics"]["passage_recall"] == {"mean": 0.75, "n": 2}
 
 
+@pytest.mark.parametrize("label", [{"relevant_passages": [{"pmid": "b", "chunk": 7}]},
+                                   {"supporting_passages": [{"pmid": "PMID b", "chunk": 0}]},
+                                   {"expected_pmids": ["b", "PMID c"]}])
+def test_a_label_that_names_no_corpus_passage_or_paper_is_refused(tiny, label):
+    # A typo in a label would otherwise be a miss for every method, lowering all scores silently.
+    chunks, vecs = tiny
+    question = {"id": "typo", "category": "mechanism", "queries": ["rescue pathway"], **label}
+    with pytest.raises(ValueError, match="typo"):
+        ev.evaluate([question], chunks, vecs, embed, top_k=1, max_per_paper=1, enumeration_budget=4)
+
+
 def test_unlabeled_and_supporting_passage_metrics():
     assert all(v is None for v in ev.metrics([], {}).values())
     assert ev.metrics([], {"relevant_passages": [{"pmid": "a", "chunk": 0}]})["passage_precision"] == 0

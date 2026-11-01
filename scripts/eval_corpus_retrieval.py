@@ -121,6 +121,14 @@ def evaluate(questions: list[dict[str, Any]], chunks: list[dict[str, Any]], vecs
     keys = [passage_key(c) for c in chunks]
     if len(set(keys)) != len(keys):
         raise ValueError("Corpus (pmid, chunk) identifiers must be unique")
+    # A label the corpus does not have can never be retrieved: it would lower every method's score.
+    known, known_pmids = set(keys), {k[0] for k in keys}
+    unknown = [f"{q['id']}: {key} {p}" for q in questions for key in ("relevant_passages", "supporting_passages")
+               for p in q.get(key, []) if passage_key(p) not in known]
+    unknown += [f"{q['id']}: expected_pmids {p}" for q in questions for p in q.get("expected_pmids", [])
+                if str(p) not in known_pmids]
+    if unknown:
+        raise ValueError("Labels not in the corpus snapshot: " + "; ".join(unknown[:10]))
     index = TextIndex.of_chunks(chunks)
     rows = []
     for q in questions:
