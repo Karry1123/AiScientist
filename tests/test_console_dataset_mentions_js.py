@@ -160,6 +160,32 @@ def test_pick_inside_an_earlier_mention_replaces_the_whole_word(mentions):
     assert mentions["midWord"] == {"text": "@Atlas more", "caret": 6}
 
 
+def test_list_goes_above_the_caret_when_it_does_not_fit_below():
+    node = shutil.which("node")
+    if not node:
+        pytest.skip("node is not installed")
+    source = (ROOT / "app.js").read_text(encoding="utf-8")
+    script = _function(source, "positionDatasetMentions") + r"""
+const window = { innerWidth: 1200, innerHeight: 688 };
+const list = { parentElement: null, offsetWidth: 440, offsetHeight: 170, style: {} };
+const input = { value: 'Compare @', selectionStart: 9, scrollLeft: 0, scrollTop: 0,
+  getBoundingClientRect: () => ({ left: 497, top: 588, width: 536 }) };
+const $ = (id) => (id === 'chatInput' ? input : list);
+let caret;
+const document = { body: { appendChild(el) { if (el === list) list.parentElement = document.body; } },
+  createElement: () => ({ style: {}, appendChild() {}, remove() {}, getBoundingClientRect: () => caret }) };
+const getComputedStyle = () => ({});
+const place = (top) => { caret = { left: 585, top, bottom: top + 20 }; positionDatasetMentions(); return parseFloat(list.style.top); };
+console.log(JSON.stringify({ bottom: place(598), top: place(100) }));
+"""
+    done = subprocess.run([node, "-e", script], capture_output=True, text=True, encoding="utf-8", timeout=30)
+    assert done.returncode == 0, done.stderr
+    out = json.loads(done.stdout)
+    # The composer sits at the bottom of the window: the list ends above the caret line, never over it.
+    assert out["bottom"] + 170 <= 598
+    assert out["top"] == 120          # with room below, it opens under the caret line as before
+
+
 def test_enter_ending_an_ime_composition_neither_picks_nor_sends(mentions):
     assert mentions["imeEnter"] == {"key": {"handled": False, "prevented": False}, "text": "@Atl", "bound": 3}
     node = shutil.which("node")

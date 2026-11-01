@@ -6240,7 +6240,7 @@ function closeDatasetMentions(dismiss = true) {
   $("chatInput").removeAttribute("aria-activedescendant");
 }
 
-// Mirror the textarea's wrapping and scroll to anchor the list below the actual caret.
+// Mirror the textarea's wrapping and scroll to anchor the list at the actual caret.
 function positionDatasetMentions() {
   const input = $("chatInput"), list = $("datasetMentions"), rect = input.getBoundingClientRect();
   // The glass chat panel is a containing block for fixed descendants. Portal out of it.
@@ -6255,7 +6255,11 @@ function positionDatasetMentions() {
   document.body.appendChild(mirror);
   const caret = marker.getBoundingClientRect();
   const left = Math.max(12, Math.min(caret.left - input.scrollLeft, window.innerWidth - list.offsetWidth - 12));
-  const top = Math.max(12, Math.min(caret.bottom - input.scrollTop, window.innerHeight - list.offsetHeight - 12));
+  // Under the caret line when the list fits there, else above it (the composer sits at the bottom of
+  // the window): never over the text being typed.
+  const below = caret.bottom - input.scrollTop, above = caret.top - input.scrollTop - list.offsetHeight;
+  const top = below + list.offsetHeight > window.innerHeight - 12 && above >= 12 ? above
+    : Math.max(12, Math.min(below, window.innerHeight - list.offsetHeight - 12));
   list.style.left = `${left}px`;
   list.style.top = `${top}px`;
   mirror.remove();
