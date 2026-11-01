@@ -6383,6 +6383,7 @@ async function bindServerPath(path) {
 function hydrateChatDatasets(c, data) {
   if (Number.isInteger(data.max_bound_datasets)) state.maxBoundDatasets = data.max_bound_datasets;
   if (!Array.isArray(data.datasets)) return;
+  c.datasetsLoaded = true;
   c.bound = data.datasets.map((d) => d.path);
   c.roles = Object.fromEntries(data.datasets.filter((d) => d.role).map((d) => [d.path, d.role]));
   for (const d of data.datasets) {
@@ -6403,10 +6404,16 @@ function datasetLimitAllows(paths) {
 function changeChatDatasets(c, change) {
   if (!c) return Promise.resolve(false);
   const apply = async () => {
+    const s = state.sessions.find((x) => String(x.id) === String(c.sid));
+    if (s && s.cid && !c.datasetsLoaded) {
+      // A chat this page has not loaded (an upload restored after a reload finishing in it): the
+      // change applies to its saved set, not to an empty one that would replace it.
+      try { hydrateChatDatasets(c, await api("GET", `/api/conversations/${s.cid}`)); }
+      catch (err) { toast(`Datasets not saved: ${err.message}`); return false; }
+    }
     const next = { bound: [...c.bound], roles: { ...c.roles } };
     change(next);
     if (!datasetLimitAllows(next.bound)) return false;
-    const s = state.sessions.find((x) => String(x.id) === String(c.sid));
     try {
       if (s && s.cid) {
         if (next.bound.some((path) => !state.datasets.some((d) => d.path === path && d.id != null))) {

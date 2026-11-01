@@ -101,3 +101,73 @@ const api = async (method, url, body) => {
     result = subprocess.run([node, "-e", harness + "\n".join(blocks) + checks],
                             capture_output=True, text=True, encoding="utf-8", timeout=30)
     assert result.returncode == 0, result.stderr
+
+
+# A server-backed chat this page has not opened, a refused change, and a refused run, under node.
+_REVIEW_HARNESS = r'''
+const assert = require("assert");
+const state = { activeId: "1", status: "ready", connectionId: "conn", maxRuns: 0,
+  sessions: [{ id: "1", cid: 1, loaded: true, messages: [] }, { id: "2", cid: 2, loaded: false, messages: [] }],
+  datasets: [{id: 10, path: "/a.h5ad", name: "A", kind: "file"},
+             {id: 11, path: "/b.csv", name: "B", kind: "file"},
+             {id: 12, path: "/c.h5ad", name: "C", kind: "file"}],
+  selectedDatasetIds: new Set(), maxBoundDatasets: 12 };
+const stored = {}, localStorage = { getItem: k => stored[k] || null,
+  setItem: (k,v) => stored[k] = v, removeItem: k => delete stored[k] };
+const COMPOSER_KEY = "composer", RUNOWNER_KEY = "owners", STREAMS_KEY = "streams";
+const els = {}, $ = id => els[id] || (els[id] = {value:"", innerHTML:"", textContent:""});
+const escapeHtml = s => String(s).replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;").replace(/"/g,"&quot;");
+const datasetIcon = () => "draft", notices = [], toast = s => notices.push(s);
+const openChat = () => {}, authed = () => true, msgFromServer = x => x;
+const saved = { 1: [], 2: [{id: 10, role: null}, {id: 11, role: "primary"}] }, puts = [];
+let maxBound = 12;
+const row = d => ({...state.datasets.find(x => x.id === d.id), role: d.role});
+const api = async (method, url, body) => {
+  const cid = Number((url.match(/conversations\/(\d+)/) || [])[1]);
+  if (method === "PUT") { puts.push({cid, ids: body.datasets.map(d => d.id)}); saved[cid] = body.datasets; }
+  if (url === "/api/datasets") return { datasets: state.datasets, max_bound_datasets: maxBound };
+  return { datasets: (saved[cid] || []).map(row), max_bound_datasets: maxBound,
+           conversation: {title: "Study"}, messages: [] };
+};
+const revised = [], posted = [];
+const revisePlanInWords = (c, text) => revised.push(text);
+const updateComposerButton = () => {}, appendUserMessage = () => {}, injectPrompt = () => {};
+const setChatRunning = (c, on) => { c.running = on; };
+const isUnreachable = () => false, userTz = () => "UTC", FIXED_RUN_OPTIONS = {};
+const activeSession = () => state.sessions.find(s => s.id === state.activeId);
+let labReply = { status: 200, body: {} };
+const fetch = async (url, opt) => { posted.push(JSON.parse(opt.body));
+  return { ok: labReply.status < 300, status: labReply.status, json: async () => labReply.body,
+           clone() { return this; } }; };
+'''
+
+
+def _run_review_checks(checks: str) -> None:
+    node = shutil.which("node")
+    if not node:
+        pytest.skip("node is not installed")
+    source = APP.read_text(encoding="utf-8")
+    blocks = [
+        source[source.index("const chats = new Map();"):source.index("function toast(")],
+        source[source.index("const _PRIMARY_SUFFIXES"):source.index("// A dataset row's kind")],
+        source[source.index("function hydrateChatDatasets("):source.index("// A deleted dataset")],
+        source[source.index("function toggleBound("):source.index("// The composer's upload line")],
+        source[source.index("async function ensureMessages("):source.index("async function loadSessions(")],
+        source[source.index("async function sendChat("):source.index("// ---- plan-mode review")],
+    ]
+    script = (_REVIEW_HARNESS + "\n".join(blocks)
+              + "\n(async () => {\n" + checks + "\n})().catch(e => {console.error(e.stack); process.exit(1)});")
+    result = subprocess.run([node, "-e", script], capture_output=True, text=True, encoding="utf-8", timeout=30)
+    assert result.returncode == 0, result.stderr
+
+
+def test_an_upload_finishing_in_a_chat_not_opened_since_a_reload_keeps_its_saved_datasets():
+    # After a reload the server restores an upload's copy to HPC3; when it finishes it attaches to the
+    # chat it was started from, which this page has not opened: that chat's saved set is kept.
+    _run_review_checks(r'''
+  await addDataset({id: 12, path: "/c.h5ad", name: "C", kind: "file"}, "2");
+  assert.deepStrictEqual(puts, [{cid: 2, ids: [10, 11, 12]}]);
+  assert.equal(saved[2].find(d => d.id === 11).role, "primary");
+  assert.deepStrictEqual(chatOf("2").bound, ["/a.h5ad", "/b.csv", "/c.h5ad"]);
+''')
+
