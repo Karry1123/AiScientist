@@ -5251,12 +5251,17 @@ window.addEventListener("online", uploadsLinkBack);
 function uploadFailure(err, where, next) {
   const res = tusResponseOf(err);
   const status = res ? res.getStatus() : 0;
-  let said = "";
-  if (res) { try { said = JSON.parse(res.getBody() || "{}").error || ""; } catch { /* not JSON */ } }
+  let said = "", overLimit = false;
+  if (res) {
+    try { const body = JSON.parse(res.getBody() || "{}"); said = body.error || ""; overLimit = !!body.storage_url; }
+    catch { /* not JSON */ }
+  }
+  // The account limit's message links Account → Storage in Markdown; the card has its own button.
+  const plain = (s) => String(s).replace(/\[([^\]]+)\]\([^)]*\)/g, "$1");
   const detail = (err && err.message) || "";
   const noAnswer = !!err && (err instanceof TypeError || (!!err.originalRequest && !status));
   if (noAnswer) return { lost: true, detail, text: `The connection was lost${where}. ${next}` };
-  if (status === 507) return { lost: false, detail, text: "The server's disk is too full for this file." };
+  if (status === 507) return { lost: false, detail, text: overLimit && said ? plain(said) : "The server's disk is too full for this file." };
   if (status >= 500) return { lost: true, detail, text: `The server did not answer (HTTP ${status})${where}. ${next}` };
   if (status === 401) return { lost: false, detail, text: "You are signed out. Sign in again, then continue the upload." };
   if (status === 408 || status === 423) {   // the server keeps the upload: no bytes came, or no session holds it
@@ -5270,7 +5275,7 @@ function uploadFailure(err, where, next) {
     return { lost: false, detail, text: "The server no longer knows this session (it was restarted, or you were disconnected). Connect to HPC3 again, then continue the upload." };
   }
   if (status) return { lost: false, detail, text: said ? `The server refused the upload: ${said}` : `The server refused the upload (HTTP ${status}).` };
-  return { lost: false, detail: "", text: detail.replace(/^tus: /, "") || "upload failed" };
+  return { lost: false, detail: "", text: plain(detail.replace(/^tus: /, "")) || "upload failed" };
 }
 const STAGING_POLL_MS = 15000;      // how long to wait for a WebSocket event before asking the server
 const UPLOAD_ACTIVE = ["queued", "uploading", "staging", "verifying", "unpacking"];

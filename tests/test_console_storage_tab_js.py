@@ -254,3 +254,30 @@ const fetch = async () => ({ ok, json: async () => ({ datasets: [{ id: 2, path: 
 '''
     out = subprocess.run([node, "-e", script], capture_output=True, text=True)
     assert out.returncode == 0, out.stderr or out.stdout
+
+
+def test_an_upload_over_the_account_limit_says_how_much_space_is_left():
+    node = shutil.which("node")
+    if not node:
+        pytest.skip("node is not installed")
+    source = APP.read_text(encoding="utf-8")
+    failure = source[source.index("function uploadFailure(err, where, next)"):source.index("const STAGING_POLL_MS")]
+    response = source[source.index("function tusResponseOf(err)"):source.index("// Asked after every failed request")]
+    script = r'''
+const assert = require("assert");
+const refused = (status, body) => ({ message: "tus: unexpected response", originalRequest: {},
+  originalResponse: { getStatus: () => status, getBody: () => JSON.stringify(body) } });
+''' + response + failure + r'''
+const quota = uploadFailure(refused(507, { error: "Account storage limit reached: 1.50 GB of space left. " +
+  "Free space in [Account → Storage](/?account=storage) before saving more datasets.", storage_url: "#account/storage" }), "", "");
+assert.strictEqual(quota.text, "Account storage limit reached: 1.50 GB of space left. " +
+  "Free space in Account → Storage before saving more datasets.");
+assert.strictEqual(quota.lost, false);
+const disk = uploadFailure(refused(507, { error: "not enough eyeserver disk space" }), "", "");
+assert.strictEqual(disk.text, "The server's disk is too full for this file.");
+const reserve = uploadFailure(new Error("Account storage limit reached: 0.00 GB of space left. " +
+  "Free space in [Account → Storage](/?account=storage) before saving more datasets."), "", "");
+assert(!reserve.text.includes("](/?account=storage)"), reserve.text);
+'''
+    out = subprocess.run([node, "-e", script], capture_output=True, text=True)
+    assert out.returncode == 0, out.stderr or out.stdout
