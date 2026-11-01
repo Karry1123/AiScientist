@@ -557,7 +557,9 @@ async function api(method, url, body) {
   const r = await fetch(url, opt);
   if (!r.ok) {
     const data = await r.json().catch(() => ({}));
-    throw new Error(data.detail || data.error || `${method} ${url} -> ${r.status}`);
+    // A validation error (422) carries a list in `detail`: only a string is a message.
+    const detail = typeof data.detail === "string" ? data.detail : "";
+    throw new Error(detail || data.error || `${method} ${url} -> ${r.status}`);
   }
   return r.status === 204 ? null : r.json();
 }

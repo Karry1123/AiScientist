@@ -195,3 +195,30 @@ def test_a_run_the_server_refuses_for_its_dataset_count_says_why():
   assert(notices.pop().includes("At most 12 datasets"), notices);
   assert.equal($("chatInput").value, "run QC");
 ''')
+
+
+def test_api_error_uses_only_a_string_detail():
+    """A refusal's reason in ``detail`` is the message; a 422's list of field errors is not."""
+    node = shutil.which("node")
+    if not node:
+        pytest.skip("node is not installed")
+    source = APP.read_text(encoding="utf-8")
+    block = source[source.index("async function api("):source.index("// Map a stored server message row")]
+    script = block + r'''
+const assert = require("assert");
+let reply;
+globalThis.fetch = async () => reply;
+const fail = (status, data) => ({ ok: false, status, json: async () => data });
+(async () => {
+  reply = fail(400, { detail: "At most 12 datasets per run." });
+  await assert.rejects(api("POST", "/api/x"), { message: "At most 12 datasets per run." });
+  reply = fail(422, { detail: [{ loc: ["body", "datasets"], msg: "field required" }] });
+  await assert.rejects(api("PUT", "/api/y"), { message: "PUT /api/y -> 422" });
+  reply = fail(409, { error: "Not connected" });
+  await assert.rejects(api("GET", "/api/z"), { message: "Not connected" });
+  console.log("ok");
+})().catch(e => { console.error(e); process.exit(1); });
+'''
+    out = subprocess.run([node, "-e", script], capture_output=True, text=True, timeout=30)
+    assert out.returncode == 0, out.stderr
+    assert out.stdout.strip() == "ok"
