@@ -132,6 +132,8 @@ def build_scientist_catalog(code_executor: Any = None, scgpt_runner: Any = None,
     env_tool = make_run_in_environment_tool(code_executor)
     if env_tool is not None:
         catalog.append(env_tool)
+    from .atlas_expression import build_atlas_tools
+    catalog.extend(build_atlas_tools(code_executor, env_tool))
     if importlib.util.find_spec("scanpy") is not None:
         catalog = [t for t in catalog if t.name not in _SUPERSEDED_WHEN_SCANPY]
     # The HPC3 filesystem/shell line — appended LAST so it never displaces a typed tool in the

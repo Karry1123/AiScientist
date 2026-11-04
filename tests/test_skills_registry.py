@@ -16,6 +16,7 @@ from aiscientist.agents.research_harness import HarnessContext
 def release(tmp_path, monkeypatch):
     root = tmp_path / "releases" / "0.1.0"
     root.mkdir(parents=True)
+    monkeypatch.setenv("AISCIENTIST_SKILLS_REGISTRY_RELEASE_TAG", "v0.1.0")
     monkeypatch.setenv("AISCIENTIST_SKILLS_REGISTRY_RELEASES_ROOT", str(root.parent))
     monkeypatch.setenv("AISCIENTIST_SKILLS_REGISTRY_STATS", str(tmp_path / "counts.sqlite3"))
     rows = []
@@ -92,8 +93,8 @@ def test_an_absent_release_is_an_empty_library_and_says_how_to_install_it(tmp_pa
     (local / "SKILL.md").write_text("---\nname: example\n---\nLocal guidance")
     assert registry.load(sk._load_from) == {}
     assert sk._load_skills() == {}
-    assert "Pinned skills release v0.1.0 is not installed" in caplog.text
-    assert (f"gh release download v0.1.0 -R lijinbio/aiscientist-skills -D {tmp_path / 'absent' / '0.1.0'}"
+    assert "Pinned skills release v0.2.0 is not installed" in caplog.text
+    assert (f"gh release download v0.2.0 -R lijinbio/aiscientist-skills -D {tmp_path / 'absent' / '0.2.0'}"
             in caplog.text)
 
 
@@ -250,6 +251,7 @@ def test_release_as_the_registry_publishes_it(tmp_path, monkeypatch):
     timestamps, SHA256SUMS over the zips and catalog.json."""
     root = tmp_path / "releases" / "0.1.0"
     root.mkdir(parents=True)
+    monkeypatch.setenv("AISCIENTIST_SKILLS_REGISTRY_RELEASE_TAG", "v0.1.0")
     monkeypatch.setenv("AISCIENTIST_SKILLS_REGISTRY_RELEASES_ROOT", str(root.parent))
     name = "qc-snrna-with-cellqc-standalone"
     with zipfile.ZipFile(root / f"{name}-1.0.0.zip", "w", zipfile.ZIP_DEFLATED) as zf:
@@ -292,6 +294,7 @@ def bundle_release(tmp_path, monkeypatch, members: dict[str, str], rows: list[st
     with each skill folder at its catalog path, catalog.json, and SHA256SUMS over the two."""
     root = tmp_path / "releases" / "0.1.0"
     root.mkdir(parents=True)
+    monkeypatch.setenv("AISCIENTIST_SKILLS_REGISTRY_RELEASE_TAG", "v0.1.0")
     monkeypatch.setenv("AISCIENTIST_SKILLS_REGISTRY_RELEASES_ROOT", str(root.parent))
     monkeypatch.setenv("AISCIENTIST_SKILLS_REGISTRY_ALLOWED_TIERS", "core,verified,community")
     with zipfile.ZipFile(root / "aiscientist-skills-0.1.0.zip", "w", zipfile.ZIP_DEFLATED) as zf:

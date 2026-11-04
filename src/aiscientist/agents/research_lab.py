@@ -1161,7 +1161,9 @@ def _known_tool_names() -> frozenset[str]:
         from .registry import build_scientist_catalog
         # run_in_environment is only built for a live HPC3 session, so the bare catalog lacks it;
         # a step that names it must still be recognised as that tool's step.
-        return frozenset(t.name for t in build_scientist_catalog()) | {"run_in_environment"}
+        from .atlas_expression import TOOLS as atlas_tools
+        return (frozenset(t.name for t in build_scientist_catalog())
+                | {"run_in_environment"} | atlas_tools.keys())
     except Exception:  # noqa: BLE001 - classification degrades, it does not fail
         return frozenset()
 
