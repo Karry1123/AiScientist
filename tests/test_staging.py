@@ -157,8 +157,10 @@ def test_wait_returns_none_while_running_and_the_job_once_settled(h):
 def test_no_session_requeues_without_using_an_attempt_and_resume_finishes(h):
     h.no_session = True
     job = h.job()
-    h.q.submit(job)
-    time.sleep(0.1)
+    # Wait for the attempt's thread to end, not for a fixed time: resume() skips a job whose
+    # attempt is still running, and on a slow runner "queued" is written before the thread
+    # returns (CI, 2026-11-04).
+    h.q.submit(job).result(timeout=5)
     j = h.q.get(job.id)
     assert j.state == "queued" and j.attempts == 0 and "session" in j.error
     h.no_session = False
