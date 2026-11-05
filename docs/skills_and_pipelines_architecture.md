@@ -177,10 +177,11 @@ the reason logged, and the skill still loads as guidance.
 
 ### The pinned registry release
 
-`configs/skills_registry.json` pins a registry release tag, `v0.1.0`. A branch name such as `main`
-is refused. The config also lists the tiers to load (`core`, `verified` and `community`; every
-skill but CellQC is `community` in `v0.1.0`, so without that tier an installed release would load
-only CellQC) and the releases root. Each key has an `AISCIENTIST_SKILLS_REGISTRY_<KEY>` override.
+`configs/skills_registry.json` pins a registry release tag, `v0.2.0`. A branch name such as `main`
+is refused. The config also lists the tiers to load (`core`, `verified` and `community`)
+and the releases root. Community remains enabled using the existing tier mechanism:
+`explore-atlas-expression-with-aiscientist-mcp` is community in v0.2.0 and is not promoted
+locally. Each key has an `AISCIENTIST_SKILLS_REGISTRY_<KEY>` override.
 Updating skills means changing the tag and installing the release.
 
 `agents/skills_registry.py` reads `skills/releases/<version>/`, which holds the release's three
@@ -190,8 +191,8 @@ The folder is outside git (`.gitignore`), and an app release never ships or dele
 server `deploy/deploy_skills.sh` installs it; a development checkout that needs skills downloads it:
 
 ```bash
-gh release download v0.1.0 -R lijinbio/aiscientist-skills -D skills/releases/0.1.0
-(cd skills/releases/0.1.0 && sha256sum -c SHA256SUMS)   # leave the zip packed
+gh release download v0.2.0 -R lijinbio/aiscientist-skills -D skills/releases/0.2.0
+(cd skills/releases/0.2.0 && sha256sum -c SHA256SUMS)   # leave the zip packed
 ```
 
 The loader checks `SHA256SUMS` against `catalog.json`, the bundle or every skill zip, and every
@@ -324,3 +325,68 @@ How a run gets its pipeline:
 
 When a pipeline is loaded, the console shows the tools it composes and marks those this deployment
 cannot run.
+
+
+## Atlas expression MCP bridge
+
+The v0.2.0 bundle SHA-256 is
+`6ce775b9ddde52982e7a905c430b8e55db3543e2f5d0b6f8524068105e818e2a`.
+Install the three release assets and verify `SHA256SUMS` as above. The loader
+continues to verify the entire release before exposing skills; no analysis code
+or unverified copy of the skill is bundled into AiScientist.
+
+`agents/atlas_expression.py` exposes the server's nine typed tools to the planner
+when the allowed skill and an image executor are available. It calls
+`aiscientist-mcp --server atlas-expression-exploration-mcp --timeout 15000 call <tool> '<json>'`
+through `run_in_environment`. The image's bundled client starts the MCP server
+over stdio; the gateway needs no MCP or scanpy installation. The server owns
+resolution and analysis. Follow `resolve_genes` -> `submit_query` -> `query_status`
+-> `get_summary`, the three plot tools -> `write_report`; `list_queries` lists
+only this run's queries. Pass all requested names together, unchanged. Report
+CRALBP -> RLBP1 (alias), ABCR -> ABCA4 (previous symbol), rho -> RHO (case), and
+any unresolved or ambiguous names from the server. Report donor support with
+expression claims; these are descriptive summaries, not differential tests.
+
+Attach the HECA `.h5ad` as the primary dataset at its shared, immutable path on
+HPC3, visible to the compute nodes. The executor binds that dataset read-only;
+the bridge neither copies it nor accepts an alternative atlas path. Provisioning
+shared HECA versions and mounting Eye Server storage on HPC3 are deployment work
+from issue 92, not performed by this bridge. Set `AISCIENTIST_ATLAS_FILES` to a
+semicolon-separated mapping, for example
+`heca/v2026.11=/shared/heca/v2026.11/HRCA_snRNA_allcells.h5ad`.
+The primary dataset must match a configured path after POSIX path normalization;
+the matched entry supplies the immutable release label.
+Each successful call records the label, resolved path, size and mtime in the
+run's `manifest.json`, alongside the skill release and image provenance. The
+label must describe that file's actual immutable release; size and mtime are
+additional identity metadata, not cryptographic checksum verification.
+
+Inside the container `ATLAS_H5AD=$AISCIENTIST_DATASET`,
+`AISCI_DATA_DIR=$AISCIENTIST_ENV_DIR` (a persistent directory within this run),
+and `AISCI_EXECUTOR=inline`. Only `submit_query` requests the skill's 4 CPUs,
+300 GB and 04:00:00. All other tools use 2 CPUs, 16 GB and 00:30:00, including
+status and list calls, which preserve the server's state handling in a light job.
+The platform supplies these resources internally, outside the tool JSON schema.
+There is no nested Slurm submission or gateway fallback. Plot/report calls read the
+small `query.h5ad`, and do not reload the full atlas. The CLI timeout covers the
+four-hour job. The image is pinned to
+`docker://ghcr.io/lijinbio/mcp-atlas-expression-exploration@sha256:5e9b13da5d180e7983945a7f1f4182e4b12876d3ec8f59ed0a0aa7b43d041d8a`.
+Image provisioning and the server's first HGNC download require deployment
+network access. `ATLAS_HGNC` sets the lab-shared HGNC cache file, defaulting to
+`<parent of executor images_dir>/skills/atlas-expression/hgnc_complete_set.txt`
+(or `/shared/skills/atlas-expression/hgnc_complete_set.txt` without images_dir).
+The executor creates and mounts its parent directory writable so one download
+serves all runs. Configure a dedicated cache directory visible on compute nodes.
+
+After every successful call, `gene_resolution.tsv`, `summary_*.tsv`, PDF/PNG
+plots and `report.md` are copied to
+`$AISCIENTIST_ARTIFACTS/gene_expression/<query_id>/`. The existing executor
+mirrors them to the website's run artifacts and reports evidence paths.
+`query.h5ad`, logs and job state stay in work storage. Use the nine typed atlas
+tools; direct `run_in_environment` calls for this skill are refused.
+
+Responses omit report Markdown and bound summary rows, reporting `rows_omitted`
+and `full_table` for the complete artifact. The collector also saves
+`gene_expression/mcp_result.json` (replaced each call) and uses that evidence path
+for other oversized responses. Stdout stays below the executor's 20,000-character
+limit and is removed from the parsed tool response.

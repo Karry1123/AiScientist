@@ -87,6 +87,8 @@ def skill_release(tmp_path, monkeypatch):
     monkeypatch.setenv("AISCIENTIST_SKILLS_REGISTRY_STATS", str(tmp_path / "skill_versions.sqlite3"))
 
     def install(source: Path, *, refresh: bool = True, **kw) -> Path:
+        kw.setdefault("tag", "v0.1.0")
+        monkeypatch.setenv("AISCIENTIST_SKILLS_REGISTRY_RELEASE_TAG", kw["tag"])
         root = write_release(releases, source, **kw)
         if refresh:
             sk.refresh_skills()

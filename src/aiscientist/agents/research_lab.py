@@ -994,7 +994,9 @@ def make_run_in_environment_tool(executor: Any,
                                     "command_sha256": hashlib.sha256(command.encode()).hexdigest()[:16]}
         return result
 
-    def _exec(args: dict[str, Any], ctx: HarnessContext) -> dict[str, Any]:
+    def _exec(args: dict[str, Any], ctx: HarnessContext, *,
+              _atlas_bridge: bool = False, _resources: tuple | None = None,
+              _cache_dir: str = "") -> dict[str, Any]:
         import hashlib
         from pathlib import Path as _Path
         from .skills import SKILLS, get_skill, refresh_skills
@@ -1010,6 +1012,9 @@ def make_run_in_environment_tool(executor: Any,
         if skill is None:
             return {"status": "error", "error": f"no skill named {wanted!r}. Skills that declare an "
                                                 f"environment: {with_env or 'none'}"}
+        from .atlas_expression import SKILL, TOOLS
+        if skill.name == SKILL and not _atlas_bridge:
+            return {"status": "error", "error": "Use the atlas bridge tools: " + ", ".join(TOOLS)}
         if not skill.image:
             why = f" ({skill.env_problem})" if skill.env_problem else ""
             return {"status": "error",
@@ -1022,6 +1027,9 @@ def make_run_in_environment_tool(executor: Any,
                  if folder is not None and (folder / rel).is_file()}
         workdir = "env/" + re.sub(r"[^\w.\-]", "_", skill.name)
         from .skills_registry import execute
+        # Platform callers select resources without exposing overrides to the model.
+        cpus, mem_gb, time_limit = _resources or (skill.cpus, skill.mem_gb, skill.time_limit)
+        cache = {"cache_dir": _cache_dir} if _cache_dir else {}
         def run():
             if skill.registry_release:
                 import tempfile
@@ -1032,10 +1040,10 @@ def make_run_in_environment_tool(executor: Any,
                         path.parent.mkdir(parents=True, exist_ok=True)
                         path.write_text(text, encoding="utf-8")
                         staged[rel] = str(path)
-                    return runner(command, skill.image, workdir=workdir, cpus=skill.cpus,
-                                  mem_gb=skill.mem_gb, time_limit=skill.time_limit, files=staged)
-            return runner(command, skill.image, workdir=workdir, cpus=skill.cpus,
-                          mem_gb=skill.mem_gb, time_limit=skill.time_limit, files=files)
+                    return runner(command, skill.image, workdir=workdir, cpus=cpus,
+                                  mem_gb=mem_gb, time_limit=time_limit, files=staged, **cache)
+            return runner(command, skill.image, workdir=workdir, cpus=cpus,
+                          mem_gb=mem_gb, time_limit=time_limit, files=files, **cache)
         result = execute(skill, ctx, executor, run, "run_in_environment", code=command)
         if isinstance(result, dict):
             result["skill"] = skill.name
@@ -1236,7 +1244,9 @@ def _known_tool_names() -> frozenset[str]:
         from .registry import build_scientist_catalog
         # run_in_environment is only built for a live HPC3 session, so the bare catalog lacks it;
         # a step that names it must still be recognised as that tool's step.
-        return frozenset(t.name for t in build_scientist_catalog()) | {"run_in_environment"}
+        from .atlas_expression import TOOLS as atlas_tools
+        return (frozenset(t.name for t in build_scientist_catalog())
+                | {"run_in_environment"} | atlas_tools.keys())
     except Exception:  # noqa: BLE001 - classification degrades, it does not fail
         return frozenset()
 
