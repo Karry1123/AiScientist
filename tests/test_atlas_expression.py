@@ -23,7 +23,7 @@ RESOLUTION = [
 
 @pytest.fixture
 def release(skill_release, monkeypatch):
-    monkeypatch.setenv("AISCIENTIST_ATLAS_VERSION", "heca/v2026.11")
+    monkeypatch.setenv("AISCIENTIST_ATLAS_FILES", "heca/v2026.11=" + Runner.dataset_path)
     return skill_release(FIXTURE, tag="v0.2.0")
 
 
@@ -69,14 +69,15 @@ def test_resolution_flow_preserves_all_user_names_and_provenance(release, tmp_pa
     catalog = tools(runner)
     ctx = HarnessContext(workspace=tmp_path)
     result = catalog["resolve_genes"].executor({"genes": GENES}, ctx)
+    assert "stdout" not in result
     assert result["resolution"] == RESOLUTION
     runner.result = {"query_id": "HRCA__LRAT_RLBP1_RHO_ABCA4", "state": "COMPLETED", "resolution": RESOLUTION}
     submitted = catalog["submit_query"].executor({"genes": GENES}, ctx)
     assert submitted["resolution"] == RESOLUTION
     assert submitted["artifacts"] == ["gene_expression/q/gene_resolution.tsv"]
-    for command, image, kwargs in runner.calls:
+    for index, (command, image, kwargs) in enumerate(runner.calls):
         assert image == IMAGE
-        assert (kwargs["cpus"], kwargs["mem_gb"], kwargs["time_limit"]) == (4, 300, "04:00:00")
+        assert (kwargs["cpus"], kwargs["mem_gb"], kwargs["time_limit"]) == ((2, 16, "00:30:00") if index == 0 else (4, 300, "04:00:00"))
         cli = next(line for line in command.splitlines() if line.startswith("aiscientist-mcp "))
         assert json.loads(shlex.split(cli)[7]) == {"genes": GENES}
         assert 'ATLAS_H5AD="$AISCIENTIST_DATASET"' in command
@@ -113,10 +114,10 @@ def test_invalid_binding_version_and_failed_container(release, monkeypatch):
     runner.dataset_path = "/shared/not-an-atlas.txt"
     assert tool.executor({"genes": GENES}, None)["status"] == "error"
     runner.dataset_path = Runner.dataset_path
-    monkeypatch.delenv("AISCIENTIST_ATLAS_VERSION")
+    monkeypatch.delenv("AISCIENTIST_ATLAS_FILES")
     assert tool.executor({"genes": GENES}, None)["status"] == "error"
     assert not runner.calls
-    monkeypatch.setenv("AISCIENTIST_ATLAS_VERSION", "heca/v2026.11")
+    monkeypatch.setenv("AISCIENTIST_ATLAS_FILES", "heca/v2026.11=" + Runner.dataset_path)
     monkeypatch.setattr(runner, "run_in_image", lambda *a, **kw: {"status": "error", "stderr": "OOM"})
     assert tools(runner)["submit_query"].executor({"genes": GENES}, None)["stderr"] == "OOM"
     monkeypatch.setattr(runner, "run_in_image", lambda *a, **kw: {"status": "ok", "stdout": "truncated"})
@@ -140,11 +141,12 @@ def test_deliverables_are_collected_without_checkpoint_or_atlas(release, tmp_pat
     monkeypatch.setenv("AISCIENTIST_ARTIFACTS", str(artifacts))
     monkeypatch.setenv("ATLAS_H5AD", str(source))
     monkeypatch.setenv("AISCI_ATLAS_RESULT", str(tmp_path / ".atlas-result.json"))
+    monkeypatch.setenv("AISCI_ATLAS_RELEASE", "heca/v2026.11")
     exec(atlas.COLLECT, {})
     response = json.loads(capsys.readouterr().out)
     assert response["result"]["resolution"] == RESOLUTION
     assert response["atlas"]["size_bytes"] == source.stat().st_size
-    assert sorted(p.name for p in artifacts.rglob("*") if p.is_file()) == sorted(names)
+    assert sorted(p.name for p in artifacts.rglob("*") if p.is_file()) == sorted([*names, "mcp_result.json"])
     assert source.read_text() == "mock atlas; never parsed"
 
 
@@ -157,4 +159,85 @@ def test_submit_uses_real_slurm_image_path_with_metadata(release):
     script = "\n".join(hpc.commands)
     for value in ("--cpus-per-task=4", "--mem=300G", "--time=04:00:00",
                   "AISCI_EXECUTOR=inline", "call submit_query", "apptainer"):
+        assert value in script
+
+
+@pytest.mark.parametrize("kind", ["summary", "report", "queries"])
+def test_large_response_survives_stdout_tail(release, tmp_path, monkeypatch, capsys, kind):
+    from aiscientist.agents.sandbox import _tail
+
+    data = tmp_path / "work"
+    query = data / "atlas-expression-exploration" / "q"
+    query.mkdir(parents=True)
+    (query / "state.json").write_text("{}")
+    table = query / "summary_majorclass.tsv"
+    table.write_text("full table")
+    result = {
+        "summary": {"table": str(table), "rows": [{"gene": "G", "value": "x" * 316}] * 80},
+        "report": {"file": str(query / "report.md"), "markdown": "report" * 10000},
+        "queries": {"queries": [{"query_id": "q" * 300}] * 100},
+    }[kind]
+    source = tmp_path / "atlas.h5ad"
+    source.write_text("atlas")
+    raw = tmp_path / "result.json"
+    raw.write_text(json.dumps(result))
+    for key, value in {"AISCI_DATA_DIR": data, "AISCIENTIST_ARTIFACTS": tmp_path / "artifacts",
+                       "ATLAS_H5AD": source, "AISCI_ATLAS_RESULT": raw,
+                       "AISCI_ATLAS_RELEASE": "heca/v2026.11"}.items():
+        monkeypatch.setenv(key, str(value))
+    exec(atlas.COLLECT, {})
+    stdout = capsys.readouterr().out
+    assert len(stdout) < 20000
+    payload = json.loads(_tail(stdout, 20000))
+    compact = payload["result"]
+    if kind == "summary":
+        assert len(compact["rows"]) + compact["rows_omitted"] == 80
+        assert compact["rows_omitted"] > 0
+        assert compact["full_table"] == "gene_expression/q/summary_majorclass.tsv"
+    elif kind == "report":
+        assert "markdown" not in compact
+        assert compact["file"] == result["file"]
+    else:
+        assert compact["response_omitted"]
+    runner = Runner()
+    monkeypatch.setattr(runner, "run_in_image", lambda *a, **kw: {"status": "ok", "stdout": _tail(stdout, 20000)})
+    response = tools(runner)["list_queries"].executor({}, HarnessContext(workspace=tmp_path))
+    assert response["status"] == "ok"
+    assert "stdout" not in response
+    assert json.loads((tmp_path / "manifest.json").read_text())["atlas"]["version"] == "heca/v2026.11"
+
+
+def test_direct_skill_refused_even_with_model_override_arguments(release):
+    runner = Runner()
+    tool = tools(runner)["run_in_environment"]
+    out = tool.executor({"skill": atlas.SKILL.upper(), "command": "true",
+                         "_atlas_bridge": True, "_resources": [1, 1, "00:01:00"]}, None)
+    assert out["status"] == "error"
+    assert all(name in out["error"] for name in atlas.TOOLS)
+    assert not runner.calls
+    assert not {"_atlas_bridge", "_resources", "_cache_dir"} & tool.parameters["properties"].keys()
+
+
+def test_configured_paths_are_normalized_and_supply_the_release(release, monkeypatch):
+    runner = Runner()
+    runner.dataset_path = "/shared/other/../other/release.h5ad"
+    monkeypatch.setenv("AISCIENTIST_ATLAS_FILES", "other/v1=/shared/other/release.h5ad")
+    tools(runner)["resolve_genes"].executor({"genes": GENES, "atlas": "/shared/other/release.h5ad"}, None)
+    assert "AISCI_ATLAS_RELEASE=other/v1" in runner.calls[0][0]
+    runner.dataset_path = "/shared/unconfigured.h5ad"
+    assert tools(runner)["resolve_genes"].executor({"genes": GENES}, None)["status"] == "error"
+
+
+@pytest.mark.parametrize("name", sorted(set(atlas.TOOLS) - {"submit_query"}))
+def test_light_tools_use_small_jobs_and_shared_hgnc(release, name, monkeypatch):
+    from test_run_in_environment import _HPC, _executor
+    hpc = _HPC()
+    runner = _executor(hpc)
+    runner.dataset_path = Runner.dataset_path
+    monkeypatch.setenv("ATLAS_HGNC", "/shared/skills/hgnc/complete.txt")
+    args = {key: "q" for key in atlas.TOOLS[name][1]["required"]}
+    tools(runner)[name].executor(args, None)
+    script = "\n".join(hpc.commands)
+    for value in ("--cpus-per-task=2", "--mem=16G", "--time=00:30:00",
+                  "ATLAS_HGNC=/shared/skills/hgnc/complete.txt", "/shared/skills/hgnc:/shared/skills/hgnc"):
         assert value in script

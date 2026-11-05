@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import json
 import os
+import posixpath
 import shlex
 from typing import Any
 
@@ -29,10 +30,30 @@ for state in root.glob("*/state.json"):
                 target = dest / query.name / source.name
                 target.parent.mkdir(parents=True, exist_ok=True)
                 shutil.copy2(source, target)
+# Save the complete response as evidence before bounding the transport envelope.
+result.pop("markdown", None)
+dest.mkdir(parents=True, exist_ok=True)
+full = dest / "mcp_result.json"
+full.write_text(json.dumps(result))
+if "rows" in result:
+    result["full_table"] = "gene_expression/" + Path(result["table"]).relative_to(root).as_posix()
+    result["rows_omitted"] = 0
+    rows = result["rows"]
+    result["rows"] = []
+    size = len(json.dumps(result))
+    for row in rows:
+        size += len(json.dumps(row)) + 2
+        if size > 12000:
+            break
+        result["rows"].append(row)
+    result["rows_omitted"] = len(rows) - len(result["rows"])
+if len(json.dumps(result)) > 14000:
+    result = {k: result[k] for k in ("state", "query_id") if k in result and len(json.dumps(result[k])) < 1000}
+    result.update(response_omitted=True, full_result="gene_expression/mcp_result.json")
 atlas = Path(os.environ["ATLAS_H5AD"])
 stat = atlas.stat()
 print(json.dumps({"result": result, "atlas": {"path": str(atlas.resolve()),
-    "version": os.environ["AISCIENTIST_ATLAS_VERSION"],
+    "version": os.environ["AISCI_ATLAS_RELEASE"],
     "size_bytes": stat.st_size, "mtime_ns": stat.st_mtime_ns}}, separators=(",", ":")))
 '''
 
@@ -75,23 +96,32 @@ def build_atlas_tools(executor: Any, environment_tool: Any) -> list:
         if set(args) - set(schema["properties"]) or any(k not in args for k in schema["required"]):
             return {"status": "error", "error": "Unexpected or missing atlas tool arguments"}
         atlas = str(getattr(executor, "dataset_path", "") or "")
-        if not atlas.endswith(".h5ad"):
-            return {"status": "error", "error": "Attach the HECA atlas .h5ad as the primary dataset"}
-        if args.get("atlas") and args["atlas"] != atlas:
+        configured = {}
+        for entry in os.environ.get("AISCIENTIST_ATLAS_FILES", "").split(";"):
+            label, sep, path = entry.strip().partition("=")
+            if sep and label and path.startswith("/") and label.lower().split("/")[-1] != "latest":
+                configured[posixpath.normpath(path)] = label
+        version = configured.get(posixpath.normpath(atlas))
+        if not version:
+            return {"status": "error", "error": "Attach a primary dataset listed in AISCIENTIST_ATLAS_FILES"}
+        if args.get("atlas") and posixpath.normpath(args["atlas"]) != posixpath.normpath(atlas):
             return {"status": "error", "error": "atlas must be the attached primary dataset"}
-        version = os.environ.get("AISCIENTIST_ATLAS_VERSION", "").strip()
-        if not version or version.lower() == "latest" or version.lower().endswith("/latest"):
-            return {"status": "error", "error": "Set AISCIENTIST_ATLAS_VERSION to the attached immutable atlas release"}
+        shared = posixpath.dirname(str(getattr(executor, "images_dir", "") or "/shared/containers").rstrip("/"))
+        hgnc = os.environ.get("ATLAS_HGNC", shared + "/skills/atlas-expression/hgnc_complete_set.txt")
         command = (
             'export ATLAS_H5AD="$AISCIENTIST_DATASET"\n'
             'export AISCI_DATA_DIR="$AISCIENTIST_ENV_DIR" AISCI_EXECUTOR=inline\n'
-            f"export AISCIENTIST_ATLAS_VERSION={shlex.quote(version)}\n"
+            f"export AISCI_ATLAS_RELEASE={shlex.quote(version)}\n"
+            f"export ATLAS_HGNC={shlex.quote(hgnc)}\n"
             'export AISCI_ATLAS_RESULT=$(mktemp "$AISCIENTIST_ENV_DIR/.atlas-result.XXXXXX")\n'
             'trap \'rm -f "$AISCI_ATLAS_RESULT"\' EXIT\n'
             'aiscientist-mcp --server atlas-expression-exploration-mcp --timeout 15000 call '
             f'{name} {shlex.quote(json.dumps(args))} > "$AISCI_ATLAS_RESULT" || exit $?\n'
             "python - <<'AISCI_ATLAS_COLLECT'\n" + COLLECT + "AISCI_ATLAS_COLLECT\n")
-        out = environment_tool.executor({"skill": SKILL, "command": command}, ctx)
+        out = environment_tool.executor(
+            {"skill": SKILL, "command": command}, ctx, _atlas_bridge=True,
+            _resources=None if name == "submit_query" else (2, 16, "00:30:00"),
+            _cache_dir=posixpath.dirname(hgnc))
         if out.get("status") != "ok":
             return out
         try:
@@ -104,6 +134,7 @@ def build_atlas_tools(executor: Any, environment_tool: Any) -> list:
             return {**out, "status": "error", "error": f"Invalid atlas MCP response: {exc}"}
         from . import run_manifest
         run_manifest.update(ctx, lambda doc: doc.update(atlas=provenance))
+        out.pop("stdout", None)
         response = {**out, **result, "atlas": provenance}
         if result.get("state") in {"FAILED", "CANCELLED", "TIMEOUT", "OUT_OF_MEMORY"}:
             response.update(status="error", error=f"Atlas query ended in {result['state']}")
@@ -112,6 +143,7 @@ def build_atlas_tools(executor: Any, environment_tool: Any) -> list:
     return [HarnessTool(name=name, description="Atlas expression: " + description +
                         " Flow: resolve_genes -> submit_query -> query_status -> get_summary, "
                         "plot_dotplot, plot_violin, plot_featureplot -> write_report. "
+                        "Use these nine typed tools; run_in_environment refuses this skill. "
                         "Uses the attached atlas read in place; outputs appear in gene_expression/.",
                         parameters=schema, executor=lambda args, ctx, n=name: call(n, args or {}, ctx),
                         reads_private_data=True, category="single-cell")

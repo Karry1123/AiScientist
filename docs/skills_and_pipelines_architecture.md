@@ -327,7 +327,7 @@ When a pipeline is loaded, the console shows the tools it composes and marks tho
 cannot run.
 
 
-## Atlas expression MCP bridge (issue 93, option b)
+## Atlas expression MCP bridge
 
 The v0.2.0 bundle SHA-256 is
 `6ce775b9ddde52982e7a905c430b8e55db3543e2f5d0b6f8524068105e818e2a`.
@@ -351,9 +351,11 @@ Attach the HECA `.h5ad` as the primary dataset at its shared, immutable path on
 HPC3, visible to the compute nodes. The executor binds that dataset read-only;
 the bridge neither copies it nor accepts an alternative atlas path. Provisioning
 shared HECA versions and mounting Eye Server storage on HPC3 are deployment work
-from issue 92, not performed by this bridge. Set `AISCIENTIST_ATLAS_VERSION` to
-the attached release label, for example `heca/v2026.11`, before starting the
-gateway. Missing version or a primary file other than `.h5ad` fails explicitly.
+from issue 92, not performed by this bridge. Set `AISCIENTIST_ATLAS_FILES` to a
+semicolon-separated mapping, for example
+`heca/v2026.11=/shared/heca/v2026.11/HRCA_snRNA_allcells.h5ad`.
+The primary dataset must match a configured path after POSIX path normalization;
+the matched entry supplies the immutable release label.
 Each successful call records the label, resolved path, size and mtime in the
 run's `manifest.json`, alongside the skill release and image provenance. The
 label must describe that file's actual immutable release; size and mtime are
@@ -361,26 +363,30 @@ additional identity metadata, not cryptographic checksum verification.
 
 Inside the container `ATLAS_H5AD=$AISCIENTIST_DATASET`,
 `AISCI_DATA_DIR=$AISCIENTIST_ENV_DIR` (a persistent directory within this run),
-and `AISCI_EXECUTOR=inline`. The outer Slurm job requests the skill's 4 CPUs,
-300 GB and 04:00:00, including for `submit_query`; it never attempts nested
-Slurm submission or a gateway fallback. All calls conservatively use those
-resources through the existing environment path. Plot/report calls read the
+and `AISCI_EXECUTOR=inline`. Only `submit_query` requests the skill's 4 CPUs,
+300 GB and 04:00:00. All other tools use 2 CPUs, 16 GB and 00:30:00, including
+status and list calls, which preserve the server's state handling in a light job.
+The platform supplies these resources internally, outside the tool JSON schema.
+There is no nested Slurm submission or gateway fallback. Plot/report calls read the
 small `query.h5ad`, and do not reload the full atlas. The CLI timeout covers the
 four-hour job. The image is pinned to
 `docker://ghcr.io/lijinbio/mcp-atlas-expression-exploration@sha256:5e9b13da5d180e7983945a7f1f4182e4b12876d3ec8f59ed0a0aa7b43d041d8a`.
 Image provisioning and the server's first HGNC download require deployment
-network access; the HGNC cache persists in the run directory across calls.
+network access. `ATLAS_HGNC` sets the lab-shared HGNC cache file, defaulting to
+`<parent of executor images_dir>/skills/atlas-expression/hgnc_complete_set.txt`
+(or `/shared/skills/atlas-expression/hgnc_complete_set.txt` without images_dir).
+The executor creates and mounts its parent directory writable so one download
+serves all runs. Configure a dedicated cache directory visible on compute nodes.
 
 After every successful call, `gene_resolution.tsv`, `summary_*.tsv`, PDF/PNG
 plots and `report.md` are copied to
 `$AISCIENTIST_ARTIFACTS/gene_expression/<query_id>/`. The existing executor
 mirrors them to the website's run artifacts and reports evidence paths.
-`query.h5ad`, logs and job state stay in work storage. The released skill's
-older statement that AiScientist lacks an MCP client is superseded by this
-bridge; skip its installation commands.
+`query.h5ad`, logs and job state stay in work storage. Use the nine typed atlas
+tools; direct `run_in_environment` calls for this skill are refused.
 
-Offline tests mock the image/Slurm boundary and validate forwarding, provenance,
-release verification, tiers and deliverable collection. Website validation still
-requires HPC3 plus the real shared atlas: test LRAT (RPE about 75.7%, 6.29 CP10k,
-19 donors) and the four-name query above, including donor-aware tables, PDFs,
-PNGs, the resolution table and report in the downloadable results.
+Responses omit report Markdown and bound summary rows, reporting `rows_omitted`
+and `full_table` for the complete artifact. The collector also saves
+`gene_expression/mcp_result.json` (replaced each call) and uses that evidence path
+for other oversized responses. Stdout stays below the executor's 20,000-character
+limit and is removed from the parsed tool response.

@@ -186,7 +186,7 @@ class SlurmCodeExecutor:
 
     def run_in_image(self, command: str, image: str, *, workdir: str, cpus: int = 0,
                      mem_gb: int = 0, time_limit: str = "",
-                     files: "dict[str, str] | None" = None) -> dict[str, object]:
+                     files: "dict[str, str] | None" = None, cache_dir: str = "") -> dict[str, object]:
         """Run a SHELL ``command`` inside container ``image`` (a skill's declared environment) as a
         Slurm job, with the same data contract as a snippet: the dataset read-only, work/artifacts
         writable, the AISCIENTIST_* variables set.
@@ -194,7 +194,9 @@ class SlurmCodeExecutor:
         ``workdir`` is the command's directory under the run's work dir (it persists across calls,
         so a pipeline's intermediate output survives to the next step); ``files`` are the skill's
         bundled files, ``{relative path: local path}``, staged into ``<workdir>/.skill``. Resources
-        default to this executor's. There is no local fallback: the command needs the image."""
+        default to this executor's. Platform-only ``cache_dir`` mounts a lab-shared reference
+        cache writable so downloads survive across runs. There is no local fallback: the command
+        needs the image."""
         command = (command or "").strip()
         if not command:
             return {"status": "error", "error": "no command provided"}
@@ -215,6 +217,10 @@ class SlurmCodeExecutor:
                                     detail=made.stderr)
             for rel, local in (files or {}).items():
                 self.remote.put_file(local, f"{wd}/.skill/{rel}")
+            if cache_dir:
+                made = self.remote.exec(f"mkdir -p {shlex_quote(cache_dir)}")
+                if not made.ok:
+                    raise SlurmJobError("could not create the lab-shared reference cache")
             cpus = int(cpus or self.cpus)
             time_limit = time_limit or self.time_limit
             exports = {"AISCIENTIST_ENV_DIR": wd, "AISCIENTIST_SKILL_DIR": f"{wd}/.skill",
@@ -222,7 +228,7 @@ class SlurmCodeExecutor:
                        "TMPDIR": f"{wd}/.tmp"}
             out = self._submit(command, kind="env", runner="bash", image=sif, cpus=cpus,
                                mem_gb=int(mem_gb or self.mem_gb), time_limit=time_limit,
-                               cwd=wd, extra_exports=exports, package_cache=False,
+                               cwd=wd, extra_exports=exports, package_cache=False, cache_dir=cache_dir,
                                run_timeout_s=slurm_time_to_seconds(time_limit) + 600)
         except JobCancelled:
             return {"status": "cancelled", "error": "Run cancelled by the user.",
@@ -350,7 +356,7 @@ class SlurmCodeExecutor:
     def _submit_job(self, source: str, *, kind: str, runner: str, image: str, cpus: int, mem_gb: int,
                 time_limit: str, run_timeout_s: int, cwd: str = "",
                 extra_exports: "dict[str, str] | None" = None,
-                package_cache: bool = False, secret_file: str = "") -> dict[str, object]:
+                package_cache: bool = False, secret_file: str = "", cache_dir: str = "") -> dict[str, object]:
         """Stage ``source`` as a script, run it with ``runner`` inside ``image`` as a contained Slurm
         job, and collect stdout/stderr/exit code plus the artifacts it wrote."""
         self._counter += 1
@@ -406,7 +412,7 @@ class SlurmCodeExecutor:
         binds_ro = tuple(p for p in (root, None if inside_root else self.dataset_path, *cache_binds,
                                      *self._input_binds(), *env_paths)
                          if p)
-        binds_rw = tuple(p for p in (self.work_dir, self.artifacts_dir, scratch) if p)
+        binds_rw = tuple(p for p in (self.work_dir, self.artifacts_dir, scratch, cache_dir) if p)
         from ..agents.skills_registry import POLICY, network_allowed
         policy = POLICY.get()
         gpu = bool(policy and policy["gpu"])
