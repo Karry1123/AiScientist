@@ -9,11 +9,12 @@ import pytest
 from test_console_plan_card_js import APP_JS, ESCAPE, _card
 
 
-def _console(plan, change=None, *, action=None, messages=()):
+def _console(plan, change=None, *, action=None, messages=(), provenance=None):
     """Use the actual renderer, field commit, submit and history functions with an offline transport."""
     source = APP_JS.read_text(encoding="utf-8")
     blocks = [
         ("function planStepParts", "function showPlanPanel"),
+        ("function handleRunEvent", "// ---- actions"),
         ("function planSavedMessage", "function showClarify"),
         ("function finishPlanApproval", "// ---- uploads"),
         ("function msgFromServer", "// The payload to persist"),
@@ -44,6 +45,11 @@ vm.createContext(sandbox); vm.runInContext(input.code, sandbox);
   if (input.change) out.error = sandbox.commitPlanChange(c, input.change);
   else if (input.action) await sandbox.submitPlan(input.action, '', '', c);
   await new Promise(setImmediate);
+  if (input.provenance) {
+    sandbox.handleRunEvent(c, input.provenance);
+    const record = out.persisted[out.persisted.length - 1];
+    out.provenanceRestored = sandbox.msgFromServer(sandbox.serverMsgPayload(record));
+  }
   const saved = sandbox.planSavedMessage(input.plan);
   out.saved = saved;
   const restored = sandbox.msgFromServer(sandbox.serverMsgPayload(saved));
@@ -55,8 +61,8 @@ vm.createContext(sandbox); vm.runInContext(input.code, sandbox);
 })().catch((e)=>{console.error(e);process.exit(1);});
 """.replace("__ESCAPE__", ESCAPE)
     result = subprocess.run([node, "-e", harness], input=json.dumps({
-        "code": code, "plan": plan, "change": change, "action": action, "messages": messages,
-    }), text=True, capture_output=True, timeout=30)
+        "code": code, "plan": plan, "change": change, "action": action, "messages": messages, "provenance": provenance,
+    }), text=True, encoding="utf-8", capture_output=True, timeout=30)
     assert result.returncode == 0, result.stderr
     return json.loads(result.stdout)
 
@@ -166,3 +172,33 @@ def test_structured_edit_validation_correction_approval_execution_and_reload(lab
     assert (art / "report" / "plan.yaml").read_text() == accepted["doc"]["yaml"]
     assert not gw._saved_plan_replays(conn)
     _no_raw(approved["savedHtml"])
+
+
+def test_saved_readable_plan_and_restored_card_keep_all_provider_and_skill_assignments():
+    steps = [
+        {"id": "atlas", "tool": "resolve_genes", "tools": [
+            {"tool": "resolve_genes", "provider": "mcp", "server": "atlas-expression-exploration", "version": "0.0.3"},
+            {"tool": "plot_dotplot", "provider": "mcp", "server": "atlas-expression-exploration", "version": "0.0.3"}],
+         "skills": [{"name": "atlas_query", "version": "2.0"}, {"name": "gene_review", "version": "1.1"}]},
+        {"id": "other", "tool": "run_code", "tools": [{"tool": "run_code", "provider": "local", "version": "unknown"}], "skills": []},
+    ]
+    out = _console({"agenda": ["Query attached atlas", "Analyse other atlas"], "doc": {"steps": steps, "yaml": "steps: []"}})
+    assert out["restored"]["plan"]["doc"]["steps"] == steps
+    for surface in (out["saved"]["content"], out["savedHtml"]):
+        assert "atlas-expression-exploration / version 0.0.3" in surface
+        assert "plot_dotplot" in surface and "resolve_genes" in surface
+        assert "atlas_query / version 2.0" in surface and "gene_review / version 1.1" in surface
+        assert "run_code / Local / version unknown" in surface and "No skill assigned" in surface
+
+
+def test_actual_step_event_is_persisted_and_restored_with_planned_vs_failed_skills():
+    record = {"type": "step_provenance", "run_id": "run-A", "id": "s2", "step": "Analyse second atlas", "status": "failed",
+              "planned_skills": [{"name": "analysis", "version": "1.0"}],
+              "skills": [{"name": "analysis", "version": "1.0", "status": "failed"}],
+              "planned_tools": [{"tool": "run_code", "provider": "local", "version": "unknown"}], "tools": []}
+    out = _console({"agenda": ["Analyse second atlas"], "doc": None}, provenance=record)
+    restored = out["provenanceRestored"]
+    assert restored["streamId"] == "provenance:run-A:s2"
+    assert "Planned skills: analysis / version 1.0" in restored["content"]
+    assert "Recorded skills: analysis / version 1.0 (failed; no successful use)" in restored["content"]
+    assert "(recorded used)" not in restored["content"]
