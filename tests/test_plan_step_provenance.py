@@ -197,7 +197,7 @@ def test_provider_changes_do_not_override_primary_settings_or_acceptance(primary
         assert row["detail"] == [{"param": "n", "approved": 3, "used": 4}]
 
 
-def test_guidance_is_not_use_and_multiple_methods_stay_with_their_step(tmp_path, library):
+def test_guidance_is_not_use_and_multiple_methods_stay_with_their_step(tmp_path, library):  # noqa: F811 (fixture)
     lab = _lab(tmp_path, [])
     first, second = list(library.values())
     with skills_registry.step_scope(first, step="A"):
@@ -217,7 +217,7 @@ def test_guidance_is_not_use_and_multiple_methods_stay_with_their_step(tmp_path,
     assert len(observed["A"]) == 2 and observed["A"][0]["status"] == "used"
 
 
-def test_mcp_registration_and_method_outcome_not_transport_success(registry, tmp_path):
+def test_mcp_registration_and_method_outcome_not_transport_success(registry, tmp_path):  # noqa: F811 (fixture)
     runner = Runner()
     tool, = build(runner)
     assert tool.identity() == {"tool": "tables_check", "provider": "mcp", "server": "table-check", "version": "1.2.3"}
@@ -235,7 +235,7 @@ def test_mcp_registration_and_method_outcome_not_transport_success(registry, tmp
 
 
 @pytest.mark.parametrize("status,expected", [("ok", "used"), ("error", "failed")])
-def test_dedicated_tool_skill_metadata_and_actual_outcomes(registry, tmp_path, status, expected):
+def test_dedicated_tool_skill_metadata_and_actual_outcomes(registry, tmp_path, status, expected):  # noqa: F811 (fixture)
     from aiscientist.agents.tool_skills import attach_skill
     tool = attach_skill(SimpleNamespace(name="dedicated", skill="check-table"), HarnessTool(
         "dedicated", "A dedicated method", {}, lambda a, c: {"status": status}))
