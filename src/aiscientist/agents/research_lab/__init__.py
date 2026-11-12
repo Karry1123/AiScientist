@@ -3576,7 +3576,12 @@ class ResearchLab:
         for tool in tools:
             identity = {k: tool[k] for k in ("tool", "provider", "server", "version")}
             expected = [t for t in planned_tools if t["tool"] == identity["tool"]]
-            if identity not in expected:
+            # As in check_adherence: only a planned tool whose identity is known on both sides can
+            # have changed. A helper the plan never named, or unknown metadata, is not a change.
+            known = [t for t in expected if t.get("provider") != "unknown"]
+            if not known or identity["provider"] == "unknown":
+                continue
+            if identity not in known:
                 changes.append({"tool": identity["tool"], "planned": expected, "used": identity})
         row = {"id": key, "step": text, "planned_tools": planned_tools,
                "planned_skills": planned_skills, "tools": tools, "skills": skills,

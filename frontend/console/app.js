@@ -3331,8 +3331,11 @@ function handleRunEvent(c, msg) {
     case "run_job": streamJob(c, msg); break;
     case "chat_context": c.ctx = msg; if (chatVisible(c)) renderContextMeter(msg); break;
     case "step_provenance":
+      // A step's record is re-sent when a retry changes it. The id carries the outcome, so the later
+      // record is shown after the failed one instead of being dropped as a replay of it.
       pushToSession(c.sid, { role: "assistant", content: stepProvenanceMarkdown(msg),
-        streamId: `provenance:${msg.run_id || msg.stream_id || c.lastStreamId}:${msg.id || msg.step}` });
+        streamId: `provenance:${msg.run_id || msg.stream_id || c.lastStreamId}:${msg.id || msg.step}`
+          + `:${msg.status || ""}:${(msg.tools || []).length}` });
       if (chatVisible(c)) renderChat();
       break;
     case "run_usage":

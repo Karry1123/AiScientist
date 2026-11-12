@@ -110,6 +110,22 @@ def test_observed_provider_changes_failures_and_skips_are_persisted(tmp_path):
     assert events[0]["type"] == "step_provenance"
 
 
+@pytest.mark.parametrize("planned,call", [
+    # A helper the plan never named is not a provider change.
+    ((_mcp(),), {"tool": "run_code", "provider": {"tool": "run_code", "provider": "local", "server": "local",
+                                                    "version": "unknown"}, "ok": True}),
+    # Unknown metadata on either side establishes nothing.
+    ((_mcp(),), {"tool": "resolve_genes", "ok": True}),
+    (({"tool": "resolve_genes", "provider": "unknown", "server": "unknown", "version": "unknown"},),
+     {"tool": "resolve_genes", "provider": _mcp(), "ok": True}),
+])
+def test_the_step_ledger_reports_no_change_without_a_known_planned_identity(tmp_path, planned, call):
+    lab = _lab(tmp_path, [])
+    lab._approved_plan = PlanDoc("", (PlanStep("atlas", "Query", "resolve_genes", tools=planned),))
+    lab._record_step_provenance("Query", [call], lambda _e: None)
+    assert lab.step_provenance()[0]["provider_changes"] == []
+
+
 def test_adherence_lists_unused_secondary_tools_and_checks_recorded_provider_changes():
     doc = PlanDoc("", (PlanStep("s", "Query", "resolve_genes", tools=(_mcp(), _mcp("submit_query"))),))
     calls = [{"tool": "resolve_genes", "provider": _mcp(), "ok": True}]

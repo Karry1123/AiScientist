@@ -46,7 +46,8 @@ vm.createContext(sandbox); vm.runInContext(input.code, sandbox);
   else if (input.action) await sandbox.submitPlan(input.action, '', '', c);
   await new Promise(setImmediate);
   if (input.provenance) {
-    sandbox.handleRunEvent(c, input.provenance);
+    for (const ev of [].concat(input.provenance)) sandbox.handleRunEvent(c, ev);
+    out.provenanceIds = out.persisted.map((m) => m.streamId);
     const record = out.persisted[out.persisted.length - 1];
     out.provenanceRestored = sandbox.msgFromServer(sandbox.serverMsgPayload(record));
   }
@@ -198,7 +199,17 @@ def test_actual_step_event_is_persisted_and_restored_with_planned_vs_failed_skil
               "planned_tools": [{"tool": "run_code", "provider": "local", "version": "unknown"}], "tools": []}
     out = _console({"agenda": ["Analyse second atlas"], "doc": None}, provenance=record)
     restored = out["provenanceRestored"]
-    assert restored["streamId"] == "provenance:run-A:s2"
+    assert restored["streamId"] == "provenance:run-A:s2:failed:0"
     assert "Planned skills: analysis / version 1.0" in restored["content"]
     assert "Recorded skills: analysis / version 1.0 (failed; no successful use)" in restored["content"]
     assert "(recorded used)" not in restored["content"]
+
+
+def test_a_retry_that_succeeds_is_shown_after_the_failed_attempt_not_dropped():
+    tool = {"tool": "run_code", "provider": "local", "server": "local", "version": "unknown"}
+    failed = {"type": "step_provenance", "run_id": "run-A", "id": "s2", "step": "Analyse", "status": "failed",
+              "planned_tools": [tool], "planned_skills": [], "skills": [], "tools": [{**tool, "ok": False}]}
+    used = {**failed, "status": "used", "tools": [{**tool, "ok": False}, {**tool, "ok": True}]}
+    out = _console({"agenda": ["Analyse"], "doc": None}, provenance=[failed, used])
+    assert out["provenanceIds"] == ["provenance:run-A:s2:failed:1", "provenance:run-A:s2:used:2"]
+    assert "Recorded use" in out["provenanceRestored"]["content"]
