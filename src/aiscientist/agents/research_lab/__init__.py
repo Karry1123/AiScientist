@@ -3547,7 +3547,7 @@ class ResearchLab:
         return rows
 
     def _persist_step_provenance(self, row: dict[str, Any]) -> None:
-        from . import run_manifest
+        from .. import run_manifest
         def change(doc):
             doc.setdefault("step_provenance", {})[row["id"]] = row
         run_manifest.update(self.ctx, change)
@@ -4619,7 +4619,7 @@ class ResearchLab:
             args = {"query": q, "limit": per_limit}
             emit({"type": "tool_start", "tool": "literature_search", "args": args})
             try:
-                from .skills_registry import step_scope
+                from ..skills_registry import step_scope
                 with step_scope(step=step):
                     output = lit_tool.executor(args, self.ctx)
             except Exception as exc:  # noqa: BLE001 - one bad query never fails the whole step
@@ -4672,7 +4672,7 @@ class ResearchLab:
         args = {"question": q}
         emit({"type": "tool_start", "tool": "deep_literature", "args": args})
         try:
-            from .skills_registry import step_scope
+            from ..skills_registry import step_scope
             with step_scope(step=step):
                 output = deep_tool.executor(args, self.ctx)
         except Exception as exc:  # noqa: BLE001 - one literature failure never fails the whole run
@@ -4774,7 +4774,7 @@ class ResearchLab:
         args = {**pinned, "queries": queries}
         emit({"type": "tool_start", "tool": "search_corpus", "args": args})
         try:
-            from .skills_registry import step_scope
+            from ..skills_registry import step_scope
             with step_scope(step=step):
                 output = corpus_tool.executor(args, self.ctx)
         except Exception as exc:  # noqa: BLE001 - one literature failure never fails the whole run
