@@ -63,6 +63,7 @@ from ..plan_doc import (
     check_plan,
     parse_plan_ops,
     parse_plan_yaml,
+    provider_changed,
     split_step,
     sync_plan,
 )
@@ -3626,12 +3627,9 @@ class ResearchLab:
         for tool in tools:
             identity = {k: tool[k] for k in ("tool", "provider", "server", "version")}
             expected = [t for t in planned_tools if t["tool"] == identity["tool"]]
-            # As in check_adherence: only a planned tool whose identity is known on both sides can
-            # have changed. A helper the plan never named, or unknown metadata, is not a change.
-            known = [t for t in expected if t.get("provider") != "unknown"]
-            if not known or identity["provider"] == "unknown":
-                continue
-            if identity not in known:
+            # The rule check_adherence uses: a helper the plan never named, or a field unknown on
+            # either side, is not a change. Only a field known on both sides that differs is.
+            if expected and all(provider_changed(t, identity) for t in expected):
                 changes.append({"tool": identity["tool"], "planned": expected, "used": identity})
         row = {"id": key, "step": text, "planned_tools": planned_tools,
                "planned_skills": planned_skills, "tools": tools, "skills": skills,
@@ -4225,10 +4223,13 @@ class ResearchLab:
                 except ValueError as exc:
                     return "failed", str(exc)
                 self.config = replace(self.config, plan_yaml=True)
-                self._plan_doc = PlanDoc(request=question, steps=tuple(
+                doc = PlanDoc(request=question, steps=tuple(
                     PlanStep(id=f"s{i}", text=text, tool=call.name, settings=copy.deepcopy(call.arguments),
                              runs_on=_tool_runs_on(call.name))
                     for i, (call, text) in enumerate(zip(explicit, agenda), 1)))
+                # These steps are new, but the plan card's sync keeps them as they are (same text),
+                # so their tools' registration facts are resolved here, once.
+                self._plan_doc = self._resolve_plan_provenance(doc, range(len(doc.steps)))
                 self._self_sourced = "The researcher supplied the ordered tool calls and all stated settings."
                 self._save_plan_reply(json.dumps({"source": "explicit_mcp", "agenda": agenda}))
                 emit({"type": "pi_agenda", "agenda": agenda, "source": "explicit_mcp"})

@@ -15404,10 +15404,12 @@ async def _run_lab(conn: Connection, req: LabRequest, *,
             should_compact=take_compact_request,
             checkpoint=checkpoint_run, **saved_args)
 
-        # Keep the execution ledger even when no analysis step succeeded.
+        # Keep the execution ledger even when no analysis step succeeded, once a step has run: a plan
+        # cancelled in review lists every step as skipped, and is finished below with no record.
         step_usage = getattr(lab_obj, "step_provenance", lambda: [])()
         session_meta["step_provenance"] = step_usage
-        if step_usage:
+        steps_ran = any(row.get("status") != "skipped" for row in step_usage)
+        if steps_ran:
             try:
                 (art / "process").mkdir(parents=True, exist_ok=True)
                 (art / "process" / "step_provenance.md").write_text(
@@ -15419,11 +15421,12 @@ async def _run_lab(conn: Connection, req: LabRequest, *,
         # has no results to write up. Rendering a report from it produced a placeholder, DATALESS
         # manuscript ("[Figure 1. Schematic of the intended … workflow]") that read like a real
         # deliverable AND became the connection's "last run", so the NEXT message was misrouted as a
-        # follow-up to it (dropping the dataset, reverting the assembly). Finish cleanly with NO report,
-        # NO last_run_id, so the conversation's next message is a fresh, dataset-bound
-        # study. (A mid-run Stop that accepted ≥1 step still writes up what ran — that path has rounds.)
+        # follow-up to it (dropping the dataset, reverting the assembly). Finish cleanly with NO report
+        # and NO last_run_id, so the conversation's next message is a fresh, dataset-bound study; the
+        # run_state is kept only when a step ran, for its step ledger. (A mid-run Stop that accepted
+        # ≥1 step still writes up what ran — that path has rounds.)
         if _run_produced_nothing(result, run_flags["plan_cancelled"]):
-            if step_usage:
+            if steps_ran:
                 _write_run_state(art, result, getattr(lab_obj, "guidance", None), decisions,
                                  getattr(lab_obj, "execution_profile", None),
                                  protocols=getattr(lab_obj, "protocols", None),
@@ -15440,7 +15443,7 @@ async def _run_lab(conn: Connection, req: LabRequest, *,
             emit("warning", "lab", "Run ended before any step was accepted — skipping report render.")
             conn.push({"type": "chat_token", "token": reason})
             conn.push({"type": "chat_stopped"})
-            _finish_run_record(conn, run_id, "cancelled", str(art) if step_usage else None, reason)
+            _finish_run_record(conn, run_id, "cancelled", str(art) if steps_ran else None, reason)
             return
 
         # Persist the approved plan as a human-readable Markdown file (the user asked for

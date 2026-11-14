@@ -288,11 +288,16 @@ def test_report_calls_without_known_provider_are_not_changes(used):
     ({**_mcp(), "version": "unknown"}, _mcp()),
     (_mcp(), {**_mcp(), "version": "unknown"}),
 ])
-def test_unknown_identity_fields_do_not_establish_provider_changes(planned, used):
+def test_unknown_identity_fields_do_not_establish_provider_changes(tmp_path, planned, used):
     doc = PlanDoc("", (PlanStep("s", "Query", "submit_query", tools=({**planned, "tool": "submit_query"},)),))
-    report = check_adherence(doc, [{"step": "Query", "accepted": True, "calls": [
-        {"tool": "submit_query", "ok": True, "provider": used}]}])
+    call = {"tool": "submit_query", "ok": True, "provider": {**used, "tool": "submit_query"}}
+    report = check_adherence(doc, [{"step": "Query", "accepted": True, "calls": [call]}])
     assert report["ok"] and report["steps"][0]["provider_changes"] == []
+    # The step ledger the console and the run record show follows the same rule.
+    lab = _lab(tmp_path, [])
+    lab._approved_plan = doc
+    lab._record_step_provenance("Query", [call], lambda _e: None)
+    assert lab.step_provenance()[0]["provider_changes"] == []
 
 
 def test_failed_optional_tool_is_informational():

@@ -1023,7 +1023,7 @@ def pin_args(args: "Mapping[str, Any]", pinned: "Mapping[str, Any]") -> "tuple[d
 
 # --- reading a finished run back against the approved plan --------------------------------------------
 
-def _provider_changed(approved: Mapping[str, Any], used: Any) -> bool:
+def provider_changed(approved: Mapping[str, Any], used: Any) -> bool:
     """Missing provenance is not evidence of a provider change."""
     if not isinstance(used, Mapping) or approved.get("provider") not in {"local", "mcp"} \
             or used.get("provider") not in {"local", "mcp"}:
@@ -1072,7 +1072,7 @@ def check_adherence(doc: PlanDoc, executed: "list[dict[str, Any]]",
                                         and not any(c.get("tool") == t["tool"] and c.get("ok") for c in calls)]
         changed = [{"tool": c.get("tool"), "approved": t, "used": c.get("provider")}
                    for t in step.tools for c in calls if c.get("tool") == t["tool"]
-                   and _provider_changed(t, c.get("provider"))]
+                   and provider_changed(t, c.get("provider"))]
         row["provider_changes"] = changed
         if step.tool:
             mine = [c for c in calls if c.get("tool") == step.tool]
