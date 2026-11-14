@@ -816,6 +816,17 @@ class ResearchLab:
             raise PlanMigrationRequired("This changed saved plan needs the normal plan review before execution.")
         self._skipped_steps = []
 
+        if resume is not None:
+            # Restored rounds carry tool calls, but skill outcomes live only in this ledger.
+            for row in copy.deepcopy(resume.step_provenance):
+                self._step_provenance[row["id"]] = {**row, **self._step_provenance.get(row["id"], {})}
+                observed = self.ctx.decisions.setdefault("step_skill_use", {})
+                skills = {(s["name"], s["version"]): s for s in row.get("skills", [])}
+                for skill in observed.get(row["step"], []):
+                    key = (skill["name"], skill["version"])
+                    skills[key] = {**skills.get(key, {}), **skill}
+                observed[row["step"]] = list(skills.values())
+
         def check_restored(agenda: list[str]) -> None:
             from ..mcp_plan_migration import assert_plan_available
             indices = None
@@ -3571,7 +3582,11 @@ class ResearchLab:
             row = {**identity, "ok": step_succeeded(call)}
             if row not in tools:
                 tools.append(row)
-        skills = [dict(s) for s in self.ctx.decisions.get("step_skill_use", {}).get(text, [])]
+        skills_by_id = {(s["name"], s["version"]): dict(s) for s in prior.get("skills", [])}
+        for skill in self.ctx.decisions.get("step_skill_use", {}).get(text, []):
+            identity = (skill["name"], skill["version"])
+            skills_by_id[identity] = {**skills_by_id.get(identity, {}), **skill}
+        skills = list(skills_by_id.values())
         changes = []
         for tool in tools:
             identity = {k: tool[k] for k in ("tool", "provider", "server", "version")}

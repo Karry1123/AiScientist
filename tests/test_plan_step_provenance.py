@@ -174,6 +174,71 @@ def test_observed_provider_changes_failures_and_skips_are_persisted(tmp_path):
     assert events[0]["type"] == "step_provenance"
 
 
+@pytest.mark.parametrize("review_round_trip", [False, True])
+def test_stopped_run_continues_without_losing_step_skill_use(tmp_path, review_round_trip):
+    from test_research_lab_resume import _lab as resume_lab
+    from aiscientist.gateway import app as gw_app
+
+    agenda = ["Run QC", "Cluster the cells"]
+    plan = PlanDoc("characterize", tuple(
+        PlanStep(f"s{i}", text, "run_qc") for i, text in enumerate(agenda, 1)))
+    skill = {"name": "atlas-query", "version": "1.4", "status": "used"}
+    first = resume_lab(agenda)
+    first.ctx.workspace = tmp_path / "run"
+    stopped = False
+    run_scientist = first.scientist.run
+
+    def scientist(*args, **kwargs):
+        nonlocal stopped
+        if first.ctx.decisions.get("step_skill_use"):
+            stopped = True  # Stop during step 2, after step 1 was checkpointed.
+        else:
+            first.ctx.decisions["step_skill_use"] = {agenda[0]: [dict(skill)]}
+        return run_scientist(*args, **kwargs)
+
+    first.scientist.run = scientist
+
+    def checkpoint(partial):
+        gw_app._write_run_state(tmp_path / "artifacts", partial, None, first.ctx.decisions,
+            extra={"approved_plan_yaml": plan.to_yaml(), "step_provenance": first.step_provenance()})
+
+    first.run("characterize", approved_plan=plan, should_cancel=lambda: stopped, checkpoint=checkpoint)
+    assert stopped
+    state = json.loads((tmp_path / "artifacts/process/run_state.json").read_text(encoding="utf-8"))
+    assert state["step_provenance"][0]["skills"] == [skill]
+    resume = rl.ResumeState.from_interrupted(state)
+    if review_round_trip:
+        resume = rl.ResumeState.from_review_state(resume.to_review_state())
+        resume = replace(resume, review_requested=False)
+    second = resume_lab(agenda)
+    second.ctx.workspace = first.ctx.workspace
+    assert second.ctx.decisions == {}
+    events = []
+    result = second.run("characterize", resume=resume, on_event=events.append)
+    assert result.converged and result.accepted_steps == 2
+    rows = second.step_provenance()
+    assert rows[0]["skills"] == [skill]
+    assert second.ctx.decisions["step_skill_use"][agenda[0]] == [skill]
+    manifest = json.loads((second.ctx.workspace / "manifest.json").read_text(encoding="utf-8"))
+    assert manifest["step_provenance"]["s1"]["skills"] == [skill]
+    assert all(e["skills"] == [skill] for e in events
+               if e["type"] == "step_provenance" and e["id"] == "s1")
+    assert "atlas-query @ 1.4 [used]" in gw_app._readable_step_usage(rows)
+
+
+def test_new_step_skill_evidence_merges_by_identity(tmp_path):
+    lab = _lab(tmp_path, [])
+    lab._approved_plan = PlanDoc("", (PlanStep("s1", "Query", "resolve_genes"),))
+    first = {"name": "atlas-query", "version": "1.4", "status": "failed"}
+    other = {"name": "other", "version": "2", "status": "used"}
+    lab.ctx.decisions["step_skill_use"] = {"Query": [first, other]}
+    lab._record_step_provenance("Query", [], lambda _e: None)
+    updated = {**first, "status": "used"}
+    lab.ctx.decisions["step_skill_use"]["Query"] = [updated]
+    lab._record_step_provenance("Query", [], lambda _e: None)
+    assert lab.step_provenance()[0]["skills"] == [updated, other]
+
+
 @pytest.mark.parametrize("planned,call", [
     # A helper the plan never named is not a provider change.
     ((_mcp(),), {"tool": "run_code", "provider": {"tool": "run_code", "provider": "local", "server": "local",
