@@ -415,3 +415,26 @@ def test_a_corpus_tool_without_registration_records_explicit_unknown_identity():
     assert result.steps[0]["provider"] == {
         "tool": "search_corpus", "provider": "unknown", "server": "unknown", "version": "unknown"}
 
+
+def test_a_tool_s_own_skill_is_planned_and_shown_but_not_handed_over(tmp_path, monkeypatch, library):  # noqa: F811 (fixture)
+    """An MCP server's skill guides that server's tools. A step listing it only because its tool
+    runs it gets no guidance block, no skill scope, no required outputs and no Critic check for it;
+    a skill the plan assigns (``skill:``) is still handed over, on a tool step too."""
+    served, other = list(library.values())
+    monkeypatch.setattr(rl, "_tool_skill", lambda _: None)
+    tools = [HarnessTool("resolve_genes", "Atlas", {}, lambda a, c: {},
+                         provider={k: v for k, v in _mcp().items() if k != "tool"},
+                         skills=({"name": served.name, "version": served.version or "unknown"},)),
+             HarnessTool("run_code", "Python", {}, lambda a, c: {})]
+    lab = _lab(tmp_path, tools)
+    query, named, code = "Query the atlas.", "Query the atlas again.", "Score the cells."
+    lab._plan_doc = lab._resolve_plan_provenance(PlanDoc("q", (
+        PlanStep("a", query, "resolve_genes"),
+        PlanStep("b", named, "resolve_genes", skill=served.name),
+        PlanStep("c", code, "run_code", skill=other.name))), [0, 1, 2])
+    assert [s["name"] for s in lab._plan_doc.steps[0].planned_skills()] == [served.name]
+    assert [s.name for s in lab._planned_skills(query)] == [served.name]
+    assert lab._assigned_skills(query) == [] and lab._assigned_skill(query) is None
+    assert lab._expected_outputs(query) == ([], [])
+    assert [s.name for s in lab._assigned_skills(named)] == [served.name]
+    assert [s.name for s in lab._assigned_skills(code)] == [other.name]

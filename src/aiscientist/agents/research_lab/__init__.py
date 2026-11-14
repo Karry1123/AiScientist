@@ -3528,11 +3528,42 @@ class ResearchLab:
             steps.append(replace(step, tools=tools, skills=tuple(unique.values())))
         return PlanDoc(doc.request, tuple(steps))
 
-    def _assigned_skills(self, step: str) -> list[Skill]:
+    def _planned_skills(self, step: str) -> list[Skill]:
+        """Every skill the plan lists for ``step`` that the library still has: the ones assigned to
+        it and the ones its tools run. What the plan card, the readable plan and the run record show."""
         plan = self._approved_plan or self._plan_doc
         found = plan.step_for(step) if plan is not None else None
         return [skill for identity in (found.planned_skills() if found else [])
                 if (skill := get_skill(identity["name"])) is not None]
+
+    def _tool_skill_names(self, step: PlanStep) -> set[str]:
+        """The skills ``step`` lists only because one of its tools runs them: an MCP server's skill,
+        or the one a TOOL.md names (run_cellqc runs CellQC)."""
+        catalog = {t.name: t for t in getattr(self.scientist, "catalog", [])}
+        names: set[str] = set()
+        for identity in step.planned_tools():
+            tool = catalog.get(identity["tool"])
+            names.update(str(s.get("name")) for s in getattr(tool, "skills", ()) if s.get("name"))
+            by_tool = _tool_skill(identity["tool"])
+            if by_tool is not None:
+                names.add(by_tool.name)
+        return names
+
+    def _assigned_skills(self, step: str) -> list[Skill]:
+        """The skills HANDED OVER to ``step``: their guidance goes into its brief, its run_code runs
+        in their scope, their declared outputs are required and the Critic reads its code against
+        them. The plan's ``skill:`` and any other skill the plan lists, except one listed only
+        because a tool of the step runs it: the tool is the step and uses its own skill (an MCP
+        server's skill guides that server's tools, not code the step writes). Such a skill is still
+        planned and shown (``_planned_skills``); it is not assigned (issue 111)."""
+        plan = self._approved_plan or self._plan_doc
+        found = plan.step_for(step) if plan is not None else None
+        if found is None:
+            return []
+        own = get_skill(found.skill) if found.skill else None
+        via_tools = self._tool_skill_names(found)
+        return [skill for skill in self._planned_skills(step)
+                if skill.name not in via_tools or (own is not None and skill.name == own.name)]
 
     def _version_edited_skills(self, doc: PlanDoc, changes: list[dict[str, Any]]) -> PlanDoc:
         changed = {c["id"] for c in changes if c["kind"] in {"skill", "skills"}}
@@ -4066,7 +4097,7 @@ class ResearchLab:
         """Every skill ``step`` uses: the one the plan assigned (``skill:``), any its text names, and
         the one its tool's TOOL.md names (run_cellqc runs the CellQC skill). Each skill once."""
         found: "list[Skill]" = []
-        found.extend(self._assigned_skills(step))
+        found.extend(self._planned_skills(step))
         found += [s for s in map(get_skill, skills_named_in(step)) if s is not None]
         tool = _primary_tool(step)
         by_tool = _tool_skill(tool) if tool else None
