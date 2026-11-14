@@ -73,7 +73,7 @@ def test_gateway_saves_readable_assignment_before_review_and_final_usage(lab_gat
     asyncio.run(gw._run_lab(conn, req))
     rid, art, _, _ = gw._find_saved_plan(conn, None, "provenance")
     draft = (art / "report" / "plan.md").read_text(encoding="utf-8")
-    assert "Planned tools: run_scanpy_qc (local @ unknown)" in draft
+    assert "Planned tools: mcp_run_scanpy_qc (MCP scrna-analysis @ 0.0.5)" in draft
     assert "No skill assigned" in draft
 
     async def approve():
@@ -89,7 +89,7 @@ def test_gateway_saves_readable_assignment_before_review_and_final_usage(lab_gat
     asyncio.run(approve())
     record = (art / "process" / "step_provenance.md").read_text(encoding="utf-8")
     assert not (art / "report" / "run_record.md").exists()
-    assert "run_scanpy_qc" in record and "Recorded tools:" in record
+    assert "mcp_run_scanpy_qc (MCP scrna-analysis @ 0.0.5) [used]" in record
     state = json.loads((art / "process" / "run_state.json").read_text(encoding="utf-8"))
     assert state["step_provenance"] == state["session_meta"]["step_provenance"]
     assert state["step_provenance"][0]["tools"][0]["ok"] is True

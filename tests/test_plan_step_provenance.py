@@ -398,9 +398,20 @@ def test_harness_records_call_time_identity_even_on_exception(tmp_path):
     assert result.steps[0]["ok"] is False
 
 
-def test_legacy_corpus_tool_records_explicit_unknown_identity():
-    from test_search_corpus import _lab, OK_OUT
-    result = _lab("PRPF31 haploinsufficiency causes adRP [PMID:11111111].", OK_OUT)()
+def test_a_corpus_tool_without_registration_records_explicit_unknown_identity():
+    """The lab's own corpus step records the tool's identity too; a tool object with no registration
+    facts is unknown, never guessed."""
+    replies = iter(['["Does PRPF31 loss cause adRP?"]',
+                    "PRPF31 haploinsufficiency causes adRP [PMID:11111111]."])
+    lab = SimpleNamespace(_complete=lambda _msgs: next(replies), ctx=None,
+                          _deep_literature_question=lambda *_a: "fallback question about PRPF31 and adRP")
+    found = {"status": "ok", "contexts": [{
+        "pmid": "11111111", "citation": "Smith J. PRPF31 in adRP. 2001.",
+        "text": "Haploinsufficiency of PRPF31 causes retinitis pigmentosa through reduced splicing."}]}
+    tool = SimpleNamespace(executor=lambda args, ctx: found)
+    result = rl.ResearchLab._run_search_corpus_step(lab, "q", "step", [], tool,
+                                                     SimpleNamespace(name="Geneticist"), lambda _e: None)
     assert result.status == "ok"
     assert result.steps[0]["provider"] == {
         "tool": "search_corpus", "provider": "unknown", "server": "unknown", "version": "unknown"}
+
