@@ -631,9 +631,17 @@ def bind_settings(text: str, properties: "Mapping[str, Any]",
     return settings, dropped
 
 
+def _edited_primary_tool(step: PlanStep, old: "PlanStep | None") -> PlanStep:
+    """A changed tools list selects the primary unless the singular tool was also changed."""
+    if old is not None and step.tools != old.tools and step.tool == old.tool:
+        return replace(step, tool=step.tools[0]["tool"] if step.tools else None)
+    return step
+
+
 def check_plan(doc: PlanDoc, schemas: "Mapping[str, Mapping[str, Any]]",
                is_known: "Callable[[str], bool] | None" = None,
                skill_name: "Callable[[str], str | None] | None" = None,
+               *, before: "PlanDoc | None" = None,
                ) -> "tuple[PlanDoc, list[dict[str, Any]]]":
     """``(doc with settings in their declared types, findings)`` for a document a person edited.
 
@@ -643,7 +651,12 @@ def check_plan(doc: PlanDoc, schemas: "Mapping[str, Mapping[str, Any]]",
     findings: with no catalog there is nothing to judge against.
 
     ``skill_name`` resolves a step's ``skill`` to the library's own name (an old name of a migrated
-    skill resolves too), or ``None`` when no such skill is loaded."""
+    skill resolves too), or ``None`` when no such skill is loaded. ``before`` settles a tools-only
+    edit's primary tool before validating its settings, using the same rule as ``apply_edit``."""
+    if before is not None:
+        old_by_id = {s.id: s for s in before.steps}
+        doc = PlanDoc(request=doc.request, steps=tuple(
+            _edited_primary_tool(s, old_by_id.get(s.id)) for s in doc.steps))
     if skill_name is not None:
         resolved: list[PlanStep] = []
         skill_findings: list[dict[str, Any]] = []
@@ -773,8 +786,7 @@ def apply_edit(before: PlanDoc, edited: PlanDoc) -> "tuple[PlanDoc, list[dict[st
             continue
         if step.skills != old.skills and step.skill == old.skill:
             step = replace(step, skill=step.skills[0]["name"] if step.skills else None)
-        if step.tools != old.tools and step.tool == old.tool:
-            step = replace(step, tool=step.tools[0]["tool"] if step.tools else None)
+        step = _edited_primary_tool(step, old)
         # Old editors remove/change the singular line. Do not resurrect it from
         # an unchanged plural mirror written by a newer version.
         mirrored_skill_edit = step.skill != old.skill and step.skills == old.skills

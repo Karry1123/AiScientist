@@ -69,6 +69,70 @@ def test_identity_lists_survive_sync_settings_and_edits():
     assert not apply_ops(doc, [{"op": "change", "step": "a", "skill": None}]).steps[0].skills
 
 
+@pytest.mark.parametrize("edit", ["yaml", "ops", "ops_with_tool"])
+def test_tools_only_edit_checks_settings_against_new_primary(edit):
+    before = PlanDoc("q", (PlanStep("s1", "Use tool_a at threshold 3.", "tool_a",
+                                    {"threshold": 3}, tools=(_mcp("tool_a"), _mcp("tool_b"))),))
+    tools = [_mcp("tool_b"), _mcp("tool_a")]
+    if edit == "yaml":
+        raw = before.to_public()[0]
+        raw["tools"] = tools
+        edited = parse_plan_yaml(json.dumps({"steps": [raw]}))
+    else:
+        op = {"op": "change", "step": "s1", "tools": tools}
+        if edit == "ops_with_tool":
+            op["tool"] = "tool_a"
+        edited = apply_ops(before, [op])
+    checked, findings = check_plan(
+        edited, {"tool_a": {"threshold": {"type": "integer"}}, "tool_b": {}}, before=before)
+    assert checked.steps[0].tool == "tool_b"
+    assert [(f["kind"], f["tool"], f["param"]) for f in findings] == [
+        ("unknown_setting", "tool_b", "threshold")]
+    adopted, _, _ = apply_edit(before, checked)
+    assert adopted.steps[0].tool == checked.steps[0].tool
+
+
+@pytest.mark.parametrize("edit", ["yaml", "ops"])
+def test_lab_rejects_tools_edit_with_settings_for_old_primary(tmp_path, edit):
+    tools = [HarnessTool("tool_a", "A", {"type": "object", "properties": {
+                 "threshold": {"type": "integer"}}}, lambda a, c: {}),
+             HarnessTool("tool_b", "B", {}, lambda a, c: {})]
+    lab = _lab(tmp_path, tools)
+    before = PlanDoc("q", (PlanStep("s1", "Use tool_a at threshold 3.", "tool_a",
+                                    {"threshold": 3}, tools=(_mcp("tool_a"), _mcp("tool_b"))),))
+    lab._plan_doc = before
+    events = []
+    identities = [_mcp("tool_b"), _mcp("tool_a")]
+    if edit == "yaml":
+        raw = before.to_public()[0]
+        raw["tools"] = identities
+        result = lab._apply_plan_edit("q", json.dumps({"steps": [raw]}), events.append)
+        assert events[-1]["type"] == "plan_edit_rejected"
+    else:
+        result = lab._revise_plan_document("q", "Change tools", events.append, ops=[{
+            "op": "change", "step": "s1", "tool": "tool_a", "tools": identities}])
+        assert events[-1]["type"] == "plan_revise_skipped"
+    assert result is None
+    assert lab._plan_doc is before
+    assert "threshold" in str(events[-1]) and "tool_b" in str(events[-1])
+
+
+@pytest.mark.parametrize("tool, tools", [
+    ("tool_a", (_mcp("tool_b"), _mcp("tool_a"))),
+    ("tool_c", (_mcp("tool_b"), _mcp("tool_a"))),
+    ("tool_c", (_mcp("tool_a"),)),
+])
+def test_primary_tool_edit_preserves_singular_precedence_and_unchanged_lists(tool, tools):
+    step = PlanStep("s1", "Query", "tool_a", tools=tools if tool == "tool_a" else (_mcp("tool_a"),))
+    before = PlanDoc("q", (step,))
+    edited = PlanDoc("q", (replace(step, tool=tool, tools=tools),))
+    checked, findings = check_plan(edited, {name: {} for name in ("tool_a", "tool_b", "tool_c")},
+                                   before=before)
+    assert findings == [] and checked.steps[0].tool == tool
+    adopted, _, _ = apply_edit(before, checked)
+    assert adopted.steps[0].tool == tool
+
+
 @pytest.mark.parametrize("text", [
     'plan: 1\nsteps:\n- id: old\n  tool: run_code\n  skill: score\n  does: Score cells\n',
     json.dumps({"plan": 1, "steps": [{"id": "old", "tool": "run_code", "skill": "score", "does": "Score cells"}]}),

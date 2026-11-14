@@ -3805,7 +3805,8 @@ class ResearchLab:
             if s.id not in known and not s.tool else s for s in edited.steps))
         edited, findings = check_plan(
             edited, _tool_schemas(list(getattr(self.scientist, "catalog", []))),
-            is_known=lambda name: get_skill(name) is not None, skill_name=_skill_name)
+            is_known=lambda name: get_skill(name) is not None, skill_name=_skill_name,
+            before=self._plan_doc)
         if findings:
             refuse([_PLAN_FINDING_WORDS.get(f["kind"], "{kind}").format(**f) + "." for f in findings])
             return None
@@ -3993,7 +3994,7 @@ class ResearchLab:
                 step, tool=tool, settings=settings, tools=step.tools if tool == step.tool else ()))
         edited, findings = check_plan(PlanDoc(request=question, steps=tuple(steps)), schemas,
                                       is_known=lambda name: get_skill(name) is not None,
-                                      skill_name=_skill_name)
+                                      skill_name=_skill_name, before=before)
         if findings:
             emit({"type": "plan_revise_skipped", "why": "; ".join(
                 _PLAN_FINDING_WORDS.get(f["kind"], "{kind}").format(**f) for f in findings)[:300]})
