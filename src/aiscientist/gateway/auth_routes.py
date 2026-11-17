@@ -985,6 +985,8 @@ def delete_conversation(cid: int, request: Request) -> dict:
             s.delete(run)
         s.delete(conv)   # cascade removes the conversation's messages
         s.commit()
+    from . import chat_images
+    chat_images.remove_conversation(user.username, cid)       # a chat's images go with it
     for run_id in run_ids:
         if _delete_run_dir(user.username, run_id):
             removed_dirs += 1
@@ -1013,11 +1015,100 @@ def _delete_run_dir(owner: str, run_id: str) -> bool:
         return False
 
 
+def _named_chat_images(s, user_id: int, cids) -> set[tuple[int, str]]:
+    """The ``(conversation, image id)`` pairs that the stored messages of these conversations of the
+    account name."""
+    from . import chat_images
+    cids = [int(c) for c in cids]
+    if not cids:
+        return set()
+    rows = s.execute(
+        select(Message.conversation_id, Message.meta)
+        .join(Conversation, Conversation.id == Message.conversation_id)
+        .where(Conversation.user_id == user_id, Message.conversation_id.in_(cids), Message.meta.like('%"images"%'))
+    ).all()
+    return {(cid, image_id) for cid, meta in rows for image_id in chat_images.named_ids([meta])}
+
+
+@router.post("/conversations/{cid}/images")
+async def upload_chat_image(cid: int, request: Request, name: str = "") -> dict:
+    """Keep one image for this conversation (the body is the image itself). It is checked by its bytes
+    (PNG, JPEG, WebP, GIF), at most 7.5 MB, and kept under the account; the reply is its reference, which
+    the message names when it is sent. No HPC3 connection is needed. The account's images that no message
+    names and that were uploaded more than a day ago are removed first; then the account's total must stay
+    under ``chat_images.MAX_ACCOUNT_BYTES``."""
+    from . import chat_images
+    user = require_user(request)
+    with session_scope() as s:
+        _owned_conversation(s, cid, user.id)
+        stale = chat_images.unsent(user.username)
+        named = _named_chat_images(s, user.id, stale) if stale else set()
+    if stale:
+        chat_images.sweep(user.username, named)
+    too_big = f"The image is over the {chat_images.mb(chat_images.MAX_IMAGE_BYTES)} limit."
+    declared = request.headers.get("content-length")
+    if declared and declared.isdigit() and int(declared) > chat_images.MAX_IMAGE_BYTES + 1024:
+        raise HTTPException(status_code=413, detail=too_big)
+    chunks, size = [], 0
+    async for chunk in request.stream():
+        size += len(chunk)
+        if size > chat_images.MAX_IMAGE_BYTES:
+            raise HTTPException(status_code=413, detail=too_big)
+        chunks.append(chunk)
+    try:
+        return {"image": chat_images.save(user.username, cid, b"".join(chunks), name)}
+    except chat_images.ChatImageQuotaError as exc:
+        raise HTTPException(status_code=413, detail=str(exc)) from None
+    except chat_images.ChatImageError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from None
+
+
+@router.delete("/conversations/{cid}/images/{image_id}")
+def delete_chat_image(cid: int, image_id: str, request: Request) -> dict:
+    """Remove an image that was attached and then taken off the message before it was sent. An image a
+    sent message names stays: it goes with its chat."""
+    from . import chat_images
+    user = require_user(request)
+    with session_scope() as s:
+        _owned_conversation(s, cid, user.id)
+        if (cid, image_id) in _named_chat_images(s, user.id, [cid]):
+            raise HTTPException(status_code=409, detail="This image is in a sent message; it is removed with its chat.")
+    if not chat_images.remove(user.username, cid, image_id):
+        raise HTTPException(status_code=404, detail="image not found")
+    return {"removed": image_id}
+
+
+@router.get("/chat-images/{cid}/{filename}")
+def get_chat_image(cid: int, filename: str, request: Request):
+    """One of this account's chat images, shown inline as the image type it was checked to be (never
+    anything else), and only to the conversation's owner."""
+    from fastapi.responses import FileResponse
+    from . import chat_images
+    user = require_user(request)
+    with session_scope() as s:
+        _owned_conversation(s, cid, user.id)
+    found = chat_images.path_of(user.username, cid, filename)
+    if found is None:
+        raise HTTPException(status_code=404, detail="image not found")
+    path, media = found
+    return FileResponse(path, media_type=media, headers={
+        "X-Content-Type-Options": "nosniff", "Cache-Control": "private, max-age=86400",
+        "Content-Security-Policy": "sandbox; default-src 'none'"})
+
+
 @router.post("/conversations/{cid}/messages")
 def add_message(cid: int, req: MessageCreate, request: Request) -> dict:
     user = require_user(request)
     if req.role not in ("user", "assistant", "system"):
         raise HTTPException(status_code=400, detail="role must be user|assistant|system")
+    if isinstance(req.meta, dict) and req.meta.get("images"):
+        # A message's images are the ones uploaded to this conversation: the page names them by id and
+        # the server keeps the references it checked, not the ones it was sent.
+        from . import chat_images
+        try:
+            req.meta = {**req.meta, "images": chat_images.resolve(user.username, cid, req.meta["images"])}
+        except chat_images.ChatImageError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from None
     with session_scope() as s:
         conv = _owned_conversation(s, cid, user.id)
         # An answer is saved by every window that showed it: two windows of one account share a
