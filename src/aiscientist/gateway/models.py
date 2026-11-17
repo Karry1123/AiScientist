@@ -116,6 +116,8 @@ class Dataset(Base):
     chat_attachments: Mapped[list["ConversationDataset"]] = relationship(
         back_populates="dataset", cascade="all, delete-orphan")
 
+    run_inputs: Mapped[list["RunDataset"]] = relationship(back_populates="dataset")
+
     def public(self) -> dict:
         return {
             "id": self.id, "uuid": self.uuid, "owner": self.user_id,
@@ -187,6 +189,8 @@ class SharedDatasetVersion(Base):
     hpc_verified_at: Mapped[_dt.datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     created_at: Mapped[_dt.datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
 
+    run_inputs: Mapped[list["RunDataset"]] = relationship(back_populates="shared_version")
+
 
 class SharedDatasetFile(Base):
     """One file of a version, as its manifest lists it. ``facets`` is JSON: tissue, modality and,
@@ -255,15 +259,42 @@ class Run(Base):
     finished_at: Mapped[_dt.datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
 
     owner: Mapped[User] = relationship(back_populates="runs", foreign_keys=[user_id])
+    datasets: Mapped[list["RunDataset"]] = relationship(
+        back_populates="run", cascade="all, delete-orphan", order_by="RunDataset.position")
 
     def public(self) -> dict:
         return {
             "id": self.id, "run_id": self.run_id, "question": self.question, "status": self.status,
             "plan_mode": self.plan_mode, "dataset_id": self.dataset_id,
+            "datasets": [d.public() for d in self.datasets],
             "conversation_id": self.conversation_id,
             "created_at": self.created_at.isoformat() if self.created_at else None,
             "finished_at": self.finished_at.isoformat() if self.finished_at else None,
         }
+
+
+class RunDataset(Base):
+    """Inputs fixed at run start; the identity snapshot survives removal of the data."""
+
+    __tablename__ = "run_datasets"
+
+    run_id: Mapped[int] = mapped_column(
+        ForeignKey("runs.id", ondelete="CASCADE"), primary_key=True)
+    position: Mapped[int] = mapped_column(Integer, primary_key=True)
+    dataset_id: Mapped[int | None] = mapped_column(
+        ForeignKey("datasets.id", ondelete="SET NULL"), nullable=True, index=True)
+    dataset_uuid: Mapped[str | None] = mapped_column(String(36), nullable=True, index=True)
+    name: Mapped[str] = mapped_column(String(255))
+    shared_version_id: Mapped[int | None] = mapped_column(
+        ForeignKey("shared_dataset_versions.id", ondelete="SET NULL"), nullable=True, index=True)
+    role: Mapped[str | None] = mapped_column(String(32), nullable=True)
+
+    run: Mapped[Run] = relationship(back_populates="datasets")
+    dataset: Mapped[Dataset | None] = relationship(back_populates="run_inputs")
+    shared_version: Mapped[SharedDatasetVersion | None] = relationship(back_populates="run_inputs")
+
+    def public(self) -> dict:
+        return {"name": self.name, "role": self.role, "uuid": self.dataset_uuid}
 
 
 class Conversation(Base):

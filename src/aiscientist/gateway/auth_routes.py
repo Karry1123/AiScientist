@@ -19,6 +19,7 @@ from fastapi import APIRouter, Depends, HTTPException, Request, Response
 from pydantic import BaseModel
 from sqlalchemy import delete as sa_delete
 from sqlalchemy import func, or_, select
+from sqlalchemy.orm import selectinload
 
 from . import auth, email_send, rate_limit
 from .dataset_limits import MAX_BOUND_DATASETS
@@ -422,7 +423,8 @@ def my_datasets(request: Request) -> dict:
 def my_runs(request: Request) -> dict:
     user = require_user(request)
     with session_scope() as s:
-        rows = s.scalars(select(Run).where(Run.user_id == user.id).order_by(Run.id.desc())).all()
+        rows = s.scalars(select(Run).where(Run.user_id == user.id)
+                         .options(selectinload(Run.datasets)).order_by(Run.id.desc())).all()
         # Each run's plan estimate and measured compute (issue 25), two queries for the whole list.
         from .estimates import runs_usage
         usage = runs_usage([r.run_id for r in rows])
@@ -631,10 +633,56 @@ def delete_run_record(user_id: int, run_id: str, run_dir=None, delete_files=None
 
 def record_run_start(user_id: int, run_id: str, question: str, plan_mode: bool,
                      dataset_id: int | None = None, conversation_id: str | None = None) -> None:
+    """Start history; dataset_id is accepted for compatibility but no longer written."""
     with session_scope() as s:
         s.add(Run(user_id=user_id, run_id=run_id, question=question, plan_mode=plan_mode,
-                  dataset_id=dataset_id, conversation_id=conversation_id, status="running"))
+                  conversation_id=conversation_id, status="running"))
         s.commit()
+
+
+def record_run_datasets(user_id: int, run_id: str, bound: list[dict],
+                        shared_resolved: list[dict] | None = None) -> None:
+    """Snapshot the final bind set, in order, before review or execution. Paths stay internal."""
+    from .models import RunDataset, SharedDatasetVersion
+
+    shared = {e["path"]: a for a in shared_resolved or [] for e in a["entries"]}
+    with session_scope() as s:
+        run = s.scalar(select(Run).where(Run.user_id == user_id, Run.run_id == run_id))
+        if run is None or run.datasets:
+            return
+        owned = {d.path: d for d in s.scalars(select(Dataset).where(
+            Dataset.user_id == user_id, Dataset.path.in_([e["path"] for e in bound])))}
+        for position, entry in enumerate(bound):
+            attachment = shared.get(entry["path"])
+            dataset = owned.get(entry["path"]) if attachment is None else None
+            version = (s.scalar(select(SharedDatasetVersion).where(
+                SharedDatasetVersion.uuid == attachment["version_uuid"])) if attachment else None)
+            # A server folder has no registry identity. Store only its display name, never its path.
+            name = (dataset.name if dataset else
+                    f"{attachment['title']} {attachment['version']}" if attachment else
+                    str(entry.get("name") or entry["path"]).replace("\\", "/").rstrip("/").rsplit("/", 1)[-1])
+            run.datasets.append(RunDataset(
+                position=position, dataset_id=dataset.id if dataset else None,
+                dataset_uuid=dataset.uuid if dataset else attachment["version_uuid"] if attachment else None,
+                name=name, shared_version_id=version.id if version else None,
+                role=entry.get("role") or ("primary" if position == 0 else None)))
+        s.commit()
+
+
+def runs_for_dataset(user_id: int, dataset_uuid: str | None = None, *,
+                     shared_version_id: int | None = None) -> list[dict]:
+    """The owner's runs using a dataset UUID or shared version, including deleted datasets."""
+    from .models import RunDataset
+
+    if dataset_uuid is None and shared_version_id is None:
+        return []
+    with session_scope() as s:
+        query = select(Run).join(RunDataset).where(Run.user_id == user_id)
+        if dataset_uuid is not None:
+            query = query.where(RunDataset.dataset_uuid == dataset_uuid)
+        if shared_version_id is not None:
+            query = query.where(RunDataset.shared_version_id == shared_version_id)
+        return [r.public() for r in s.scalars(query.order_by(Run.created_at.desc(), Run.id.desc())).unique()]
 
 
 def _usage_split(usage: dict) -> tuple[int, int, int, int, int]:
