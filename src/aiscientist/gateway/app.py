@@ -15151,6 +15151,12 @@ async def _run_lab(conn: Connection, req: LabRequest, *,
             bound, server_mirrors = await _admit_bound_paths(
                 conn, bound, say_key, emit, unusable, _shared_by_path(getattr(req, "_shared_resolved", None)))
             decisions["input_name"] = _display_name(bound[0]) if bound else ""
+        if resume is None and saved_state is None and _AUTH_ENABLED and conn.app_user_id:
+            try:
+                await asyncio.to_thread(auth_routes.record_run_datasets,
+                                        conn.app_user_id, run_id, bound, shared_resolved)
+            except Exception as exc:  # noqa: BLE001 - history is best-effort
+                print(f"[auth] record_run_datasets failed: {exc}")
         primary_path = bound[0]["path"] if bound else None
         primary_name = _display_name(bound[0]) if bound else ""
         # The primary's matrix as staged here from dfs3b, so describing its folder reads that copy.
