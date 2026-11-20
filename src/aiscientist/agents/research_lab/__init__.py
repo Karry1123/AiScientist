@@ -44,6 +44,7 @@ from pathlib import Path
 from dataclasses import asdict, replace
 from typing import Any, Callable, Iterable
 from ...tools.sdk import tool_identity
+from ..provenance import report_tool_identity
 from .. import claim_audit
 from ..dag import LabPlan, TaskNode, lift_agenda_to_dag, parse_dag
 from ..cellqc_cutoffs import CUTOFFS as CUTOFF_SETTINGS, cutoff_rows, read_cutoffs
@@ -765,8 +766,7 @@ class ResearchLab:
                            for c in (r.scientist_result.get("steps") or []) if isinstance(c, dict)]}
                 for r in result.rounds] + [
                 {"step": s, "accepted": True, "calls": [{"tool": REPORT_TOOL, "args": {}, "ok": True,
-                 "provider": tool_identity(next((t for t in getattr(self.scientist, "catalog", [])
-                                                   if t.name == REPORT_TOOL), None), REPORT_TOOL)}]}
+                 "provider": report_tool_identity()}]}
                 for s in self._report_steps], approved_additions=self._approved_additions)
             on_event = kwargs.get("on_event") or (args[1] if len(args) > 1 else None)
             if on_event is not None:
@@ -3530,6 +3530,10 @@ class ResearchLab:
     def _resolve_plan_provenance(self, doc: PlanDoc, fresh: Iterable[int] = ()) -> PlanDoc:
         """Resolve new assignments from registration; retain approved/restored pins verbatim."""
         catalog = {t.name: t for t in getattr(self.scientist, "catalog", [])}
+
+        def registered_identity(name):
+            return report_tool_identity() if name == REPORT_TOOL else tool_identity(catalog.get(name), name)
+
         fresh = set(fresh)
         steps = []
         for i, step in enumerate(doc.steps):
@@ -3539,14 +3543,12 @@ class ResearchLab:
             tools = step.tools
             if not tools:
                 names = [step.tool] if step.tool else []
-                declared = _declared_tools(step.text) & set(catalog)
+                declared = _declared_tools(step.text) & (set(catalog) | {REPORT_TOOL})
                 names += sorted(declared - set(names), key=lambda n: step.text.find(n))
-                tools = tuple(tool_identity(catalog[n], n) if n in catalog else {
-                    "tool": n, "provider": "unknown", "server": "unknown", "version": "unknown"
-                } for n in names)
+                tools = tuple(registered_identity(n) for n in names)
             else:
-                tools = tuple(tool_identity(catalog[t["tool"]], t["tool"]) if t.get("provider") == "unknown"
-                              and t["tool"] in catalog else t for t in tools)
+                tools = tuple(registered_identity(t["tool"]) if t.get("provider") == "unknown"
+                              and (t["tool"] in catalog or t["tool"] == REPORT_TOOL) else t for t in tools)
             skills = list(step.skills)
             names = [step.skill] if step.skill and not skills else []
             names += skills_named_in(step.text)

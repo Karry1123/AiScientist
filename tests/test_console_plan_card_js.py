@@ -92,6 +92,9 @@ const provenanceSteps = [
 out.provenanceReview = api.planCardHtml(agenda.slice(0,2), {steps:provenanceSteps}, [1]);
 out.provenanceSaved = api.planCardHtml(agenda.slice(0,2), {steps:provenanceSteps}, [], {mode:"saved"});
 out.provenanceLegacy = api.planStepHtml("Legacy", 1, {tool:"run_code",skill:"legacy_skill"});
+out.reportProvenance = ["review", "saved"].map(mode => api.planCardHtml(["Write report"], {steps:[
+  {id:"report",tool:"write_report",tools:[{tool:"write_report",provider:"local",server:"aiscientist-gateway",version:"v1.2.3"}]}
+]}, [], {mode}));
 out.provenanceUsed = api.stepProvenanceMarkdown({id:"atlas",step:"Query",status:"used",
   planned_tools:provenanceSteps[0].tools,planned_skills:provenanceSteps[0].skills,
   tools:[{tool:"submit_query",provider:"mcp",server:"atlas-expression-exploration",version:"0.0.4",ok:true}],
@@ -531,6 +534,12 @@ def test_a_step_shows_each_qc_cutoff_with_its_unit_and_whether_it_was_changed():
     assert '<span class="plan-cutoff-unit">counts</span><span class="plan-cutoff-tag">default</span>' in default
     assert 'data-edit' not in default.split("plan-cutoff-tag")[0], "a default cutoff is changed in the chat, not in place"
     assert "data-edit" not in out["cutoffsReadOnly"].split("plan-step-meta")[1], "a plan no longer waiting is read-only"
+
+
+def test_issue151_report_card_shows_gateway_server_and_version():
+    for html in _card()["reportProvenance"]:
+        assert "write_report / Local aiscientist-gateway / version v1.2.3" in html
+        assert "Unknown provider" not in html
 
 
 def test_each_planned_tool_retains_provider_and_each_skill_retains_version_on_all_cards():

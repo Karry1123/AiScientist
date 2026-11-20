@@ -11326,6 +11326,7 @@ def _record_chat_usage(conn: Connection, *, role: str, model: str, base_url: str
                     else base_url or "session vLLM")
         active = getattr(conn, "active_run", None)
         conversation_id = getattr(active, "conversation_id", None) if active is not None else None
+        _log_model_usage(conn, run=active, role=role, model=model, usage=usage)
         auth_routes.record_llm_call(run_id=None, user_id=getattr(conn, "app_user_id", None),
                                     conversation_id=conversation_id, step="Chat", provider=provider,
                                     role=role, model=model, endpoint=endpoint, remote=remote,
@@ -12718,6 +12719,7 @@ def _record_lab_usage(conn: Connection, *, key_use: Any = None,
         run_id = billed or (getattr(active, "run_id", None) if active is not None else None) \
             or getattr(conn, "last_run_id", None)
         conversation_id = getattr(active, "conversation_id", None) if active is not None else None
+        _log_model_usage(conn, run=active, run_id=run_id, conversation_id=conversation_id, **fields)
         from . import auth_routes
         if key_use is not None:
             fields["key_fp"] = key_use.fingerprint
@@ -12729,6 +12731,27 @@ def _record_lab_usage(conn: Connection, *, key_use: Any = None,
         print(f"[llm-usage] not recorded: {exc}")
     if key_use is not None:
         key_use.after_call()       # the spike check; never raises
+
+
+def _log_model_usage(conn: Connection, *, run: RunState | None = None,
+                     run_id: str | None = None, conversation_id: str | None = None, **fields: Any) -> None:
+    """Record the usage row's input split in the owning run's log, independently of the DB."""
+    try:
+        from .token_usage import input_token_usage
+
+        usage = fields.get("usage") or {}
+        counts = input_token_usage(usage)
+        if run_id and (run is None or getattr(run, "run_id", None) != run_id):
+            # Finished-report calls can be billed to a run other than the active one.
+            run = RunState(conn, conversation_id=conversation_id, run_id=run_id)
+        conn.emit("info", "llm_usage",
+                  f"{fields.get('role', 'reason')} / {fields.get('model', '')}: "
+                  f"cached input {counts['cache_read_tokens']}, new input {counts['input_tokens']}, "
+                  f"cache writes {counts['cache_write_tokens']} tokens",
+                  detail={"role": fields.get("role"), "model": fields.get("model"),
+                          "usage": dict(usage, **counts)}, run=run)
+    except Exception as exc:  # noqa: BLE001 - logging never breaks a model call
+        print(f"[llm-usage] log not recorded: {exc}")
 
 
 def _push_usage(conn: Connection, run: "RunState | None", conversation_id: str | None,
@@ -13243,6 +13266,7 @@ def _lab_llm(conn: Connection) -> "LabLLM":
         return out
 
     def _scientist_vllm(messages, tools):
+        started = time.monotonic()
         # The Scientist's tool turns get a role effort like every lab call
         # (AISCIENTIST_VLLM_REASONING_EFFORT_SCIENTIST, else the global one). Without it Qwen3.8 thought
         # at its default xhigh and ran out of its output reservation before acting.
@@ -13254,6 +13278,14 @@ def _lab_llm(conn: Connection) -> "LabLLM":
         # lost a whole step to three such turns in a row).
         if (not base_url and isinstance(out, dict) and not out.get("tool_calls")
                 and out.get("finish_reason") == "length"):
+            usage = out.get("usage")
+            if usage:
+                _record_lab_usage(conn, key_use=key_use, role="scientist", model=model,
+                                  endpoint=f"{model} @ {label}", remote=_endpoint_is_off_host(base_url),
+                                  max_tokens=None, provider="openai" if base_url else "vllm", usage=usage,
+                                  duration_ms=int((time.monotonic() - started) * 1000))
+            if key_use is not None:
+                key_use.before_call()
             conn.emit("warning", "llm", "The Scientist's turn ran out of output room while still "
                                         "reasoning — asking again at low reasoning effort.")
             out = _with_recovery(lambda p: vllm_client.chat_tools(p, model, messages, tools, base_url=send_base,

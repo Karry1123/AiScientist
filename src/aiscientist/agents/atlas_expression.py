@@ -14,6 +14,101 @@ from .mcp_bridge import READ_RESULT, PreparedCall
 
 SKILL = "explore-atlas-expression-with-aiscientist-mcp"
 
+# Runs in the pinned image, where the attached file is mounted. The Atlas server
+# (0.0.4) reads ATLAS_OBS_COLS by position -- class, cell type, region, donor --
+# and refuses a file that lacks any of the four, so every role gets a distinct
+# column the file has. Only HDF5 keys and category lists are read, never the
+# expression matrix or the per-cell values.
+OBS_COLUMNS = '''import os
+import sys
+import h5py
+
+ROLES = (
+    ("class", ("majorclass", "major_class", "cell_class", "cellclass", "broad_cell_type",
+               "broad_celltype", "class", "cell_category", "lineage"),
+     ("class", "major", "broad", "lineage", "compartment"), "few"),
+    ("cell type", ("celltype", "cell_type", "cell_type_annotation", "celltype_annotation",
+                   "cell_subtype", "subtype", "subclass", "annotation", "cell_annotation"),
+     ("type", "subclass", "annot", "cluster", "label"), "many"),
+    ("region", ("tissue", "region", "tissue_region", "anatomical_region", "location", "site",
+                "organ"),
+     ("tissue", "region", "anatom", "location", "site", "organ"), "few"),
+    ("donor", ("donor", "donor_id", "donorid", "subject", "subject_id", "individual",
+               "patient", "patient_id", "sampleid", "sample_id", "sample"),
+     ("donor", "subject", "individual", "patient", "sample", "library", "batch"), "many"),
+)
+
+
+def normalized(name):
+    return "".join(c for c in name.casefold() if c.isalnum())
+
+
+def text(value):
+    return value.decode() if isinstance(value, bytes) else str(value)
+
+
+path = os.environ["AISCIENTIST_DATASET"]
+with h5py.File(path, "r") as atlas:
+    obs = atlas["obs"]
+    sizes = {}  # column -> number of categories; None for plain text columns
+    if isinstance(obs, h5py.Dataset):  # AnnData < 0.7: one compound table
+        index = text(obs.attrs.get("_index", "index"))
+        for name in obs.dtype.names or ():
+            if name != index:
+                sizes[name] = None
+    else:
+        index = text(obs.attrs.get("_index", "_index"))
+        legacy = obs.get("__categories")
+        for name, item in obs.items():
+            if name == index or name.startswith("_"):
+                continue
+            if isinstance(item, h5py.Group) and "categories" in item:
+                sizes[name] = len(item["categories"])
+            elif legacy is not None and name in legacy:
+                sizes[name] = len(legacy[name])
+            elif isinstance(item, h5py.Dataset) and item.dtype.kind in "OSU":
+                sizes[name] = None
+
+columns = list(sizes)
+lookup = {}
+for name in columns:
+    lookup.setdefault(normalized(name), name)
+chosen = {}
+
+# 1. a column named for the role
+for role, aliases, _, _ in ROLES:
+    for alias in aliases:
+        column = lookup.get(normalized(alias))
+        if column is not None and column not in chosen.values():
+            chosen[role] = column
+            break
+# 2. a column whose name hints at the role
+for role, _, hints, _ in ROLES:
+    if role not in chosen:
+        for hint in hints:
+            column = next((c for c in columns if hint in normalized(c)
+                           and c not in chosen.values()), None)
+            if column is not None:
+                chosen[role] = column
+                break
+# 3. any other annotation: the fewest categories for class and region, the most
+#    for cell type and donor; text columns of unknown size count as many.
+for role, _, _, size in ROLES:
+    if role not in chosen:
+        left = [c for c in columns if c not in chosen.values()]
+        if left:
+            many = lambda c: float("inf") if sizes[c] is None else sizes[c]
+            chosen[role] = (min if size == "few" else max)(left, key=many)
+
+roles = [role for role, _, _, _ in ROLES]
+if len(chosen) < len(roles):
+    sys.exit(f"{os.path.basename(path)} has {len(columns)} text or category observation "
+             f"column(s) ({', '.join(columns) or 'none'}); the Atlas server needs four distinct "
+             "columns for class, cell type, region and donor")
+print("atlas observation columns: " + ", ".join(f"{r}={chosen[r]}" for r in roles), file=sys.stderr)
+print(",".join(chosen[r] for r in roles))
+'''
+
 # Runs inside the image after a successful CLI call. Checkpoints stay in work/;
 # only deliverables enter artifacts/, which the executor mirrors to the website.
 COLLECT = READ_RESULT + '''import shutil
@@ -148,11 +243,14 @@ class AtlasAdapter:
             version = shared_release(atlas) or (shared_release(str(getattr(executor, "dataset_source", "") or "")))
         if not atlas.endswith(".h5ad") or not version:
             raise ValueError("Attach a primary .h5ad dataset listed in AISCIENTIST_ATLAS_FILES")
-        if args.get("atlas") and posixpath.normpath(args["atlas"]) not in {
-                posixpath.normpath(p) for p in (atlas, source) if p}:
+        paths = {posixpath.normpath(p) for p in (atlas, source) if p}
+        names = {posixpath.basename(p) for p in paths}
+        if args.get("atlas") and posixpath.normpath(args["atlas"]) not in paths and args["atlas"] not in names:
             raise ValueError("atlas must be the attached primary dataset")
         setup = ('export ATLAS_H5AD="$AISCIENTIST_DATASET"\n'
                  f"export AISCI_ATLAS_RELEASE={shlex.quote(version)}\n"
+                 'ATLAS_OBS_COLS="$(python - <<\'AISCI_ATLAS_OBS\'\n' + OBS_COLUMNS +
+                 'AISCI_ATLAS_OBS\n)" || exit $?\nexport ATLAS_OBS_COLS\n' +
                  'if [ -n "${AISCIENTIST_TOOL_CACHE:-}" ]; then\n'
                  '  export ATLAS_HGNC="$AISCIENTIST_TOOL_CACHE/atlas-expression/hgnc_complete_set.txt"\n'
                  'fi\n')

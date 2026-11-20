@@ -53,6 +53,93 @@ def tools(runner):
     return {t.name: t for t in build_scientist_catalog(code_executor=runner)}
 
 
+def _obs_roles(tmp_path, monkeypatch, capsys, columns, filename="atlas.h5ad", categories=None):
+    """Run the in-image column script on a fake atlas; returns (stdout list, stderr)."""
+    h5py = pytest.importorskip("h5py")
+    path = tmp_path / filename
+    with h5py.File(path, "w") as f:
+        obs = f.create_group("obs")
+        obs.attrs["_index"] = "cell_names"
+        obs.create_dataset("cell_names", data=[b"cell1"])
+        obs.create_dataset("n_counts", data=[1.0])  # numeric: never a grouping column
+        for column in columns:
+            if categories and column in categories:
+                group = obs.create_group(column)
+                group.create_dataset("categories", data=[f"c{i}".encode() for i in range(categories[column])])
+                group.create_dataset("codes", data=[0])
+            else:
+                obs.create_dataset(column, data=[b"value"])
+    runner = Runner()
+    runner.dataset_path = "/shared/heca/v2026.11/" + filename
+    monkeypatch.setenv("AISCIENTIST_ATLAS_FILES", "heca/v2026.11=" + runner.dataset_path)
+    monkeypatch.setenv("AISCIENTIST_DATASET", str(path))
+    prepared = atlas.AtlasAdapter(planner_name=lambda name: name).prepare(
+        {"genes": ["RHO"], "atlas": filename}, runner, tool="submit_query")
+    assert prepared.arguments == {"genes": ["RHO"]}
+    script = prepared.setup.split("<<'AISCI_ATLAS_OBS'\n", 1)[1].split("\nAISCI_ATLAS_OBS", 1)[0]
+    assert prepared.setup.index("AISCI_ATLAS_OBS\n)") < prepared.setup.index("export ATLAS_OBS_COLS")
+    exec(compile(script, "atlas-obs-setup", "exec"), {"__name__": "__main__"})
+    out = capsys.readouterr()
+    return out.out.strip().split(","), out.err
+
+
+def test_obs_roles_complete_file_sends_the_four_server_positions(tmp_path, monkeypatch, capsys):
+    # The server reads class, cell type, region, donor by position; extras are not needed.
+    cols, err = _obs_roles(tmp_path, monkeypatch, capsys,
+                           ["majorclass", "celltype", "tissue", "donor", "sampleid"], "HRCA_snRNA_allcells.h5ad")
+    assert cols == ["majorclass", "celltype", "tissue", "donor"]
+    assert "class=majorclass, cell type=celltype, region=tissue, donor=donor" in err
+
+
+def test_obs_roles_use_the_files_own_synonym_names(tmp_path, monkeypatch, capsys):
+    cols, _ = _obs_roles(tmp_path, monkeypatch, capsys,
+                         ["Cell_Class", "cell_type", "anatomical_region", "donor_id", "sample_id"])
+    assert cols == ["Cell_Class", "cell_type", "anatomical_region", "donor_id"]
+
+
+@pytest.mark.parametrize("name,present,expected", [
+    # Shapes of the issue-151 HECA files: a missing role never shifts the others.
+    ("HRCA_scRNA", ["majorclass", "tissue", "donor", "sampleid", "subclass"],
+     ["majorclass", "subclass", "tissue", "donor"]),
+    ("Iris_scRNA", ["majorclass", "tissue", "sampleid", "cluster"],
+     ["majorclass", "cluster", "tissue", "sampleid"]),
+    ("Lens_snRNA", ["tissue", "sampleid", "cell_annotation", "broad_lineage"],
+     ["broad_lineage", "cell_annotation", "tissue", "sampleid"]),
+    ("RPEChoroid_snRNA", ["majorclass", "celltype", "sampleid", "anatomical_site"],
+     ["majorclass", "celltype", "anatomical_site", "sampleid"]),
+])
+def test_obs_roles_missing_role_takes_the_files_matching_column(tmp_path, monkeypatch, capsys,
+                                                                 name, present, expected):
+    cols, _ = _obs_roles(tmp_path, monkeypatch, capsys, present, name + "_allcells.h5ad")
+    assert cols == expected
+    assert len(set(cols)) == 4
+
+
+def test_obs_roles_unnamed_annotations_fill_by_category_count(tmp_path, monkeypatch, capsys):
+    # No name hints at all: class and region take the fewest categories, cell type and donor the most.
+    cols, _ = _obs_roles(tmp_path, monkeypatch, capsys, ["a", "b", "c", "d"],
+                         categories={"a": 3, "b": 40, "c": 1, "d": 12})
+    assert cols == ["c", "b", "a", "d"]
+
+
+def test_obs_roles_too_few_columns_stop_with_the_files_columns(tmp_path, monkeypatch, capsys):
+    with pytest.raises(SystemExit, match=r"Lens_scRNA_allcells.h5ad has 2 .*\((sampleid, tissue|tissue, sampleid)\).*four distinct"):
+        _obs_roles(tmp_path, monkeypatch, capsys, ["tissue", "sampleid"], "Lens_scRNA_allcells.h5ad")
+
+
+@pytest.mark.parametrize("copied", [False, True])
+def test_issue151_bare_primary_filename_is_accepted_but_other_files_are_refused(monkeypatch, copied):
+    runner = Runner()
+    runner.dataset_path = SESSION_COPY if copied else SERVER_FILE
+    runner.dataset_source = SERVER_FILE if copied else ""
+    monkeypatch.setenv("AISCIENTIST_ATLAS_FILES", "heca/v1=" + SERVER_FILE + ";heca/v1=/shared/other.h5ad")
+    adapter = atlas.AtlasAdapter(planner_name=lambda name: name)
+    assert adapter.prepare({"atlas": "HRCA_snRNA_allcells.h5ad"}, runner).arguments == {}
+    for argument in ("other.h5ad", "/shared/other.h5ad", "/unattached/HRCA_snRNA_allcells.h5ad"):
+        with pytest.raises(ValueError, match="attached primary dataset"):
+            adapter.prepare({"atlas": argument}, runner)
+
+
 def test_release_metadata_checksum_tier_and_exposure(release, monkeypatch):
     skill = skills.get_skill(atlas.SKILL)
     assert (skill.status, skill.registry_release) == ("community", "v0.2.0")

@@ -4988,7 +4988,8 @@ function planSkills(step) {
 }
 
 function planToolText(tool) {
-  const provider = tool.provider === "local" ? "Local" : tool.provider === "mcp" ? `MCP ${tool.server || "unknown"}` : "Unknown provider";
+  const localServer = tool.server && !["local", "unknown"].includes(tool.server) ? ` ${tool.server}` : "";
+  const provider = tool.provider === "local" ? `Local${localServer}` : tool.provider === "mcp" ? `MCP ${tool.server || "unknown"}` : "Unknown provider";
   return `${tool.tool || "unknown tool"} / ${provider} / version ${tool.version || "unknown"}`;
 }
 

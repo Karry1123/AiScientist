@@ -150,6 +150,19 @@ def git_sha() -> str | None:
 _dataset_hash_cache: dict[tuple[str, int, int], tuple[str, str]] = {}
 
 
+def report_tool_identity() -> dict[str, str]:
+    """The gateway owns write_report; its version is the running release or checkout."""
+    version = release_version().get("tag") or git_sha()
+    if not version:
+        from importlib.metadata import PackageNotFoundError, version as package_version
+
+        try:
+            version = package_version("aiscientist")
+        except PackageNotFoundError:
+            version = "unknown"
+    return {"tool": "write_report", "provider": "local", "server": "aiscientist-gateway", "version": version}
+
+
 def dataset_hashes(path: Any) -> tuple[str | None, str | None, str]:
     """Return ``(fingerprint, content_sha256, method)`` for a dataset path.
 

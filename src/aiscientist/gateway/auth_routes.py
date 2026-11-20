@@ -690,16 +690,9 @@ def _usage_split(usage: dict) -> tuple[int, int, int, int, int]:
     usage shape: Claude's (``input_tokens`` + ``cache_creation_input_tokens`` +
     ``cache_read_input_tokens``, mapped by :func:`anthropic_client._usage`) or OpenAI's
     (``prompt_tokens`` with ``prompt_tokens_details.cached_tokens`` inside it)."""
-    details = usage.get("prompt_tokens_details") or {}
-    prompt = int(usage.get("prompt_tokens") or 0)
-    reads = int(usage.get("cache_read_input_tokens") or details.get("cached_tokens") or 0)
-    writes = int(usage.get("cache_creation_input_tokens") or details.get("cache_write_tokens") or 0)
-    writes_1h = min(writes, int(usage.get("cache_creation_1h_input_tokens") or 0))
-    if usage.get("input_tokens") is not None:
-        uncached = int(usage.get("input_tokens") or 0)
-    else:
-        uncached = max(0, prompt - reads - writes)
-    return uncached, writes - writes_1h, writes_1h, reads, int(usage.get("completion_tokens") or 0)
+    from .token_usage import split_usage
+
+    return split_usage(usage)
 
 
 def record_llm_call(*, run_id: str | None, user_id: int | None, role: str, model: str,

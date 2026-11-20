@@ -31,6 +31,34 @@ from aiscientist.agents.research_lab import (
 # --- the PI's own-knowledge disclosure ---------------------------------------
 
 
+def test_issue151_gateway_report_step_resolves_its_provider_and_retains_approved_version(monkeypatch):
+    from types import SimpleNamespace
+    from aiscientist.agents import provenance
+    from aiscientist.agents.plan_doc import PlanDoc, PlanStep
+    from aiscientist.agents.research_lab import ResearchLab
+
+    monkeypatch.setattr(provenance, "release_version", lambda: {"tag": "v1.2.3", "sha": "abc"})
+    lab = object.__new__(ResearchLab)
+    lab.scientist = SimpleNamespace(catalog=[])
+    expected = {"tool": "write_report", "provider": "local", "server": "aiscientist-gateway", "version": "v1.2.3"}
+    for tools in ((), ({"tool": "write_report", "provider": "unknown", "server": "unknown", "version": "unknown"},)):
+        doc = PlanDoc("Report", (PlanStep("analysis", "Analyse with `run_code`.", "run_code"),
+                                 PlanStep("report", "Write with `write_report`.", "write_report", tools=tools)))
+        resolved = lab._resolve_plan_provenance(doc, fresh=(0, 1))
+        assert resolved.steps[1].planned_tools() == [expected]
+        monkeypatch.setattr(provenance, "release_version", lambda: {"tag": "v9.0.0"})
+        assert lab._resolve_plan_provenance(resolved).steps[1].planned_tools() == [expected]
+        monkeypatch.setattr(provenance, "release_version", lambda: {"tag": "v1.2.3"})
+
+
+def test_issue151_gateway_report_version_uses_the_checkout_without_a_release(monkeypatch):
+    from aiscientist.agents import provenance
+
+    monkeypatch.setattr(provenance, "release_version", lambda: {})
+    monkeypatch.setattr(provenance, "git_sha", lambda: "0123456789abcdef")
+    assert provenance.report_tool_identity()["version"] == "0123456789abcdef"
+
+
 def test_the_disclosure_is_separated_from_the_executable_agenda():
     """Left in the agenda it would be dispatched to the Scientist as a step to run."""
     agenda, disclosure = _split_self_sourced([
